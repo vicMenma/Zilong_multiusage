@@ -73,24 +73,29 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
              InlineKeyboardButton("📊 Media Info",       callback_data=f"dl|info|{token}")],
             [InlineKeyboardButton("🖼️ Thumbnail",         callback_data=f"dl|thumb|{token}")],
         ]
-    elif kind in ("magnet","torrent"):
+    elif kind in ("magnet", "torrent"):
         rows += [
-            [InlineKeyboardButton("🧲 Download",    callback_data=f"dl|video|{token}")],
-            [InlineKeyboardButton("📊 Magnet Info", callback_data=f"dl|info|{token}")],
+            [InlineKeyboardButton("🧲 Download",         callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}")],
+            [InlineKeyboardButton("📊 Magnet Info",      callback_data=f"dl|info|{token}")],
         ]
     elif kind == "gdrive":
         rows += [
-            [InlineKeyboardButton("☁️ Download",    callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("🎵 Audio Only",  callback_data=f"dl|audio|{token}")],
+            [InlineKeyboardButton("☁️ Download",         callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("🎵 Audio Only",       callback_data=f"dl|audio|{token}")],
+            [InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}")],
         ]
     elif kind == "mediafire":
         rows += [
-            [InlineKeyboardButton("📁 Download",    callback_data=f"dl|video|{token}")],
+            [InlineKeyboardButton("📁 Download",         callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}")],
         ]
     else:
+        # direct link
         rows += [
-            [InlineKeyboardButton("🎬 Download File", callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("📊 Media Info",    callback_data=f"dl|info|{token}")],
+            [InlineKeyboardButton("🎬 Download File",    callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("📊 Media Info",       callback_data=f"dl|info|{token}")],
+            [InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}")],
         ]
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"dl|cancel|{token}")])
     return InlineKeyboardMarkup(rows)
@@ -208,9 +213,15 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 
     # ── Stream selector — delegate to full stream extractor ───
     if mode == "stream":
-        from plugins.stream_extractor import extract_url_streams
-        st = await cb.message.edit("📡 Fetching streams…")
-        await extract_url_streams(client, st, url, uid, edit=False)
+        kind_s = classify(url)
+        if kind_s in ("magnet", "torrent"):
+            from plugins.stream_extractor import extract_magnet_streams
+            st = await cb.message.edit("🧲 Fetching torrent file list…")
+            await extract_magnet_streams(client, st, url, uid)
+        else:
+            from plugins.stream_extractor import extract_url_streams
+            st = await cb.message.edit("📡 Fetching streams…")
+            await extract_url_streams(client, st, url, uid, edit=False)
         return
 
     # ── Stream download (specific format ID) ─────────────────
