@@ -23,9 +23,11 @@ from services.utils import human_size, progress_panel, safe_edit
 
 log = logging.getLogger(__name__)
 
-_AUDIO_EXTS      = {".mp3",".aac",".flac",".ogg",".m4a",".opus",".wav",".wma",".ac3",".mka"}
-_STREAMABLE_EXTS = {".mp4",".mov",".m4v"}
-_VIDEO_EXTS      = {
+_AUDIO_EXTS = {".mp3",".aac",".flac",".ogg",".m4a",".opus",".wav",".wma",".ac3",".mka"}
+
+# ALL of these are sent as video (Telegram streams them all fine)
+# Use force_document=True to override per-call
+_VIDEO_EXTS = {
     ".mp4",".mov",".webm",".m4v",".mkv",".avi",".flv",
     ".ts",".m2ts",".wmv",".3gp",".rmvb",".mpg",".mpeg",
 }
@@ -75,10 +77,8 @@ async def upload_file(
         method = "document"
     elif ext in _AUDIO_EXTS:
         method = "audio"
-    elif ext in _STREAMABLE_EXTS:
-        method = "video"
     elif ext in _VIDEO_EXTS:
-        method = "document"   # MKV etc — send as document (keeps quality)
+        method = "video"      # ALL video formats sent as video by default
     else:
         method = "document"
 
