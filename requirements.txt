@@ -1,0 +1,13 @@
+pyrofork==2.3.38
+TgCrypto
+aiohttp
+yt-dlp
+aria2p
+py7zr
+rarfile
+python-dotenv
+google-api-python-client
+google-auth
+google-auth-httplib2
+psutil
+Pillow
