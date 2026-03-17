@@ -423,7 +423,6 @@ class LivePanel:
 
 class TaskRunner:
     def __init__(self) -> None:
-        self._queue:        asyncio.Queue        = asyncio.Queue()
         self._workers:      list[asyncio.Task]   = []
         self._panels:       dict[int, LivePanel] = {}
         self._panel_locks:  dict[int, asyncio.Lock] = {}
@@ -485,20 +484,21 @@ class TaskRunner:
 
     async def auto_panel(self, uid: int) -> None:
         """
-        Called automatically on every new task registration.
-        - If a panel is already alive for this user → just wake it (no new message).
-        - If no panel exists → send a new panel message to the user's private chat
-          and start the live loop.
+        Called on every new task registration.
+        Always tears down the old panel message and sends a fresh one at the
+        bottom of the chat — so the panel is always the newest message.
         Race-safe via per-user lock.
         """
         async with self._panel_lock(uid):
-            panel = self._panels.get(uid)
-            if panel and not panel._stopped:
-                panel.wake()
-                return
-            if panel:
-                panel.stop()
-            # Need the Pyrogram client to send the message
+            # Stop loop and delete old message
+            old = self._panels.pop(uid, None)
+            if old:
+                old.stop()
+                try:
+                    await old._msg.delete()
+                except Exception:
+                    pass
+
             try:
                 from core.session import get_client
                 from pyrogram import enums
@@ -524,7 +524,7 @@ class TaskRunner:
         if p:
             p.wake()
 
-    # ── Queue worker ──────────────────────────────────────────
+    # ── Direct task execution (true parallelism, no queue) ───
 
     async def submit(
         self,
@@ -542,31 +542,26 @@ class TaskRunner:
             fname=fname, total=total, mode=mode, engine=engine,
         )
         await tracker.register(record)
-        await self._queue.put((record, coro_factory))
+        # Fire and forget — true concurrent execution, no queue bottleneck
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._run_task(record, coro_factory))
         return record
 
-    async def _worker(self) -> None:
-        while self._running:
-            try:
-                record, factory = await asyncio.wait_for(
-                    self._queue.get(), timeout=1.0,
-                )
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
+    async def _run_task(self, record: TaskRecord, factory) -> None:
+        record.update(state="⚙️ Running")
+        try:
+            await factory(record)
+            record.update(state="✅ Done", done=record.total or record.done)
+        except asyncio.CancelledError:
+            record.update(state="❌ Cancelled")
+        except Exception as exc:
+            log.error("Task %s failed: %s", record.tid, exc)
+            record.update(state=f"❌ {str(exc)[:60]}")
 
-            record.update(state="⚙️ Running")
-            try:
-                await factory(record)
-                record.update(state="✅ Done", done=record.total or record.done)
-            except asyncio.CancelledError:
-                record.update(state="❌ Cancelled")
-            except Exception as exc:
-                log.error("Task %s failed: %s", record.tid, exc)
-                record.update(state=f"❌ {str(exc)[:60]}")
-            finally:
-                self._queue.task_done()
+    async def _worker(self) -> None:
+        """Legacy worker — kept so start()/stop() don't break. Does nothing now."""
+        while self._running:
+            await asyncio.sleep(5)
 
 
 runner = TaskRunner()
