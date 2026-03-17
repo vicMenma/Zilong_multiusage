@@ -143,13 +143,19 @@ async def url_handler(client: Client, msg: Message):
 # ─────────────────────────────────────────────────────────────
 
 async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> None:
-    st  = await msg.reply("🌊 Torrent received. Starting aria2c…\n\n<i>Use /status to track progress.</i>",
-                          parse_mode=enums.ParseMode.HTML)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
     tmp = make_tmp(cfg.download_dir, uid)
+    # Use a dummy status object — panel auto-appears via tracker.register()
+    from types import SimpleNamespace
+    _dummy = SimpleNamespace(edit=lambda *a, **kw: asyncio.sleep(0),
+                             delete=lambda: asyncio.sleep(0))
     try:
         tp = await tg_download(
             client, media.file_id,
-            os.path.join(tmp, "dl.torrent"), st,
+            os.path.join(tmp, "dl.torrent"), _dummy,
             fname="dl.torrent",
             user_id=uid,
         )
@@ -157,8 +163,17 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
         result = await download_aria2(tp, tmp, is_file=True)
     except Exception as exc:
         cleanup(tmp)
-        return await safe_edit(st, f"❌ Torrent failed: <code>{exc}</code>",
-                               parse_mode=enums.ParseMode.HTML)
+        try:
+            from core.session import get_client
+            await get_client().send_message(
+                uid, f"❌ Torrent failed: <code>{exc}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+    from core.session import get_client
+    st = await get_client().send_message(uid, "📤 Uploading…", parse_mode=enums.ParseMode.HTML)
     await upload_file(client, st, result)
     cleanup(tmp)
 
@@ -267,12 +282,12 @@ async def _launch_download(
     fmt_id: str | None = None,
 ) -> None:
     tmp = make_tmp(cfg.download_dir, uid)
-    # Edit the action message to a simple "started" notice — no live panel here
-    st = await safe_edit(
-        panel_msg,
-        "📥 <b>Download started</b>\n\n<i>Use /status to track progress.</i>",
-        parse_mode=enums.ParseMode.HTML,
-    ) or panel_msg
+
+    # Delete the keyboard message — the auto panel will appear separately
+    try:
+        await panel_msg.delete()
+    except Exception:
+        pass
 
     try:
         path = await smart_download(
@@ -283,9 +298,17 @@ async def _launch_download(
         )
     except Exception as exc:
         cleanup(tmp)
-        return await safe_edit(st,
-            f"❌ <b>Download failed</b>\n\n<code>{exc}</code>",
-            parse_mode=enums.ParseMode.HTML)
+        try:
+            from core.session import get_client
+            from pyrogram import enums
+            await get_client().send_message(
+                uid,
+                f"❌ <b>Download failed</b>\n\n<code>{exc}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
 
     if os.path.isdir(path):
         resolved = largest_file(path)
@@ -294,18 +317,31 @@ async def _launch_download(
 
     if not os.path.isfile(path):
         cleanup(tmp)
-        return await safe_edit(st, "❌ File not found after download.",
-                               parse_mode=enums.ParseMode.HTML)
+        return
 
     fsize = os.path.getsize(path)
     if fsize > cfg.file_limit_b:
         cleanup(tmp)
-        return await safe_edit(st,
-            f"❌ <b>File too large</b>\n"
-            f"Size: <code>{human_size(fsize)}</code>\n"
-            f"Limit: <code>{human_size(cfg.file_limit_b)}</code>",
-            parse_mode=enums.ParseMode.HTML)
+        try:
+            from core.session import get_client
+            from pyrogram import enums
+            await get_client().send_message(
+                uid,
+                f"❌ <b>File too large</b>\n"
+                f"Size: <code>{human_size(fsize)}</code>\n"
+                f"Limit: <code>{human_size(cfg.file_limit_b)}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
 
+    # For upload we need a status message — send a minimal one
+    from core.session import get_client
+    from pyrogram import enums
+    st = await get_client().send_message(
+        uid, "📤 Uploading…", parse_mode=enums.ParseMode.HTML,
+    )
     await upload_file(client, st, path)
     cleanup(tmp)
 
