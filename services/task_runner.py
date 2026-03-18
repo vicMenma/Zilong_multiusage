@@ -23,7 +23,7 @@ MAX_WORKERS    = 10
 MAX_CONCURRENT = 5          # hard parallel task cap
 EDIT_INTERVAL  = 1.5
 PANEL_TTL      = 600
-TASK_LINGER    = 3    # finished tasks evicted after 3s — panel deletes before this anyway
+TASK_LINGER    = 15   # finished tasks stay 15s so panel sees them before eviction
 
 # Global semaphore — limits truly concurrent task execution to 5
 _task_semaphore: Optional[asyncio.Semaphore] = None
@@ -407,10 +407,16 @@ class LivePanel:
             if tasks:
                 had_tasks = True
 
-            # Once we had tasks and now everything is terminal (or evicted), delete and exit
+            # Delete panel only when we had tasks AND nothing is still running
+            # Check ALL modes — don't delete while an upload is still in progress
             if had_tasks:
                 active = [t for t in tasks if not t.is_terminal]
-                if not active:
+                # Also check for tasks that registered in the last 3s (just started)
+                recently_started = [
+                    t for t in tasks
+                    if t.is_terminal and (time.time() - (t.finished or 0)) < 5
+                ]
+                if not active and not recently_started:
                     try:
                         await self._msg.delete()
                     except Exception:

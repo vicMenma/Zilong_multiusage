@@ -33,12 +33,7 @@ _VIDEO_EXTS = {
 }
 
 # ── Upload tuning ──────────────────────────────────────────────
-# Pyrogram splits big files into parts. Bigger parts = fewer round-trips = higher throughput.
-# 512 KiB is safe for all Telegram DC configs and gives ~15–25 MB/s on a good VPS/Colab.
 _UPLOAD_PART_SIZE = 512 * 1024   # 512 KiB
-
-# How many parts to upload in parallel per file.
-# 4 is the practical max before Telegram returns FLOOD_WAIT.
 _CONCURRENT_PARTS = 4
 
 
@@ -224,12 +219,12 @@ async def _get_video_meta(path: str) -> dict:
 
 async def upload_file(
     client:         Client,
-    msg,                          # status message to delete after upload
+    msg,
     path:           str,
     caption:        str  = "",
     thumb:          str | None = None,
     force_document: bool = False,
-    task_record     = None,       # optional pre-existing TaskRecord
+    task_record     = None,
 ) -> None:
     if not os.path.isfile(path):
         await safe_edit(msg,
@@ -288,6 +283,7 @@ async def upload_file(
             tid=tid, user_id=chat_id,
             label=f"Upload {fname}", mode="ul", engine="telegram",
             fname=fname, total=file_size,
+            state="📤 Uploading",
         )
         await tracker.register(record)
     else:
@@ -299,7 +295,6 @@ async def upload_file(
 
     async def _progress(current: int, total: int) -> None:
         now = time.time()
-        # Update tracker at most every 0.5 s — panel loop will decide when to edit
         if now - last[0] < 0.5:
             return
         last[0]  = now
@@ -311,10 +306,8 @@ async def upload_file(
             speed=speed, eta=eta, elapsed=elapsed,
             state="📤 Uploading",
         )
-        # Wake panel (non-blocking)
         runner._wake_panel(chat_id)
 
-    # ── Send with high-throughput settings ─────────────────────
     async def _send() -> None:
         common = dict(
             caption=caption,
