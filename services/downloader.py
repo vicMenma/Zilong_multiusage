@@ -2,15 +2,10 @@
 services/downloader.py
 Download strategies — decoupled from Telegram types.
 
-Multi-operation changes:
-- download_ytdlp() uses a ProcessPoolExecutor (not ThreadPool) so multiple
-  yt-dlp downloads run in truly separate OS processes — no GIL contention,
-  no yt-dlp internal state conflicts.
-- ProcessPool is a module-level singleton (max 5 workers) so processes are
-  reused across calls and startup cost is paid once.
-- All other strategies (direct HTTP, aria2, gdrive, mediafire) were already
-  async / subprocess-based — no changes needed there.
-- smart_download() is unchanged; it remains a thin dispatcher.
+Change vs original:
+- _tracked_progress inside smart_download now calls runner._wake_panel(user_id)
+  so the live panel refreshes immediately on every progress tick instead of
+  waiting for the 1.5s EDIT_INTERVAL timer.
 """
 from __future__ import annotations
 
@@ -27,8 +22,6 @@ from services.utils import largest_file
 
 ProgressCB = Callable[[int, int, float, int], Awaitable[None]]
 
-# ── Process pool for yt-dlp (module-level singleton) ─────────
-# Max 5 parallel yt-dlp processes.  Each process is ~50 MB RAM.
 _YTDLP_POOL: Optional[ProcessPoolExecutor] = None
 
 
@@ -97,7 +90,7 @@ async def download_direct(
     return fpath
 
 
-# ── yt-dlp (process pool — true parallelism) ─────────────────
+# ── yt-dlp (process pool) ─────────────────────────────────────
 
 def _ytdlp_worker(
     url: str,
@@ -105,12 +98,6 @@ def _ytdlp_worker(
     audio_only: bool,
     fmt_id: Optional[str],
 ) -> str:
-    """
-    Runs inside a separate OS process.
-    No progress callback here (can't cross process boundary easily) —
-    progress is polled by the async wrapper via file size growth.
-    Returns the output file path.
-    """
     import yt_dlp
 
     out_tmpl = os.path.join(dest, "%(title).60s.%(ext)s")
@@ -158,25 +145,15 @@ async def download_ytdlp(
     fmt_id: Optional[str] = None,
     progress: Optional[ProgressCB] = None,
 ) -> str:
-    """
-    Runs yt-dlp in a separate process (ProcessPoolExecutor).
-    Progress is approximated by polling the output directory's largest file
-    every second while waiting — gives reasonable speed/ETA estimates without
-    needing cross-process callbacks.
-    """
     loop = asyncio.get_event_loop()
     pool = _get_pool()
 
-    # Submit to process pool — returns a Future
     future = loop.run_in_executor(
         pool,
         _ytdlp_worker,
         url, dest, audio_only, fmt_id,
     )
 
-    # ── Progress poller ───────────────────────────────────────
-    # While the process runs, poll the dest dir every second and estimate
-    # progress from file size growth (works for both video and audio).
     start     = time.time()
     last_size = 0
     last_time = start
@@ -192,13 +169,11 @@ async def download_ytdlp(
                 speed    = (cur_size - last_size) / dt if dt > 0 else 0.0
                 last_size = cur_size
                 last_time = now
-                # total is unknown until download starts, pass 0
                 eta = 0
                 await progress(cur_size, 0, speed, eta)
             except Exception:
                 pass
 
-    # Await result (re-raises any exception from the worker)
     return await future
 
 
@@ -273,9 +248,6 @@ async def download_gdrive(
 
 
 # ── Aria2 (magnet / torrent) ──────────────────────────────────
-# aria2c is already a separate process that manages its own concurrency.
-# Multiple download_aria2() calls simply add more downloads to the same
-# aria2c daemon — it handles them all in parallel natively.
 
 async def download_aria2(
     uri_or_path: str, dest: str,
@@ -334,6 +306,7 @@ async def download_aria2(
             meta_phase=False,
             state="📥 Downloading",
             label=dl.name[:40] if dl.name else task_record.label,
+            fname=dl.name[:40] if dl.name else task_record.fname,
         )
 
     # ── Phase 2: actual download ──────────────────────────────
@@ -364,6 +337,13 @@ async def download_aria2(
                 elapsed=elapsed,
                 state="📥 Downloading",
             )
+            # Wake the panel immediately on each update
+            try:
+                from services.task_runner import runner
+                runner._wake_panel(task_record.user_id)
+            except Exception:
+                pass
+
         if progress:
             await progress(done, total, speed, eta)
 
@@ -387,7 +367,7 @@ async def smart_download(
     user_id: int = 0,
     label: str = "",
 ) -> str:
-    from services.task_runner import tracker, TaskRecord
+    from services.task_runner import tracker, TaskRecord, runner
 
     kind   = classify(url)
     engine = {
@@ -410,6 +390,8 @@ async def smart_download(
 
     async def _tracked_progress(done: int, total: int, speed: float, eta: int) -> None:
         record.update(done=done, total=total, speed=speed, eta=eta, state="📥 Downloading")
+        # Wake the panel on every progress tick — no waiting for 1.5s timer
+        runner._wake_panel(user_id)
         if progress:
             await progress(done, total, speed, eta)
 
@@ -419,9 +401,11 @@ async def smart_download(
             _tracked_progress, record,
         )
         record.update(state="✅ Done")
+        runner._wake_panel(user_id)
         return result
     except Exception as exc:
         record.update(state=f"❌ {str(exc)[:50]}")
+        runner._wake_panel(user_id)
         raise
 
 
