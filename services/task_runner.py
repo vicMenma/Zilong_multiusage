@@ -220,43 +220,27 @@ tracker = GlobalTracker()
 # Panel renderer  — redesigned card-style layout
 # ─────────────────────────────────────────────────────────────
 
-def _bar(pct: float, w: int = 18) -> str:
-    """Segmented progress bar with a tip marker."""
-    pct   = min(max(pct, 0), 100)
+def _bar(pct: float, w: int = 12) -> str:
+    pct    = min(max(pct, 0), 100)
     filled = int(pct / 100 * w)
     empty  = w - filled
     if filled == 0:
-        return "░" * w
+        return "○" * w
     if filled == w:
-        return "█" * w
-    return "█" * (filled - 1) + "▓" + "░" * empty
+        return "●" * w
+    return "●" * filled + "○" * empty
 
 
-def _mini_bar(pct: float, w: int = 10) -> str:
-    filled = int(min(max(pct, 0), 100) / 100 * w)
-    return "█" * filled + "░" * (w - filled)
-
-
-def _spd_tier(bps: float) -> tuple[str, str]:
-    """Returns (emoji, label) for speed tier."""
+def _spd_icon(bps: float) -> str:
     mib = bps / (1024 * 1024)
-    if mib >= 50:  return "🚀", "blazing"
-    if mib >= 20:  return "⚡", "fast"
-    if mib >= 5:   return "🔥", "good"
-    if mib >= 1:   return "🏃", "normal"
-    if mib >= 0.1: return "🐢", "slow"
-    return "💤", "stalled"
+    if mib >= 20: return "⚡"
+    if mib >= 5:  return "🔥"
+    if mib >= 1:  return "🏃"
+    return "🐢"
 
 
 def _ring(p: float) -> str:
-    return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
-
-
-def _divider(label: str = "") -> str:
-    if label:
-        pad = max(0, 22 - len(label))
-        return f"┄┄ <i>{label}</i> " + "┄" * pad
-    return "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    return "🟢" if p < 50 else ("🟡" if p < 80 else "🔴")
 
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
@@ -265,125 +249,86 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     tasks    = tracker.tasks_for_user(target_uid) if target_uid else tracker.all_tasks()
     active   = [t for t in tasks if not t.is_terminal]
     finished = [t for t in tasks if t.is_terminal]
+    now      = time.time()
 
-    lines: list[str] = []
-    now = time.time()
-
-    # ── Header banner ─────────────────────────────────────────
     n_active  = len(active)
-    n_done    = len(finished)
     n_queued  = sum(1 for t in active if t.state == "⏳ Queued")
     n_running = n_active - n_queued
 
-    if n_active == 0 and n_done == 0:
-        status_tag = "💤 Idle"
-    elif n_queued and n_running:
-        status_tag = f"⚙️ {n_running} running · ⏳ {n_queued} queued"
-    elif n_running:
-        status_tag = f"⚙️ {n_running} running"
-    elif n_queued:
-        status_tag = f"⏳ {n_queued} queued"
-    else:
-        status_tag = f"✅ {n_done} done"
+    lines: list[str] = []
 
-    lines += [
-        f"╔══ ⚡ <b>ZILONG</b>  <code>{status_tag}</code>",
-        f"║  Slot capacity: <code>{MAX_CONCURRENT - n_running}/{MAX_CONCURRENT}</code> free",
-        "╚" + "═" * 26,
-        "",
-    ]
-
-    # ── Active task cards ─────────────────────────────────────
-    for i, t in enumerate(active):
-        pct = t.pct()
-        bar = _bar(pct, 18)
-
-        # Card border top
-        mode_l  = t.mode_lbl
-        eng_l   = t.engine_lbl
+    # ── Active tasks ──────────────────────────────────────────
+    for t in active:
+        pct     = t.pct()
+        bar     = _bar(pct, 12)
         elapsed = human_dur(int(t.elapsed)) if t.elapsed else "0s"
+        fname   = (t.fname or t.label)
+        fname_s = (fname[:45] + "…") if len(fname) > 45 else fname
+
+        # Mode header line  e.g.  📥 Download:  EyDxIZgtCZ
+        header_name = fname_s if fname_s else t.label
+        lines.append(f"{t.mode_icon} <b>{t.mode_lbl}:</b> <code>{header_name}</code>")
 
         if t.state == "⏳ Queued":
             lines += [
-                f"┌─ #{t.seq}  ⏳ <b>QUEUED</b>  [{mode_l}]",
-                f"│  📄 <code>{(t.fname or t.label)[:48]}</code>",
-                f"│  Waiting for a free slot…",
-                "└" + "─" * 28,
+                f"⏳ <b>Queued</b> — waiting for a free slot",
                 "",
             ]
             continue
 
-        # Running card
-        label_short = (t.label[:42] + "…") if len(t.label) > 42 else t.label
-        lines.append(f"┌─ #{t.seq}  {t.mode_icon} <b>{mode_l.upper()}</b>  {t.engine_icon} <code>{eng_l}</code>")
-
-        if t.fname and t.fname != t.label:
-            fname_short = (t.fname[:48] + "…") if len(t.fname) > 48 else t.fname
-            lines.append(f"│  📄 <code>{fname_short}</code>")
-        else:
-            lines.append(f"│  📌 <code>{label_short}</code>")
-
-        # Metadata fetch phase for magnets
         if t.meta_phase:
             lines += [
-                f"│",
-                f"│  🔍 <i>Fetching metadata…</i>",
-                f"│  🕰 Elapsed: <code>{elapsed}</code>",
-                "└" + "─" * 28,
+                f"🔍 <b>Fetching metadata…</b>",
+                f"⏱ <b>Elapsed:</b> {elapsed}",
                 "",
             ]
             continue
 
-        # Progress bar row
-        lines += [
-            f"│",
-            f"│  <code>[{bar}]</code>  <b>{pct:.1f}%</b>",
-            f"│",
-        ]
+        # Progress bar
+        lines.append(f"<code>[{bar}]</code> <b>{pct:.1f}%</b>")
 
-        # Stats grid — 2 per line for compactness
-        spd_ico, _tier = _spd_tier(t.speed)
-        spd_s = (human_size(t.speed) + "/s") if t.speed else "—"
-        eta_s = human_dur(t.eta) if t.eta > 0 else "—"
+        # Speed
+        spd_s = (human_size(t.speed) + "/s") if t.speed else "0 B/s"
+        lines.append(f"{_spd_icon(t.speed)} <b>Speed:</b> {spd_s}")
 
-        lines.append(f"│  {spd_ico} <b>Speed</b>  <code>{spd_s}</code>")
-        lines.append(f"│  ⏳ <b>ETA</b>    <code>{eta_s}</code>   🕰 <code>{elapsed}</code>")
-
+        # Done / total
         if t.total:
-            lines.append(
-                f"│  ✅ <b>Done</b>   <code>{human_size(t.done)}</code> / <code>{human_size(t.total)}</code>"
-            )
+            lines.append(f"🔄 <b>Done:</b> {human_size(t.done)} of {human_size(t.total)}")
         elif t.done:
-            lines.append(f"│  ✅ <b>Done</b>   <code>{human_size(t.done)}</code>")
+            lines.append(f"🔄 <b>Done:</b> {human_size(t.done)}")
+
+        # ETA | Elapsed
+        eta_s = human_dur(t.eta) if t.eta > 0 else "-"
+        lines.append(f"⏳ <b>ETA:</b> {eta_s} | <b>Elapsed:</b> {elapsed}")
+
+        # Engine
+        lines.append(f"⚙️ <b>Engine:</b> {t.engine_lbl}")
 
         if t.seeds:
-            lines.append(f"│  🌱 <b>Seeds</b>  <code>{t.seeds}</code>")
+            lines.append(f"🌱 <b>Seeds:</b> {t.seeds}")
 
-        # State chip
-        lines += [
-            f"│  ◉ {t.state}",
-            "└" + "─" * 28,
-            "",
-        ]
+        lines.append("")
 
-    # ── Finished list ─────────────────────────────────────────
+    # ── Separator between tasks and recent ────────────────────
+    if active and finished:
+        lines.append("—" * 18)
+
+    # ── Finished tasks ─────────────────────────────────────────
     if finished:
-        lines.append(_divider("Recent"))
         for t in finished:
-            age     = now - (t.finished or now)
-            age_s   = human_dur(int(age))
-            fname   = (t.fname or t.label)
-            short   = (fname[:36] + "…") if len(fname) > 36 else fname
-            sz_s    = human_size(t.done or t.total) if (t.done or t.total) else ""
-            el_s    = human_dur(int(t.elapsed)) if t.elapsed else ""
-            size_part = f"  <code>{sz_s}</code>" if sz_s else ""
-            time_part = f"  <i>{el_s}</i>" if el_s else ""
+            age_s  = human_dur(int(now - (t.finished or now)))
+            fname  = (t.fname or t.label)
+            short  = (fname[:38] + "…") if len(fname) > 38 else fname
+            sz_s   = human_size(t.done or t.total) if (t.done or t.total) else ""
+            el_s   = human_dur(int(t.elapsed)) if t.elapsed else ""
+            detail = f"  {sz_s}" if sz_s else ""
+            timing = f"  <i>{el_s}</i>" if el_s else ""
             lines.append(
-                f"  #{t.seq} {t.state}  {t.mode_icon}  <code>{short}</code>{size_part}{time_part}  <i>{age_s} ago</i>"
+                f"{t.state} {t.mode_icon} <code>{short}</code>{detail}{timing}  <i>({age_s} ago)</i>"
             )
         lines.append("")
 
-    # ── System stats footer ───────────────────────────────────
+    # ── System stats + slot info ───────────────────────────────
     stats = await system_stats()
     cpu   = stats.get("cpu", 0.0)
     rp    = stats.get("ram_pct", 0.0)
@@ -392,11 +337,10 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     ul    = stats.get("ul_speed", 0.0)
 
     lines += [
-        _divider("System"),
-        f"  🖥  CPU  {_ring(cpu)} <code>[{_mini_bar(cpu)}]</code> <b>{cpu:.0f}%</b>   "
-        f"💾 RAM  {_ring(rp)} <code>[{_mini_bar(rp)}]</code> <b>{rp:.0f}%</b>",
-        f"  💿 Disk <code>{human_size(df)} free</code>   "
-        f"⬇️ <code>{human_size(dl)}/s</code>  ⬆️ <code>{human_size(ul)}/s</code>",
+        "—" * 18,
+        f"🖥 <b>CPU:</b> {cpu:.1f}% | 💿 <b>FREE:</b> {human_size(df)}",
+        f"💾 <b>RAM:</b> {rp:.1f}% | {_ring(rp)} <b>Slots:</b> {MAX_CONCURRENT - n_running}/{MAX_CONCURRENT} free",
+        f"⬇️ <b>DL:</b> {human_size(dl)}/s | ⬆️ <b>UL:</b> {human_size(ul)}/s",
     ]
 
     return "\n".join(lines)
@@ -567,7 +511,7 @@ class TaskRunner:
                 client = get_client()
                 msg = await client.send_message(
                     uid,
-                    "⚡ <b>ZILONG</b>  <code>Starting…</code>",
+                    "⚡ <b>ZILONG BOT</b>  <code>Loading…</code>",
                     parse_mode=enums.ParseMode.HTML,
                 )
                 new_panel = LivePanel(msg, uid=uid)
