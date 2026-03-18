@@ -157,6 +157,9 @@ class GlobalTracker:
         return uuid.uuid4().hex[:8].upper()
 
     async def register(self, record: TaskRecord) -> None:
+        # Uploads start immediately — show correct state from the start
+        if record.mode == "ul" and record.state == "⏳ Queued":
+            record.state = "📤 Uploading"
         async with self._lock:
             self._evict()
             self._seq += 1
@@ -252,8 +255,10 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     now      = time.time()
 
     n_active  = len(active)
-    n_queued  = sum(1 for t in active if t.state == "⏳ Queued")
-    n_running = n_active - n_queued
+    # Only dl/proc/magnet tasks consume semaphore slots
+    n_queued  = sum(1 for t in active if t.state == "⏳ Queued" and t.mode in ("dl","proc","magnet"))
+    n_running = sum(1 for t in active if t.mode in ("dl","proc","magnet") and not t.state == "⏳ Queued")
+    n_uploads = sum(1 for t in active if t.mode == "ul")
 
     lines: list[str] = []
 
@@ -269,7 +274,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         header_name = fname_s if fname_s else t.label
         lines.append(f"{t.mode_icon} <b>{t.mode_lbl}:</b> <code>{header_name}</code>")
 
-        if t.state == "⏳ Queued":
+        if t.state == "⏳ Queued" and t.mode in ("dl", "proc", "magnet"):
             lines += [
                 f"⏳ <b>Queued</b> — waiting for a free slot",
                 "",
@@ -339,7 +344,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     lines += [
         "—" * 18,
         f"🖥 <b>CPU:</b> {cpu:.1f}% | 💿 <b>FREE:</b> {human_size(df)}",
-        f"💾 <b>RAM:</b> {rp:.1f}% | {_ring(rp)} <b>Slots:</b> {MAX_CONCURRENT - n_running}/{MAX_CONCURRENT} free",
+        f"💾 <b>RAM:</b> {rp:.1f}% | {_ring(rp)} <b>DL Slots:</b> {MAX_CONCURRENT - n_running}/{MAX_CONCURRENT}" + (f" · 📤 {n_uploads} uploading" if n_uploads else ""),
         f"⬇️ <b>DL:</b> {human_size(dl)}/s | ⬆️ <b>UL:</b> {human_size(ul)}/s",
     ]
 
@@ -553,12 +558,27 @@ class TaskRunner:
         return record
 
     async def _run_task(self, record: TaskRecord, factory) -> None:
-        sem = _get_semaphore()
-        # Show queued state while waiting for a slot
-        if sem.locked() or sem._value == 0:
-            record.update(state="⏳ Queued")
-        async with sem:
-            record.update(state="⚙️ Running")
+        # Uploads are pure network I/O — never gate them, always run immediately.
+        # Only downloads (dl/magnet) and processing (proc) consume CPU/disk slots.
+        needs_slot = record.mode in ("dl", "proc", "magnet")
+
+        if needs_slot:
+            sem = _get_semaphore()
+            if sem._value == 0:
+                record.update(state="⏳ Queued")
+            async with sem:
+                record.update(state="⚙️ Running")
+                try:
+                    await factory(record)
+                    record.update(state="✅ Done", done=record.total or record.done)
+                except asyncio.CancelledError:
+                    record.update(state="❌ Cancelled")
+                except Exception as exc:
+                    log.error("Task %s failed: %s", record.tid, exc)
+                    record.update(state=f"❌ {str(exc)[:60]}")
+        else:
+            # Uploads and other I/O — run freely, no slot consumed
+            record.update(state="📤 Uploading")
             try:
                 await factory(record)
                 record.update(state="✅ Done", done=record.total or record.done)
