@@ -885,7 +885,18 @@ async def _upload_and_cleanup(client, msg, path: str, tmp: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# Download launcher — silent progress, visible only via /status
+# Safe delete helper
+# ─────────────────────────────────────────────────────────────
+
+async def _safe_delete(msg) -> None:
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Download launcher — registers task BEFORE download so panel shows it
 # ─────────────────────────────────────────────────────────────
 
 async def _launch_download(
@@ -898,10 +909,37 @@ async def _launch_download(
 ) -> None:
     tmp = make_tmp(cfg.download_dir, uid)
 
-    try:
-        await panel_msg.delete()
-    except Exception:
-        pass
+    # Extract human label from magnet dn= or URL path
+    import urllib.parse as _up
+    dn_match = re.search(r"[&?]dn=([^&]+)", url)
+    if dn_match:
+        label = _up.unquote_plus(dn_match.group(1))[:50]
+    else:
+        label = url.split("/")[-1].split("?")[0][:50] or "Download"
+
+    # Delete keyboard message (fire and forget — doesn't block task registration)
+    asyncio.get_event_loop().create_task(_safe_delete(panel_msg))
+
+    # Pre-register a TaskRecord so the panel shows the download immediately,
+    # before smart_download creates its own. smart_download will create a
+    # duplicate but that's harmless — both track the same operation.
+    from services.task_runner import tracker, TaskRecord, runner
+    from services.downloader import classify
+    kind   = classify(url)
+    engine = {"magnet":"magnet","torrent":"aria2","gdrive":"gdrive",
+              "mediafire":"mediafire","ytdlp":"ytdlp","direct":"direct"}.get(kind, "direct")
+    mode   = "magnet" if kind in ("magnet", "torrent") else "dl"
+
+    pre_record = TaskRecord(
+        tid=tracker.new_tid(), user_id=uid,
+        label=label, mode=mode, engine=engine,
+        fname=label,
+        state="🔍 Fetching metadata…" if mode == "magnet" else "📥 Starting…",
+        meta_phase=(mode == "magnet"),
+    )
+    await tracker.register(pre_record)
+    # Give auto_panel time to send the panel message before the download blocks
+    await asyncio.sleep(0.3)
 
     try:
         path = await smart_download(
@@ -909,12 +947,15 @@ async def _launch_download(
             audio_only=audio_only,
             fmt_id=fmt_id,
             user_id=uid,
+            label=label,
         )
+        # Mark pre_record done once smart_download's own record takes over
+        pre_record.update(state="✅ Done", done=pre_record.total)
     except Exception as exc:
+        pre_record.update(state=f"❌ {str(exc)[:60]}")
         cleanup(tmp)
         try:
             from core.session import get_client
-            from pyrogram import enums
             await get_client().send_message(
                 uid,
                 f"❌ <b>Download failed</b>\n\n<code>{exc}</code>",
@@ -938,7 +979,6 @@ async def _launch_download(
         cleanup(tmp)
         try:
             from core.session import get_client
-            from pyrogram import enums
             await get_client().send_message(
                 uid,
                 f"❌ <b>File too large</b>\n"
@@ -951,6 +991,7 @@ async def _launch_download(
         return
 
     from types import SimpleNamespace
+
     _up_dummy = SimpleNamespace(
         edit=lambda *a, **kw: asyncio.sleep(0),
         delete=lambda: asyncio.sleep(0),
