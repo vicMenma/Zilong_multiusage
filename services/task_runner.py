@@ -235,6 +235,13 @@ def _ring(p: float) -> str:
     return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
 
 
+def _bar(pct: float, cells: int = 10) -> str:
+    """Compact emoji progress bar — 10 cells × 2 char-widths = 20 chars total.
+    Fits on any mobile screen inside Telegram's monospace block."""
+    filled = round(pct / 100 * cells)
+    return "🟩" * filled + "⬜" * (cells - filled)
+
+
 _SEP = "═══════════════════════════"
 
 
@@ -293,6 +300,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         mode_lbl = {"dl": "Download", "ul": "Upload", "magnet": "Torrent", "proc": "Processing"}.get(t.mode, t.mode)
 
         lines.append(f"📁 <code>{fname_s}</code>  <b>{pct:.1f}%</b>")
+        lines.append(_bar(pct))
         lines.append(f"{_spd_icon(t.speed)} <b>Speed:</b> <code>{spd_s}</code>")
 
         if t.total:
