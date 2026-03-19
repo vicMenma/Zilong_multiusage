@@ -219,6 +219,91 @@ def safe_fname(name: str) -> str:
     return "".join(c for c in name if c.isalnum() or c in keep).strip() or "file"
 
 
+# ─────────────────────────────────────────────────────────────
+# Smart filename cleaner
+# ─────────────────────────────────────────────────────────────
+import re as _re
+
+# Language/audio tags we explicitly KEEP — they are meaningful to the user
+_KEEP_TAGS: frozenset[str] = frozenset({
+    "VOSTFR", "VOSTA", "VF", "VO", "VOFR", "MULTI", "FRENCH", "ENGLISH",
+    "ENG", "FR", "JAP", "JPN", "KOR", "CHI", "SPA", "ITA", "GER", "POR",
+    "DUAL", "TRUEFRENCH", "SUBFRENCH", "VOSTEN", "VOSTJP",
+})
+
+# Technical noise we strip — matched case-insensitively as whole tokens
+_NOISE_RE = _re.compile(
+    r"^("
+    r"\d{3,4}p"                              # 720p 1080p 480p 2160p
+    r"|4[Kk]|UHD|SDR|HDR|HDR10|HDR10\+|DV|DoVi|10[Bb]it|8[Bb]it"
+    r"|WEB[\-\.]?DL|WEB|BluRay|Blu[\-\.]?Ray|BDRip|BRRip|HDRip"
+    r"|HDTV|PDTV|DVDRip|DVDScr|CAMRip|TELESYNC|TS"
+    r"|AMZN|NF|DSNP|HMAX|ATVP|CR|ADN|DISNEY\+?"
+    r"|x26[45]|HEVC|AVC|H\.?26[45]|XviD|DivX|VP9|AV1"
+    r"|AAC|AC3|DTS(?:[\-\.]?HD)?|FLAC|MP3|TrueHD|Atmos|EAC3|DD5|DD\+"
+    r"|REPACK|PROPER|EXTENDED|UNRATED|THEATRICAL|REMASTERED|REMUX"
+    r")\Z",
+    _re.IGNORECASE,
+)
+
+def smart_clean_filename(fname: str) -> str:
+    """
+    Strip technical release tags from an anime/series filename, keeping
+    the show name, episode identifier, and language tag.
+
+    Examples
+    --------
+    "Oshi no Ko S03E10 VOSTFR 720p WEB x264 AAC -Tsundere-Raws (ADN).mkv"
+        → "Oshi no Ko S03E10 VOSTFR.mkv"
+    "Jujutsu Kaisen S03E09 1080p BluRay x265.mkv"
+        → "Jujutsu Kaisen S03E09.mkv"
+    "[SubsPlease] Vinland Saga - 24 (1080p) [ABC123].mkv"
+        → "Vinland Saga - 24.mkv"
+    """
+    name, ext = os.path.splitext(fname)
+
+    # 1. Strip leading group tag in square brackets e.g. "[SubsPlease]"
+    name = _re.sub(r"^\[[^\]]{1,40}\]\s*", "", name).strip()
+
+    # Replace dots/underscores used as word separators with spaces
+    # (but only if the whole string looks like it uses them as separators)
+    if " " not in name and ("." in name or "_" in name):
+        name = name.replace(".", " ").replace("_", " ")
+
+    tokens = name.split()
+    keep: list[str] = []
+    last_lang_idx: int = -1
+
+    for i, tok in enumerate(tokens):
+        bare = _re.sub(r"[^\w\+]", "", tok).upper()  # strip punctuation for matching
+
+        if bare in _KEEP_TAGS:
+            keep.append(tok)
+            last_lang_idx = len(keep) - 1
+            continue
+
+        if _NOISE_RE.match(bare):
+            # Stop here — everything from this token on is technical noise.
+            # If a lang tag was the previous token, we already kept it.
+            break
+
+        # Strip trailing release-group tokens: "-GroupName" (hyphen + text, no spaces)
+        # A bare "-" token (episode separator like "Vinland Saga - 24") must be kept.
+        if tok.startswith("-") and len(tok) > 1 and i > 0:
+            break
+        if tok.startswith("(") and tok.endswith(")") and i > 0:
+            break
+        if tok.startswith("[") and tok.endswith("]") and i > 0:
+            break
+
+        keep.append(tok)
+
+    result = " ".join(keep).strip(" -_.,")
+    if not result:
+        return fname          # fallback: return original if we stripped everything
+    return result + ext
+
+
 def largest_file(directory: str) -> Optional[str]:
     best: Optional[str] = None
     best_sz = -1
