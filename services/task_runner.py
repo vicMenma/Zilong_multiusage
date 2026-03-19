@@ -221,8 +221,8 @@ tracker = GlobalTracker()
 # Panel renderer  — redesigned card-style layout
 # ─────────────────────────────────────────────────────────────
 
-def _bar(pct: float, w: int = 12) -> str:
-    """Reference bot style: [████████░░░░]"""
+def _bar(pct: float, w: int = 18) -> str:
+    """No-bracket block bar:  ██████████░░░░░░░░  57.3%"""
     pct    = min(max(pct, 0), 100)
     filled = int(pct / 100 * w)
     return "█" * filled + "░" * (w - filled)
@@ -232,7 +232,8 @@ def _spd_icon(bps: float) -> str:
     mib = bps / (1024 * 1024)
     if mib >= 50: return "🚀"
     if mib >= 10: return "⚡"
-    if mib >= 1:  return "🏃"
+    if mib >= 1:  return "🔥"
+    if mib >= .1: return "🏃"
     return "🐢"
 
 
@@ -241,14 +242,11 @@ def _ring(p: float) -> str:
 
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
-    """
-    Renders progress panel in reference-bot style:
-    one card per active task with status_bar format + sysINFO footer.
-    """
     from services.utils import human_size, human_dur, system_stats
 
-    tasks  = tracker.tasks_for_user(target_uid) if target_uid else tracker.all_tasks()
-    active = [t for t in tasks if not t.is_terminal]
+    tasks    = tracker.tasks_for_user(target_uid) if target_uid else tracker.all_tasks()
+    active   = [t for t in tasks if not t.is_terminal]
+    finished = [t for t in tasks if t.is_terminal]
 
     n_running = sum(
         1 for t in active
@@ -257,120 +255,110 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     n_queued  = sum(1 for t in active if t.state.startswith("⏳"))
     n_uploads = sum(1 for t in active if t.mode == "ul")
 
-    lines: list[str] = []
+    lines: list[str] = [
+        "⚡️ <b>ZILONG MULTIUSAGE BOT</b>",
+        "——————————————————————",
+    ]
 
-    # ── One card per active task ───────────────────────────────
+    # ── Active tasks ──────────────────────────────────────────
     for t in active:
         pct     = t.pct()
-        bar     = _bar(pct, 12)
+        bar     = _bar(pct, 18)
         elapsed = human_dur(int(t.elapsed)) if t.elapsed else "0s"
-        fname   = (t.fname or t.label)
-        fname_s = (fname[:48] + "…") if len(fname) > 48 else fname
+        fname   = t.fname or t.label
+        fname_s = (fname[:46] + "…") if len(fname) > 46 else fname
 
-        # ── Mode header  (📥 DOWNLOADING / 📤 UPLOADING / ⚙️ PROCESSING)
-        mode_headers = {
-            "dl":     "📥 <b>DOWNLOADING</b>",
-            "ul":     "📤 <b>UPLOADING</b>",
-            "magnet": "🧲 <b>TORRENT</b>",
-            "proc":   "⚙️ <b>PROCESSING</b>",
-        }
-        header = mode_headers.get(t.mode, "⚙️ <b>PROCESSING</b>")
-        lines.append(f"{header}")
-        lines.append(f"")
-        lines.append(f"<code>{fname_s}</code>")
-        lines.append("")
+        lines.append(f"📁 <code>{fname_s}</code>")
 
-        # ── Analyzing (ffprobe running before upload) ─────────
+        if t.state.startswith("⏳"):
+            lines += [f"⏳ <b>Queued</b> — waiting for a free slot", ""]
+            continue
+
         if t.state == "🔍 Analyzing…":
             lines += [
-                f"🔍 <b>Analyzing…</b>",
-                f"──────────────────",
-                f"⚙️  <b>Engine</b>   <code>ffprobe</code>",
-                f"🕰  <b>Elapsed</b>  <code>{elapsed}</code>",
-                f"<i>Reading video metadata, please wait…</i>",
-                "──────────────────",
+                f"🔍 <b>Analyzing…</b>  <code>{elapsed}</code>",
+                f"⚙️ Engine: <code>ffprobe</code>",
                 "",
             ]
             continue
 
-        # ── Queued ────────────────────────────────────────────
-        if t.state.startswith("⏳"):
-            lines += [
-                "⏳ <b>Queued</b> — waiting for a free slot",
-                "──────────────────",
-                "",
-            ]
-            continue
-
-        # ── Metadata phase ────────────────────────────────────
         if t.meta_phase:
             lines += [
-                f"🔍 <b>Fetching metadata…</b>",
-                f"──────────────────",
-                f"⚙️  <b>Engine</b>   <code>{t.engine_lbl}</code>",
-                f"🕰  <b>Elapsed</b>  <code>{elapsed}</code>",
-                f"<i>Contacting trackers, please wait…</i>",
-                "──────────────────",
+                f"🔍 <b>Fetching metadata…</b>  <code>{elapsed}</code>",
+                f"⚙️ Engine: <code>{t.engine_lbl}</code>",
                 "",
             ]
             continue
 
-        # ── Progress bar ──────────────────────────────────────
-        lines.append(f"<code>[{bar}]</code>  <b>{pct:.1f}%</b>")
-        lines.append("──────────────────")
+        lines.append(f"<code>{bar}</code> <b>{pct:.1f}%</b>")
 
-        # Speed
         spd_s = (human_size(t.speed) + "/s") if t.speed else "—"
-        lines.append(f"{_spd_icon(t.speed)}  <b>Speed</b>    <code>{spd_s}</code>")
+        lines.append(f"{_spd_icon(t.speed)} <b>Speed:</b> <code>{spd_s}</code>")
 
-        # Engine
-        lines.append(f"⚙️  <b>Engine</b>   <code>{t.engine_lbl}</code>")
-
-        # ETA
-        eta_s = human_dur(t.eta) if t.eta > 0 else "—"
-        lines.append(f"⏳  <b>ETA</b>      <code>{eta_s}</code>")
-
-        # Elapsed
-        lines.append(f"🕰  <b>Elapsed</b>  <code>{elapsed}</code>")
-
-        # Done / Total
-        lines.append(f"✅  <b>Done</b>     <code>{human_size(t.done)}</code>")
         if t.total:
-            lines.append(f"📦  <b>Total</b>    <code>{human_size(t.total)}</code>")
+            lines.append(
+                f"🔄 <b>Done:</b> <code>{human_size(t.done)}</code>"
+                f" of <code>{human_size(t.total)}</code>"
+            )
+        elif t.done:
+            lines.append(f"🔄 <b>Done:</b> <code>{human_size(t.done)}</code>")
 
-        # Seeds (torrent)
+        eta_s = human_dur(t.eta) if t.eta > 0 else "—"
+        lines.append(f"⏳ <b>ETA:</b> <code>{eta_s}</code> | <b>Elapsed:</b> <code>{elapsed}</code>")
+
+        mode_icon = {"dl": "📥", "ul": "📤", "magnet": "🧲", "proc": "⚙️"}.get(t.mode, "📦")
+        lines.append(
+            f"⚙️ <b>Engine:</b> <code>{t.engine_lbl}</code>"
+            f" | <b>Mode:</b> {mode_icon}<code>{t.mode_lbl}</code>"
+        )
+
         if t.seeds:
-            lines.append(f"🌱  <b>Seeds</b>    <code>{t.seeds}</code>")
+            lines.append(f"🌱 <b>Seeds:</b> <code>{t.seeds}</code>")
 
-        lines += ["──────────────────", ""]
+        lines.append("")
 
-    # ── sysINFO footer (reference bot style) ──────────────────
+    # ── Finished tasks ────────────────────────────────────────
+    if finished:
+        lines.append("——————————————————————")
+        now = time.time()
+        for t in finished[-3:]:
+            ago     = int(now - t.finished) if t.finished else 0
+            ago_s   = f"({ago}s ago)" if ago < 60 else f"({human_dur(ago)} ago)"
+            elapsed = human_dur(int(t.elapsed)) if t.elapsed else "—"
+            size_s  = human_size(t.total or t.done) if (t.total or t.done) else ""
+            icon    = "✅" if t.state.startswith("✅") else "❌"
+            mode_icon = {"dl": "📥", "ul": "📤", "magnet": "🧲", "proc": "⚙️"}.get(t.mode, "📦")
+            fname   = t.fname or t.label
+            fname_s = (fname[:30] + "…") if len(fname) > 30 else fname
+            parts   = [f"{icon} {mode_icon} <code>{fname_s}</code>"]
+            if size_s:  parts.append(f"<code>{size_s}</code>")
+            if elapsed: parts.append(f"<code>{elapsed}</code>")
+            parts.append(f"<i>{ago_s}</i>")
+            lines.append("  ".join(parts))
+        lines.append("")
+
+    # ── sysINFO footer ────────────────────────────────────────
     stats = await system_stats()
     cpu   = stats.get("cpu", 0.0)
-    ram   = stats.get("ram_pct", 0.0)
+    rp    = stats.get("ram_pct", 0.0)
     df    = stats.get("disk_free", 0)
     dl    = stats.get("dl_speed", 0.0)
     ul    = stats.get("ul_speed", 0.0)
 
     slots_s = f"{MAX_CONCURRENT - n_running}/{MAX_CONCURRENT}"
-    ul_tag  = f" · 📤{n_uploads}" if n_uploads else ""
-    q_tag   = f" · ⏳{n_queued}"  if n_queued  else ""
+    ul_tag  = f" · 📤 {n_uploads} uploading" if n_uploads else ""
+    q_tag   = f" · ⏳ {n_queued} queued"     if n_queued  else ""
 
     lines += [
-        "──────────────────",
-        f"🖥  CPU  {_ring(cpu)}<code>[{_bar(cpu, 8)}]</code> <b>{cpu:.0f}%</b>",
-        f"💾  RAM  <code>{human_size(stats.get('ram_used', 0) or 0)}</code>  ·  "
-        f"Slots <code>{slots_s}{ul_tag}{q_tag}</code>",
-        f"💿  Disk Free  <code>{human_size(df)}</code>",
-        f"⬇️  <code>{human_size(dl)}/s</code>  ⬆️  <code>{human_size(ul)}/s</code>",
+        "——————————————————————",
+        f"🖥 <b>CPU:</b> <code>{cpu:.1f}%</code> | 💿 <b>FREE:</b> <code>{human_size(df)}</code>",
+        f"💾 <b>RAM:</b> <code>{rp:.1f}%</code> | {_ring(rp)} <b>DL Slots:</b> <code>{slots_s}</code>{ul_tag}{q_tag}",
+        f"⬇️ <b>DL:</b> <code>{human_size(dl)}/s</code> | ⬆️ <b>UL:</b> <code>{human_size(ul)}/s</code>",
     ]
 
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────
-# LivePanel
-# ─────────────────────────────────────────────────────────────
 
 class LivePanel:
     def __init__(self, msg, uid: int) -> None:
