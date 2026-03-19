@@ -255,9 +255,15 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     finished = [t for t in tasks if t.is_terminal]
     now      = time.time()
 
-    # Only dl/proc/magnet tasks consume semaphore slots
-    n_queued  = sum(1 for t in active if t.state == "⏳ Queued" and t.mode in ("dl","proc","magnet"))
-    n_running = sum(1 for t in active if t.mode in ("dl","proc","magnet") and t.state != "⏳ Queued")
+    # Fix C: count all genuinely active download/processing tasks regardless of
+    # whether they went through the semaphore (smart_download bypasses it).
+    # A task is "running" if it's active, not queued, and is a download/proc.
+    n_running = sum(
+        1 for t in active
+        if t.mode in ("dl", "proc", "magnet")
+        and not t.state.startswith("⏳")
+    )
+    n_queued  = sum(1 for t in active if t.state.startswith("⏳"))
     n_uploads = sum(1 for t in active if t.mode == "ul")
 
     lines: list[str] = [_PANEL_HEADER, ""]
@@ -282,8 +288,8 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
         if t.meta_phase:
             lines += [
-                f"🔍 <b>Fetching metadata…</b>",
-                f"⏱ <b>Elapsed:</b> {elapsed}",
+                f"🔍 <b>Fetching metadata…</b>  <code>{elapsed}</code>",
+                f"<i>Contacting trackers, this may take up to 90s</i>",
                 "",
             ]
             continue
@@ -323,11 +329,12 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
     slots_s = f"{MAX_CONCURRENT - n_running}/{MAX_CONCURRENT}"
     ul_tag  = f" · 📤 {n_uploads} uploading" if n_uploads else ""
+    q_tag   = f" · ⏳ {n_queued} queued"     if n_queued  else ""
 
     lines += [
         "——————————————————————",
         f"🖥 <b>CPU:</b> {cpu:.1f}% | 💿 <b>FREE:</b> {human_size(df)}",
-        f"💾 <b>RAM:</b> {rp:.1f}% | {_ring(rp)} <b>DL Slots:</b> {slots_s}{ul_tag}",
+        f"💾 <b>RAM:</b> {rp:.1f}% | {_ring(rp)} <b>DL Slots:</b> {slots_s}{ul_tag}{q_tag}",
         f"⬇️ <b>DL:</b> {human_size(dl)}/s | ⬆️ <b>UL:</b> {human_size(ul)}/s",
     ]
 
@@ -490,19 +497,29 @@ class TaskRunner:
 
     async def auto_panel(self, uid: int) -> None:
         async with self._panel_lock(uid):
-            old = self._panels.pop(uid, None)
-            if old:
-                old.stop()
+            existing = self._panels.get(uid)
+
+            # Fix F: if a panel is already running for this user, just wake it
+            # rather than destroying it and creating a new one.  The destroy+create
+            # cycle causes a visible "blank gap" between the delete and the new send,
+            # and is especially noticeable when a download task transitions to upload.
+            if existing and not existing._stopped:
+                existing.wake()
+                return
+
+            # No panel exists (or it stopped) — clean up and create a fresh one.
+            if existing:
+                existing.stop()
                 try:
-                    await old._msg.delete()
+                    await existing._msg.delete()
                 except Exception:
                     pass
+                self._panels.pop(uid, None)
 
             try:
                 from core.session import get_client
                 from pyrogram import enums
                 client = get_client()
-                # Render the real panel immediately — no placeholder
                 initial_text = await render_panel(uid)
                 msg = await client.send_message(
                     uid,
@@ -513,7 +530,7 @@ class TaskRunner:
                 self._panels[uid] = new_panel
                 new_panel.start()
             except Exception as exc:
-                log.debug("auto_panel uid=%d: %s", uid, exc)
+                log.warning("auto_panel uid=%d failed: %s", uid, exc)
 
     def close_panel(self, uid: int) -> None:
         p = self._panels.pop(uid, None)

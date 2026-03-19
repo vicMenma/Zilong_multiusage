@@ -304,25 +304,56 @@ async def download_aria2(
         dl = api.add_magnet(uri_or_path, options=aria_opts)
 
     # ── Phase 1: metadata fetch ───────────────────────────────
+    # Fix B: set meta_phase=True IMMEDIATELY so the panel shows the right
+    # state from the very first render — not "⏳ Queued — waiting for a slot".
     if task_record is not None:
         task_record.update(meta_phase=True, state="🔍 Fetching metadata…")
+        try:
+            from services.task_runner import runner as _runner
+            _runner._wake_panel(task_record.user_id)
+        except Exception:
+            pass
 
     meta_start = time.time()
-    for _ in range(120):
+    for tick in range(120):
         await asyncio.sleep(1)
+        elapsed = time.time() - meta_start
+
         try:
             dl = api.get_download(dl.gid)
-        except Exception:
+        except Exception as exc:
+            # Fix D: don't skip the record update on exception — keep the
+            # metadata state visible so the user knows we're still trying.
+            if task_record is not None:
+                task_record.update(
+                    meta_phase=True,
+                    state=f"🔍 Metadata… (retry {tick+1})",
+                    elapsed=elapsed,
+                )
+                try:
+                    from services.task_runner import runner as _runner
+                    _runner._wake_panel(task_record.user_id)
+                except Exception:
+                    pass
             continue
+
         if dl.error_message:
             raise RuntimeError(f"aria2c: {dl.error_message}")
+
+        # Fix A: call _wake_panel on EVERY successful Phase 1 update
         if task_record is not None:
             task_record.update(
                 meta_phase=True,
-                state="🔍 Metadata…",
-                elapsed=time.time() - meta_start,
+                state="🔍 Fetching metadata…",
+                elapsed=elapsed,
             )
-        if dl.name and dl.name != "Unknown":
+            try:
+                from services.task_runner import runner as _runner
+                _runner._wake_panel(task_record.user_id)
+            except Exception:
+                pass
+
+        if dl.name and dl.name not in ("Unknown", ""):
             break
 
     if task_record is not None:
@@ -332,6 +363,11 @@ async def download_aria2(
             label=dl.name[:40] if dl.name else task_record.label,
             fname=dl.name[:40] if dl.name else task_record.fname,
         )
+        try:
+            from services.task_runner import runner as _runner
+            _runner._wake_panel(task_record.user_id)
+        except Exception:
+            pass
 
     # ── Phase 2: actual download ──────────────────────────────
     dl_start = time.time()
@@ -404,11 +440,18 @@ async def smart_download(
     }.get(kind, "direct")
 
     tid    = tracker.new_tid()
+    # Fix B: magnet/torrent tasks start in metadata phase immediately.
+    # This ensures auto_panel renders "🔍 Fetching metadata…" rather than
+    # "⏳ Queued — waiting for a free slot" on the very first panel render.
+    initial_meta   = kind in ("magnet", "torrent")
+    initial_state  = "🔍 Fetching metadata…" if initial_meta else "📥 Starting…"
     record = TaskRecord(
         tid=tid, user_id=user_id,
         label=label or url.split("/")[-1].split("?")[0][:40] or "Download",
         mode="magnet" if kind in ("magnet", "torrent") else "dl",
         engine=engine,
+        meta_phase=initial_meta,
+        state=initial_state,
     )
     await tracker.register(record)
 

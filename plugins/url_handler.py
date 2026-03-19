@@ -892,15 +892,34 @@ async def _launch_download(
 ) -> None:
     tmp = make_tmp(cfg.download_dir, uid)
 
-    # Extract human label from magnet dn= or URL path
-    dn_match = re.search(r"[&?]dn=([^&]+)", url)
-    if dn_match:
-        label = _up.unquote_plus(dn_match.group(1))[:50]
+    # Fix E: extract a clean human label from the magnet/URL.
+    # For magnets: use dn= parameter (decoded). Fall back to hash prefix.
+    # For URLs: use the filename portion. Never use the raw full URL as label.
+    kind = classify(url)
+    if kind in ("magnet", "torrent"):
+        dn_match = re.search(r"[&?]dn=([^&]+)", url)
+        if dn_match:
+            label = _up.unquote_plus(dn_match.group(1))[:50]
+        else:
+            # Extract just the info-hash as a short label
+            ih_match = re.search(r"xt=urn:btih:([a-fA-F0-9]{6,}|[A-Za-z2-7]{6,})", url)
+            label = f"Magnet {ih_match.group(1)[:12].upper()}" if ih_match else "Magnet Download"
     else:
         label = url.split("/")[-1].split("?")[0][:50] or "Download"
 
-    # Delete keyboard message (fire and forget)
-    asyncio.create_task(_safe_delete(panel_msg))
+    # Fix G: give immediate visible feedback by editing the keyboard message
+    # to a status line instead of deleting it silently.  The auto_panel will
+    # appear within ~1s; this covers the gap.
+    try:
+        await panel_msg.edit(
+            f"🧲 <b>Starting download…</b>\n"
+            f"<code>{label[:60]}</code>\n\n"
+            f"<i>Progress panel will appear shortly.</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception:
+        # If edit fails (already deleted, etc.) just delete silently
+        asyncio.create_task(_safe_delete(panel_msg))
 
     try:
         path = await smart_download(
@@ -912,6 +931,8 @@ async def _launch_download(
         )
     except Exception as exc:
         cleanup(tmp)
+        # Delete the "starting…" status message on failure
+        asyncio.create_task(_safe_delete(panel_msg))
         try:
             from core.session import get_client
             await get_client().send_message(
@@ -922,6 +943,9 @@ async def _launch_download(
         except Exception:
             pass
         return
+
+    # Delete the "starting…" status message — the panel takes over from here
+    asyncio.create_task(_safe_delete(panel_msg))
 
     if os.path.isdir(path):
         resolved = largest_file(path)
