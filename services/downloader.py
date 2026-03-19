@@ -337,7 +337,7 @@ async def download_aria2(
         task_record.update(meta_phase=True, state="🔍 Fetching metadata…")
         try:
             from services.task_runner import runner as _r
-            _r._wake_panel(task_record.user_id)
+            _r._wake_panel(task_record.user_id, immediate=True)
         except Exception:
             pass
 
@@ -472,7 +472,6 @@ async def smart_download(
 
     async def _tracked_progress(done: int, total: int, speed: float, eta: int) -> None:
         record.update(done=done, total=total, speed=speed, eta=eta, state="📥 Downloading")
-        # Wake the panel on every progress tick — no waiting for 1.5s timer
         runner._wake_panel(user_id)
         if progress:
             await progress(done, total, speed, eta)
@@ -483,11 +482,11 @@ async def smart_download(
             _tracked_progress, record,
         )
         record.update(state="✅ Done")
-        runner._wake_panel(user_id)
+        runner._wake_panel(user_id, immediate=True)
         return result
     except Exception as exc:
         record.update(state=f"❌ {str(exc)[:50]}")
-        runner._wake_panel(user_id)
+        runner._wake_panel(user_id, immediate=True)
         raise
 
 

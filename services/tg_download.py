@@ -69,5 +69,5 @@ async def tg_download(
 
     fsize_done = os.path.getsize(path) if path and os.path.exists(path) else fsize
     record.update(state="✅ Done", done=fsize_done, total=fsize_done)
-    runner._wake_panel(uid)
+    runner._wake_panel(uid, immediate=True)
     return path

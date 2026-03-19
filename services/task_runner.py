@@ -371,8 +371,14 @@ class LivePanel:
         self._last_edit = 0.0
         self._last_activity = time.time()
 
-    def wake(self) -> None:
+    def wake(self, immediate: bool = False) -> None:
+        """Wake the panel loop for a re-render.
+        immediate=True resets _last_edit so the 1.0s cooldown is bypassed —
+        use this when a new task arrives and we want instant feedback.
+        """
         self._last_activity = time.time()
+        if immediate:
+            self._last_edit = 0.0   # bypass the 1.0s since-last-edit guard
         self._wake_ev.set()
 
     def start(self) -> None:
@@ -518,7 +524,7 @@ class TaskRunner:
             # cycle causes a visible "blank gap" between the delete and the new send,
             # and is especially noticeable when a download task transitions to upload.
             if existing and not existing._stopped:
-                existing.wake()
+                existing.wake(immediate=True)   # immediate=True → no 1s cooldown
                 return
 
             # No panel exists (or it stopped) — clean up and create a fresh one.
@@ -551,10 +557,10 @@ class TaskRunner:
         if p:
             p.stop()
 
-    def _wake_panel(self, uid: int) -> None:
+    def _wake_panel(self, uid: int, immediate: bool = False) -> None:
         p = self._panels.get(uid)
         if p:
-            p.wake()
+            p.wake(immediate=immediate)
 
     # ── Task submission with semaphore ─────────────────────────
 
