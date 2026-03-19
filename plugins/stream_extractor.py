@@ -9,14 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
+import subprocess
 import time
 import urllib.parse as _urlparse
 from dataclasses import dataclass, field
 from typing import Optional
 
+import aiohttp
+import aria2p
+import yt_dlp
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -28,50 +33,13 @@ from services import ffmpeg as FF
 from services.downloader import classify, download_ytdlp, download_aria2
 from services.tg_download import tg_download
 from services.uploader import upload_file
-from services.utils import cleanup, human_size, make_tmp, safe_edit
+from services.utils import cleanup, human_size, lang_flag, lang_name, make_tmp, safe_edit
 
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-# Language flags & names
-# ─────────────────────────────────────────────────────────────
-
-_LANG_FLAG: dict[str, str] = {
-    "eng":"🇬🇧","en":"🇬🇧","jpn":"🇯🇵","ja":"🇯🇵",
-    "fra":"🇫🇷","fre":"🇫🇷","fr":"🇫🇷","deu":"🇩🇪","ger":"🇩🇪","de":"🇩🇪",
-    "spa":"🇪🇸","es":"🇪🇸","por":"🇧🇷","pt":"🇧🇷","ita":"🇮🇹","it":"🇮🇹",
-    "kor":"🇰🇷","ko":"🇰🇷","chi":"🇨🇳","zho":"🇨🇳","zh":"🇨🇳",
-    "rus":"🇷🇺","ru":"🇷🇺","ara":"🇸🇦","ar":"🇸🇦","hin":"🇮🇳","hi":"🇮🇳",
-    "tha":"🇹🇭","th":"🇹🇭","vie":"🇻🇳","vi":"🇻🇳","ind":"🇮🇩","id":"🇮🇩",
-    "msa":"🇲🇾","ms":"🇲🇾","tur":"🇹🇷","tr":"🇹🇷","pol":"🇵🇱","pl":"🇵🇱",
-    "nld":"🇳🇱","nl":"🇳🇱","swe":"🇸🇪","sv":"🇸🇪","nor":"🇳🇴","no":"🇳🇴",
-    "dan":"🇩🇰","da":"🇩🇰","fin":"🇫🇮","fi":"🇫🇮","heb":"🇮🇱","he":"🇮🇱",
-    "ces":"🇨🇿","cze":"🇨🇿","ron":"🇷🇴","rum":"🇷🇴","hun":"🇭🇺","hu":"🇭🇺",
-    "bul":"🇧🇬","bg":"🇧🇬","ukr":"🇺🇦","uk":"🇺🇦","und":"🌐",
-}
-
-_LANG_NAME: dict[str, str] = {
-    "eng":"English","en":"English","jpn":"Japanese","ja":"Japanese",
-    "fra":"French","fre":"French","fr":"French","deu":"German","ger":"German","de":"German",
-    "spa":"Spanish","es":"Spanish","por":"Portuguese","pt":"Portuguese",
-    "ita":"Italian","it":"Italian","kor":"Korean","ko":"Korean",
-    "chi":"Chinese","zho":"Chinese","zh":"Chinese","rus":"Russian","ru":"Russian",
-    "ara":"Arabic","ar":"Arabic","hin":"Hindi","hi":"Hindi","tha":"Thai","th":"Thai",
-    "vie":"Vietnamese","vi":"Vietnamese","ind":"Indonesian","id":"Indonesian",
-    "msa":"Malay","ms":"Malay","tur":"Turkish","tr":"Turkish","pol":"Polish","pl":"Polish",
-    "nld":"Dutch","nl":"Dutch","swe":"Swedish","sv":"Swedish","nor":"Norwegian","no":"Norwegian",
-    "dan":"Danish","da":"Danish","fin":"Finnish","fi":"Finnish","heb":"Hebrew","he":"Hebrew",
-    "ces":"Czech","cze":"Czech","ron":"Romanian","rum":"Romanian","hun":"Hungarian","hu":"Hungarian",
-    "bul":"Bulgarian","bg":"Bulgarian","ukr":"Ukrainian","uk":"Ukrainian","und":"Unknown",
-}
-
-
-def _flag(lang: str) -> str:
-    return _LANG_FLAG.get(lang.lower(), "🌐")
-
-
-def _lang_name(lang: str) -> str:
-    return _LANG_NAME.get(lang.lower(), lang.upper())
+# Convenience aliases for the compact call-site style used throughout this file
+_flag  = lang_flag
+_lang_name = lang_name
 
 
 # ─────────────────────────────────────────────────────────────
@@ -281,7 +249,6 @@ async def _ffprobe_url(url: str) -> dict | None:
     Returns parsed JSON or None if it fails / finds no streams.
     Works on seedr.cc, DDL .mkv, any direct media link.
     """
-    import subprocess as _sp
     cmd = [
         "ffprobe", "-v", "quiet",
         "-allowed_extensions", "ALL",
@@ -300,8 +267,7 @@ async def _ffprobe_url(url: str) -> dict | None:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
         if proc.returncode != 0 or not out.strip():
             return None
-        import json as _json
-        data = _json.loads(out.decode(errors="replace"))
+        data = json.loads(out.decode(errors="replace"))
         # Only return if actual media streams found
         streams = data.get("streams", [])
         if any(s.get("codec_type") in ("video", "audio", "subtitle") for s in streams):
@@ -317,7 +283,6 @@ def _build_session_from_ffprobe(data: dict, url: str) -> dict:
     Convert raw ffprobe JSON into the same session format used by yt-dlp path.
     Returns {url, title, video:[], audio:[], subtitle:[]} groups for _show_url_streams.
     """
-    import json as _json
 
     streams  = data.get("streams", [])
     fmt      = data.get("format", {})
@@ -427,14 +392,13 @@ async def extract_url_streams(
 
     # ── Strategy 2: yt-dlp for platforms ─────────────────────
     try:
-        import yt_dlp
         ydl_opts = {
             "quiet":       True,
             "no_warnings": True,
             "noplaylist":  False,
             "extract_flat":"in_playlist",
         }
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         def _extract() -> dict:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=False)
@@ -572,6 +536,10 @@ async def se_fp_cb(client: Client, cb: CallbackQuery):
             parse_mode=enums.ParseMode.HTML)
 
 
+async def _show_playlist(
+    client: Client, st, url: str, info: dict, entries: list, uid: int,
+) -> None:
+    """Display a yt-dlp playlist and let the user pick a video or download all."""
     title   = info.get("title", "Playlist")[:50]
     channel = info.get("uploader", "")
     total   = len(entries)
@@ -627,8 +595,7 @@ async def _show_url_streams(client, st, url, info, uid):
         "──────────────────────",
     ]
 
-    bucket_count = sum(len(v) for v in groups.values())
-    if bucket_count == 0:
+    if not groups:
         lines.append("⚠️ No downloadable streams found.")
     else:
         for bucket in _QUALITY_ORDER:
@@ -735,7 +702,6 @@ async def extract_magnet_streams(client, st, magnet: str, uid: int) -> None:
 
 
 async def _aria2_file_list(magnet: str) -> tuple[list[dict], str]:
-    import aria2p
     api = aria2p.API(aria2p.Client(
         host=cfg.aria2_host, port=cfg.aria2_port, secret=cfg.aria2_secret,
     ))
@@ -1307,7 +1273,6 @@ async def _download_url_fmt(
 
 
 async def _download_subtitle(client, st, sub_url: str, lang: str, uid: int) -> None:
-    import aiohttp
     flag  = _flag(lang)
     lname = _lang_name(lang)
     tmp   = make_tmp(cfg.download_dir, uid)
@@ -1416,7 +1381,6 @@ async def se_mag_cb(client: Client, cb: CallbackQuery):
             await safe_edit(st, panel, parse_mode=enums.ParseMode.HTML)
 
         try:
-            import aria2p
             api = aria2p.API(aria2p.Client(
                 host=cfg.aria2_host, port=cfg.aria2_port, secret=cfg.aria2_secret,
             ))

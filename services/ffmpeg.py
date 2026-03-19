@@ -472,11 +472,21 @@ async def extract_subtitle(inp: str, out: str, stream_index: int = 0) -> None:
     await _run(["ffmpeg","-y","-i",inp,"-map",f"0:s:{stream_index}",out], "ExtractSub")
 
 async def merge_av(video: str, audio: str, out: str) -> None:
-    await _run([
-        "ffmpeg","-y","-i",video,"-i",audio,
-        "-c:v","copy","-c:a","aac",
-        "-map","0:v:0","-map","1:a:0",out,
-    ], "MergeAV")
+    # Try stream-copy first (fast, lossless). Fall back to AAC transcode if
+    # the muxer rejects the audio codec (e.g. mixing Opus/DTS into MP4).
+    try:
+        await _run([
+            "ffmpeg", "-y", "-i", video, "-i", audio,
+            "-c:v", "copy", "-c:a", "copy",
+            "-map", "0:v:0", "-map", "1:a:0", out,
+        ], "MergeAV(copy)")
+    except RuntimeError:
+        log.info("merge_av copy failed — retrying with AAC transcode")
+        await _run([
+            "ffmpeg", "-y", "-i", video, "-i", audio,
+            "-c:v", "copy", "-c:a", "aac",
+            "-map", "0:v:0", "-map", "1:a:0", out,
+        ], "MergeAV(aac)")
 
 async def mux_subtitle(video: str, sub: str, out: str) -> None:
     await _run(["ffmpeg","-y","-i",video,"-i",sub,"-c","copy","-map","0","-map","1",out], "MuxSub")
@@ -631,12 +641,23 @@ async def optimize(inp: str, out: str, crf: int = 23) -> None:
 
 
 async def convert_video(inp: str, out: str) -> None:
-    await _run([
-        "ffmpeg","-y","-i",inp,
-        "-c:v","libx264","-preset","fast","-crf","18",
-        "-c:a","aac","-b:a","192k",
-        out,
-    ], "ConvertVideo")
+    # If the source is already H.264 with AAC audio (common remux case, e.g. MKV→MP4),
+    # try a fast stream-copy first. Fall back to full re-encode if the container
+    # rejects it (e.g. AVI→MP4 with incompatible bitstream).
+    try:
+        await _run([
+            "ffmpeg", "-y", "-i", inp,
+            "-c:v", "copy", "-c:a", "copy",
+            out,
+        ], "ConvertVideo(copy)")
+    except RuntimeError:
+        log.info("convert_video copy failed — retrying with re-encode")
+        await _run([
+            "ffmpeg", "-y", "-i", inp,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            out,
+        ], "ConvertVideo(reencode)")
 
 
 async def stream_op(inp: str, out: str, map_args: list) -> None:

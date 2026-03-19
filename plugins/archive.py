@@ -60,7 +60,7 @@ def _list_archive(path: str) -> list[str]:
 
 async def _extract(archive: str, out_dir: str, password: str | None = None) -> list[str]:
     ext  = Path(archive).suffix.lower()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     os.makedirs(out_dir, exist_ok=True)
 
     def _zip():
@@ -118,7 +118,7 @@ async def _extract(archive: str, out_dir: str, password: str | None = None) -> l
 
 async def _create_zip(paths: list, out: str) -> None:
     import zipfile
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     def _make():
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             for p in paths:
@@ -128,7 +128,7 @@ async def _create_zip(paths: list, out: str) -> None:
 
 async def _create_7z(paths: list, out: str) -> None:
     import py7zr
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     def _make():
         with py7zr.SevenZipFile(out, mode="w") as z:
             for p in paths:
@@ -143,7 +143,7 @@ async def create_archive(paths: list, out: str, fmt: str = "zip") -> None:
         await _create_7z(paths, out)
     elif fmt == "tar.gz":
         import tarfile
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         def _make():
             with tarfile.open(out, "w:gz") as t:
                 for p in paths:
@@ -181,7 +181,7 @@ async def handle_archive_file(
         return await safe_edit(st, f"❌ Download failed: <code>{exc}</code>",
                                parse_mode=enums.ParseMode.HTML)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     contents = await loop.run_in_executor(None, _list_archive, path)
     preview  = "\n".join(f"  {f}" for f in contents[:20])
     if len(contents) > 20:

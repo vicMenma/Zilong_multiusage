@@ -28,19 +28,14 @@ from services import ffmpeg as FF
 from services.tg_download import tg_download
 from services.uploader import upload_file
 from services.utils import (
-    cleanup, fmt_hms, human_size, make_tmp, progress_panel, safe_edit,
+    cleanup, fmt_hms, human_size, lang_flag, lang_name,
+    make_tmp, progress_panel, safe_edit,
 )
 
 log = logging.getLogger(__name__)
 
-LANG = {
-    "eng":"English","jpn":"Japanese","fre":"French","fra":"French",
-    "ger":"German","deu":"German","ita":"Italian","spa":"Spanish",
-    "por":"Portuguese","kor":"Korean","chi":"Chinese","zho":"Chinese",
-    "rus":"Russian","ara":"Arabic","hin":"Hindi","tha":"Thai",
-    "vie":"Vietnamese","ind":"Indonesian","msa":"Malay","tur":"Turkish",
-    "und":"",
-}
+# Build the compact LANG dict used for stream labels from the shared table
+from services.utils import LANG_NAME as LANG
 
 _IGNORED = {
     "start","help","settings","info","broadcast","stats","log","restart",

@@ -19,7 +19,6 @@ from typing import Awaitable, Callable, Optional
 
 log = logging.getLogger(__name__)
 
-MAX_WORKERS    = 10
 MAX_CONCURRENT = 5          # hard parallel task cap
 EDIT_INTERVAL  = 1.5
 PANEL_TTL      = 600
@@ -99,13 +98,12 @@ class TaskRecord:
     finished: Optional[float] = None
     seq:      int   = 0
 
-    _factory: Optional[Callable] = field(default=None, repr=False, compare=False)
     _dirty:   asyncio.Event      = field(default_factory=asyncio.Event, repr=False)
 
     def update(self, **kw) -> None:
         changed = False
         for k, v in kw.items():
-            if hasattr(self, k) and k not in ("_factory", "_dirty"):
+            if hasattr(self, k) and k not in ("_dirty",):
                 if getattr(self, k) != v:
                     setattr(self, k, v)
                     changed = True
@@ -165,7 +163,7 @@ class GlobalTracker:
             self._seq += 1
             record.seq = self._seq
             self._tasks[record.tid] = record
-        asyncio.get_event_loop().create_task(
+        asyncio.create_task(
             runner.auto_panel(record.user_id)
         )
 
@@ -357,7 +355,7 @@ class LivePanel:
         self._wake_ev.set()
 
     def start(self) -> None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         self._task = loop.create_task(self._loop())
 
     def stop(self) -> None:
@@ -434,7 +432,6 @@ class LivePanel:
 
 class TaskRunner:
     def __init__(self) -> None:
-        self._workers:      list[asyncio.Task]   = []
         self._panels:       dict[int, LivePanel] = {}
         self._panel_locks:  dict[int, asyncio.Lock] = {}
         self._running       = False
@@ -449,16 +446,18 @@ class TaskRunner:
         # Pre-create the semaphore on the running event loop
         global _task_semaphore
         _task_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-        loop = asyncio.get_event_loop()
-        for _ in range(MAX_WORKERS):
-            self._workers.append(loop.create_task(self._worker()))
 
     def stop(self) -> None:
         self._running = False
-        for w in self._workers:
-            w.cancel()
         for p in self._panels.values():
             p.stop()
+        # Shut down the yt-dlp process pool if it was created
+        try:
+            from services.downloader import _YTDLP_POOL
+            if _YTDLP_POOL is not None:
+                _YTDLP_POOL.shutdown(wait=False)
+        except Exception:
+            pass
 
     # ── Panel lifecycle ───────────────────────────────────────
 
@@ -544,7 +543,7 @@ class TaskRunner:
             fname=fname, total=total, mode=mode, engine=engine,
         )
         await tracker.register(record)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.create_task(self._run_task(record, coro_factory))
         return record
 
@@ -578,11 +577,6 @@ class TaskRunner:
             except Exception as exc:
                 log.error("Task %s failed: %s", record.tid, exc)
                 record.update(state=f"❌ {str(exc)[:60]}")
-
-    async def _worker(self) -> None:
-        """Legacy worker — kept so start()/stop() don't break. Does nothing now."""
-        while self._running:
-            await asyncio.sleep(5)
 
 
 runner = TaskRunner()

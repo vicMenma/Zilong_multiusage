@@ -15,6 +15,48 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
+# Shared language lookup tables (single source of truth)
+# ─────────────────────────────────────────────────────────────
+
+LANG_FLAG: dict[str, str] = {
+    "eng":"🇬🇧","en":"🇬🇧","jpn":"🇯🇵","ja":"🇯🇵",
+    "fra":"🇫🇷","fre":"🇫🇷","fr":"🇫🇷","deu":"🇩🇪","ger":"🇩🇪","de":"🇩🇪",
+    "spa":"🇪🇸","es":"🇪🇸","por":"🇧🇷","pt":"🇧🇷","ita":"🇮🇹","it":"🇮🇹",
+    "kor":"🇰🇷","ko":"🇰🇷","chi":"🇨🇳","zho":"🇨🇳","zh":"🇨🇳",
+    "rus":"🇷🇺","ru":"🇷🇺","ara":"🇸🇦","ar":"🇸🇦","hin":"🇮🇳","hi":"🇮🇳",
+    "tha":"🇹🇭","th":"🇹🇭","vie":"🇻🇳","vi":"🇻🇳","ind":"🇮🇩","id":"🇮🇩",
+    "msa":"🇲🇾","ms":"🇲🇾","tur":"🇹🇷","tr":"🇹🇷","pol":"🇵🇱","pl":"🇵🇱",
+    "nld":"🇳🇱","nl":"🇳🇱","swe":"🇸🇪","sv":"🇸🇪","nor":"🇳🇴","no":"🇳🇴",
+    "dan":"🇩🇰","da":"🇩🇰","fin":"🇫🇮","fi":"🇫🇮","heb":"🇮🇱","he":"🇮🇱",
+    "ces":"🇨🇿","cze":"🇨🇿","ron":"🇷🇴","rum":"🇷🇴","hun":"🇭🇺","hu":"🇭🇺",
+    "bul":"🇧🇬","bg":"🇧🇬","ukr":"🇺🇦","uk":"🇺🇦","und":"🌐",
+}
+
+LANG_NAME: dict[str, str] = {
+    "eng":"English","en":"English","jpn":"Japanese","ja":"Japanese",
+    "fra":"French","fre":"French","fr":"French","deu":"German","ger":"German","de":"German",
+    "spa":"Spanish","es":"Spanish","por":"Portuguese","pt":"Portuguese",
+    "ita":"Italian","it":"Italian","kor":"Korean","ko":"Korean",
+    "chi":"Chinese","zho":"Chinese","zh":"Chinese","rus":"Russian","ru":"Russian",
+    "ara":"Arabic","ar":"Arabic","hin":"Hindi","hi":"Hindi","tha":"Thai","th":"Thai",
+    "vie":"Vietnamese","vi":"Vietnamese","ind":"Indonesian","id":"Indonesian",
+    "msa":"Malay","ms":"Malay","tur":"Turkish","tr":"Turkish","pol":"Polish","pl":"Polish",
+    "nld":"Dutch","nl":"Dutch","swe":"Swedish","sv":"Swedish","nor":"Norwegian","no":"Norwegian",
+    "dan":"Danish","da":"Danish","fin":"Finnish","fi":"Finnish","heb":"Hebrew","he":"Hebrew",
+    "ces":"Czech","cze":"Czech","ron":"Romanian","rum":"Romanian","hun":"Hungarian","hu":"Hungarian",
+    "bul":"Bulgarian","bg":"Bulgarian","ukr":"Ukrainian","uk":"Ukrainian","und":"Unknown",
+}
+
+
+def lang_flag(lang: str) -> str:
+    return LANG_FLAG.get(lang.lower(), "🌐")
+
+
+def lang_name(lang: str) -> str:
+    return LANG_NAME.get(lang.lower(), lang.upper())
+
+
+# ─────────────────────────────────────────────────────────────
 # Formatters
 # ─────────────────────────────────────────────────────────────
 

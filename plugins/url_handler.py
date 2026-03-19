@@ -16,8 +16,12 @@ import hashlib
 import logging
 import os
 import re
+import tempfile
 import time
+import urllib.parse as _up
 
+import aiohttp
+import aria2p
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -28,9 +32,13 @@ from core.session import users
 from services.downloader import classify, smart_download, download_ytdlp
 from services.tg_download import tg_download
 from services.uploader import upload_file
-from services.utils import cleanup, human_size, largest_file, make_tmp, safe_edit
+from services.utils import cleanup, human_size, lang_flag, lang_name, largest_file, make_tmp, safe_edit
 
 log = logging.getLogger(__name__)
+
+# Convenience aliases
+_flag  = lang_flag
+_lname = lang_name
 
 URL_RE = re.compile(r"https?://\S+|magnet:\?\S+", re.I)
 
@@ -160,6 +168,7 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
             client, media.file_id,
             os.path.join(tmp, "dl.torrent"), _dummy,
             fname="dl.torrent",
+            fsize=getattr(media, "file_size", 0) or 0,
             user_id=uid,
         )
         from services.downloader import download_aria2
@@ -181,7 +190,7 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
         delete=lambda: asyncio.sleep(0),
         chat=SimpleNamespace(id=uid),
     )
-    asyncio.get_event_loop().create_task(_upload_and_cleanup(client, _up_dummy, result, tmp))
+    asyncio.create_task(_upload_and_cleanup(client, _up_dummy, result, tmp))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -196,7 +205,6 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
     """
     from services import ffmpeg as FF
     from services.task_runner import tracker, TaskRecord, runner
-    import aria2p
 
     tmp = make_tmp(cfg.download_dir, uid)
     await safe_edit(st,
@@ -531,7 +539,7 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             url2   = url
             fmt_id = raw or None
         _cache.pop(token, None)
-        asyncio.get_event_loop().create_task(
+        asyncio.create_task(
             _launch_download(client, cb.message, url2, uid, fmt_id=fmt_id)
         )
         return
@@ -540,7 +548,7 @@ async def dl_cb(client: Client, cb: CallbackQuery):
     if mode in ("video", "audio"):
         audio_only = (mode == "audio")
         _cache.pop(token, None)
-        asyncio.get_event_loop().create_task(
+        asyncio.create_task(
             _launch_download(client, cb.message, url, uid, audio_only=audio_only)
         )
 
@@ -548,31 +556,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 # ─────────────────────────────────────────────────────────────
 # Magnet stream display + extraction
 # ─────────────────────────────────────────────────────────────
-
-_LANG_FLAG: dict[str, str] = {
-    "eng":"🇬🇧","en":"🇬🇧","jpn":"🇯🇵","ja":"🇯🇵",
-    "fra":"🇫🇷","fre":"🇫🇷","fr":"🇫🇷","deu":"🇩🇪","ger":"🇩🇪","de":"🇩🇪",
-    "spa":"🇪🇸","es":"🇪🇸","por":"🇧🇷","pt":"🇧🇷","ita":"🇮🇹","it":"🇮🇹",
-    "kor":"🇰🇷","ko":"🇰🇷","zho":"🇨🇳","zh":"🇨🇳","rus":"🇷🇺","ru":"🇷🇺",
-    "ara":"🇸🇦","ar":"🇸🇦","hin":"🇮🇳","hi":"🇮🇳","und":"🌐",
-}
-
-_LANG_NAME: dict[str, str] = {
-    "eng":"English","en":"English","jpn":"Japanese","ja":"Japanese",
-    "fra":"French","fre":"French","fr":"French","deu":"German","ger":"German","de":"German",
-    "spa":"Spanish","es":"Spanish","por":"Portuguese","pt":"Portuguese",
-    "ita":"Italian","it":"Italian","kor":"Korean","ko":"Korean",
-    "zho":"Chinese","zh":"Chinese","rus":"Russian","ru":"Russian",
-    "ara":"Arabic","ar":"Arabic","hin":"Hindi","hi":"Hindi","und":"Unknown",
-}
-
-
-def _flag(lang: str) -> str:
-    return _LANG_FLAG.get(lang.lower(), "🌐")
-
-
-def _lname(lang: str) -> str:
-    return _LANG_NAME.get(lang.lower(), lang.upper())
 
 
 async def _show_magnet_streams(
@@ -910,36 +893,14 @@ async def _launch_download(
     tmp = make_tmp(cfg.download_dir, uid)
 
     # Extract human label from magnet dn= or URL path
-    import urllib.parse as _up
     dn_match = re.search(r"[&?]dn=([^&]+)", url)
     if dn_match:
         label = _up.unquote_plus(dn_match.group(1))[:50]
     else:
         label = url.split("/")[-1].split("?")[0][:50] or "Download"
 
-    # Delete keyboard message (fire and forget — doesn't block task registration)
-    asyncio.get_event_loop().create_task(_safe_delete(panel_msg))
-
-    # Pre-register a TaskRecord so the panel shows the download immediately,
-    # before smart_download creates its own. smart_download will create a
-    # duplicate but that's harmless — both track the same operation.
-    from services.task_runner import tracker, TaskRecord, runner
-    from services.downloader import classify
-    kind   = classify(url)
-    engine = {"magnet":"magnet","torrent":"aria2","gdrive":"gdrive",
-              "mediafire":"mediafire","ytdlp":"ytdlp","direct":"direct"}.get(kind, "direct")
-    mode   = "magnet" if kind in ("magnet", "torrent") else "dl"
-
-    pre_record = TaskRecord(
-        tid=tracker.new_tid(), user_id=uid,
-        label=label, mode=mode, engine=engine,
-        fname=label,
-        state="🔍 Fetching metadata…" if mode == "magnet" else "📥 Starting…",
-        meta_phase=(mode == "magnet"),
-    )
-    await tracker.register(pre_record)
-    # Give auto_panel time to send the panel message before the download blocks
-    await asyncio.sleep(0.3)
+    # Delete keyboard message (fire and forget)
+    asyncio.create_task(_safe_delete(panel_msg))
 
     try:
         path = await smart_download(
@@ -949,10 +910,7 @@ async def _launch_download(
             user_id=uid,
             label=label,
         )
-        # Mark pre_record done once smart_download's own record takes over
-        pre_record.update(state="✅ Done", done=pre_record.total)
     except Exception as exc:
-        pre_record.update(state=f"❌ {str(exc)[:60]}")
         cleanup(tmp)
         try:
             from core.session import get_client
@@ -997,7 +955,7 @@ async def _launch_download(
         delete=lambda: asyncio.sleep(0),
         chat=SimpleNamespace(id=uid),
     )
-    asyncio.get_event_loop().create_task(_upload_and_cleanup(client, _up_dummy, path, tmp))
+    asyncio.create_task(_upload_and_cleanup(client, _up_dummy, path, tmp))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1051,8 +1009,6 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
 
     # Direct link
     try:
-        import aiohttp
-        import tempfile
         from services.ffmpeg import probe_streams, probe_duration, get_mediainfo
         headers = {"User-Agent":"Mozilla/5.0","Range":"bytes=0-5242880"}
         async with aiohttp.ClientSession() as sess:

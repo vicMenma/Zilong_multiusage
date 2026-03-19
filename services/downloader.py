@@ -10,12 +10,17 @@ Change vs original:
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import re
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Callable, Awaitable, Optional
+
+import aiohttp
+import aria2p
+import yt_dlp
 
 from core.config import cfg
 from services.utils import largest_file
@@ -59,7 +64,6 @@ def classify(url: str) -> str:
 async def download_direct(
     url: str, dest: str, progress: Optional[ProgressCB] = None
 ) -> str:
-    import aiohttp
     headers = {"User-Agent": "Mozilla/5.0"}
     start   = time.time()
 
@@ -145,8 +149,30 @@ async def download_ytdlp(
     fmt_id: Optional[str] = None,
     progress: Optional[ProgressCB] = None,
 ) -> str:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     pool = _get_pool()
+
+    # ── Pre-fetch expected file size so progress bar has a total ──
+    expected_size: int = 0
+    try:
+        def _get_size() -> int:
+            opts: dict = {"quiet": True, "no_warnings": True, "noplaylist": True}
+            if fmt_id:
+                opts["format"] = fmt_id
+            elif audio_only:
+                opts["format"] = "bestaudio/best"
+            else:
+                opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            fmts = info.get("requested_formats") or [info]
+            return sum(
+                int(f.get("filesize") or f.get("filesize_approx") or 0)
+                for f in fmts
+            )
+        expected_size = await loop.run_in_executor(pool, _get_size)
+    except Exception:
+        pass
 
     future = loop.run_in_executor(
         pool,
@@ -169,8 +195,9 @@ async def download_ytdlp(
                 speed    = (cur_size - last_size) / dt if dt > 0 else 0.0
                 last_size = cur_size
                 last_time = now
-                eta = 0
-                await progress(cur_size, 0, speed, eta)
+                total = expected_size or 0
+                eta   = int((total - cur_size) / speed) if (speed and total > cur_size) else 0
+                await progress(cur_size, total, speed, eta)
             except Exception:
                 pass
 
@@ -182,7 +209,6 @@ async def download_ytdlp(
 async def download_mediafire(
     url: str, dest: str, progress: Optional[ProgressCB] = None
 ) -> str:
-    import aiohttp
     async with aiohttp.ClientSession() as sess:
         async with sess.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
             html = await resp.text()
@@ -255,7 +281,6 @@ async def download_aria2(
     progress: Optional[ProgressCB] = None,
     task_record=None,
 ) -> str:
-    import aria2p
 
     api = aria2p.API(aria2p.Client(
         host=cfg.aria2_host, port=cfg.aria2_port, secret=cfg.aria2_secret
@@ -272,7 +297,6 @@ async def download_aria2(
     }
 
     if is_file:
-        import base64
         with open(uri_or_path, "rb") as f:
             data = f.read()
         dl = api.add_torrent(base64.b64encode(data).decode(), options=aria_opts)

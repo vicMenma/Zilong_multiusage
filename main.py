@@ -62,7 +62,7 @@ async def main() -> None:
     log.info("✅ @%s (id=%d) started", me.username or me.first_name, me.id)
 
     runner.start()
-    log.info("🚀 Task runner started (%d workers)", 10)
+    log.info("🚀 Task runner started (max %d concurrent)", 5)
 
     log.info("📡 Bot is running. Press Ctrl+C to stop.")
     await idle()
