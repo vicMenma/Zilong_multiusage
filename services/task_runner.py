@@ -232,7 +232,7 @@ def _prog_bar(pct: float, cells: int = 10) -> str:
     return "▰" * filled + "▱" * (cells - filled)
 
 
-_SEP = "────────────────────────────"
+_SEP = "════════════════════════════════"
 
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
@@ -273,41 +273,41 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
         if t.state.startswith("⏳"):
             lines += [
-                f"<b>Name</b>     <code>{fname_s}</code>",
-                f"<b>Status</b>   Queued — waiting for a free slot",
+                f"🏷️ <b>Name</b>     <code>{fname_s}</code>",
+                f"🔄 <b>Status</b>   Queued — waiting for a free slot",
             ]
             continue
 
         if t.state == "🔍 Analyzing…" or t.meta_phase:
             phase = "Fetching metadata…" if t.meta_phase else "Analyzing…"
             lines += [
-                f"<b>Name</b>     <code>{fname_s}</code>",
-                f"<b>Status</b>   {phase}   <code>{elapsed}</code>",
+                f"🏷️ <b>Name</b>     <code>{fname_s}</code>",
+                f"🔄 <b>Status</b>   {phase}   <code>{elapsed}</code>",
             ]
             continue
 
         spd_s = (human_size(t.speed) + "/s") if t.speed else "—"
         eta_s = human_dur(t.eta) if t.eta > 0 else "—"
 
-        lines.append(f"<b>Name</b>     <code>{fname_s}</code>")
-        lines.append(f"<b>Status</b>   {mode_lbl}  via {t.engine_lbl}")
-        lines.append(f"<b>Progress</b> <code>{_prog_bar(pct)}</code>  <b>{pct:.1f}%</b>")
-        lines.append(f"<b>Speed</b>    <code>{spd_s}</code>")
+        lines.append(f"🏷️ <b>Name</b>     <code>{fname_s}</code>")
+        lines.append(f"🔄 <b>Status</b>   {mode_lbl}  via {t.engine_lbl}")
+        lines.append(f"📊 <b>Progress</b> <code>{_prog_bar(pct)}</code>  <b>{pct:.1f}%</b>")
+        lines.append(f"🔥 <b>Speed</b>    <code>{spd_s}</code>")
 
         if t.total:
             lines.append(
-                f"<b>Written</b>  <code>{human_size(t.done)}</code>"
+                f"💾 <b>Written</b>  <code>{human_size(t.done)}</code>"
                 f"  of  <code>{human_size(t.total)}</code>"
             )
         elif t.done:
-            lines.append(f"<b>Written</b>  <code>{human_size(t.done)}</code>")
+            lines.append(f"💾 <b>Written</b>  <code>{human_size(t.done)}</code>")
 
         lines.append(
-            f"<b>Remains</b>  <code>{eta_s}</code>   elapsed <code>{elapsed}</code>"
+            f"⏳ <b>Remains</b>  <code>{eta_s}</code>   elapsed <code>{elapsed}</code>"
         )
 
         if t.seeds:
-            lines.append(f"<b>Seeds</b>    <code>{t.seeds}</code>")
+            lines.append(f"🌱 <b>Seeds</b>    <code>{t.seeds}</code>")
 
     stats = await system_stats()
     cpu   = stats.get("cpu", 0.0)
@@ -320,8 +320,8 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     lines += [
         "",
         _SEP,
-        f"<b>CPU</b>  <code>{cpu:.1f}%</code>   <b>Mem</b>  <code>{rp:.1f}%</code>   <b>Disk</b>  <code>{human_size(df)}</code>",
-        f"<b>Net</b>  ↑ <code>{human_size(ul)}/s</code>   ↓ <code>{human_size(dl)}/s</code>   <b>Slots</b>  <code>{slots_s}</code>",
+        f"🖥 <b>CPU</b>  <code>{cpu:.1f}%</code>   💾 <b>Mem</b>  <code>{rp:.1f}%</code>   💿 <b>Disk</b>  <code>{human_size(df)}</code>",
+        f"⬆️ <code>{human_size(ul)}/s</code>   ⬇️ <code>{human_size(dl)}/s</code>   🎰 <b>Slots</b>  <code>{slots_s}</code>",
     ]
 
     return "\n".join(lines)
