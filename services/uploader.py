@@ -44,6 +44,17 @@ def _chat_id(msg) -> int:
     return 0
 
 
+
+def _apply_caption_style(fname: str, style: str) -> str:
+    """Wrap filename in the user's chosen Telegram HTML style."""
+    s = style or "Monospace"
+    if s == "Monospace":   return f"<code>{fname}</code>"
+    if s == "Bold":        return f"<b>{fname}</b>"
+    if s == "Italic":      return f"<i>{fname}</i>"
+    if s == "Bold Italic": return f"<b><i>{fname}</i></b>"
+    return fname   # Plain
+
+
 async def upload_file(
     client:         Client,
     msg,                         # legacy: may be _up_dummy or a real message
@@ -71,7 +82,10 @@ async def upload_file(
     ext       = os.path.splitext(fname)[1].lower()
 
     if not caption:
-        caption = f"<code>{fname}</code>"
+        from core.session import settings as _settings
+        s     = await _settings.get(chat_id) if chat_id else {}
+        style = s.get("caption_style", "Monospace")
+        caption = _apply_caption_style(fname, style)
 
     if force_document:
         method = "document"
