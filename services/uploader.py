@@ -186,6 +186,8 @@ async def upload_file(
         )
         runner._wake_panel(chat_id)
 
+    _sent_msg = [None]   # mutable container so _send() can set it for the outer scope
+
     async def _send() -> None:
         common = dict(
             caption=caption,
@@ -211,6 +213,8 @@ async def upload_file(
                 force_document=True,
                 **common,
             )
+
+        _sent_msg[0] = sent
 
         try:
             await msg.delete()
@@ -238,6 +242,61 @@ async def upload_file(
             record.update(state="📤 Uploading")
             _runner_ul._wake_panel(chat_id, immediate=True)
             await _send()
+
+        # ── Auto-forward / ask-forward logic ─────────────────────────────────
+        sent = _sent_msg[0]
+        if sent:
+            try:
+                from core.session import settings as _st, get_client as _gc
+                from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                _s        = await _st.get(chat_id)
+                _channels = _s.get("forward_channels", [])
+                _auto     = _s.get("auto_forward", False)
+
+                if _channels:
+                    if _auto:
+                        # Auto-forward ON → copy silently to ALL channels
+                        _errors: list[str] = []
+                        for ch in _channels:
+                            try:
+                                await sent.copy(ch["id"])
+                            except Exception as _fe:
+                                _errors.append(ch.get("name", str(ch["id"])))
+                                log.warning("Auto-forward to %s failed: %s", ch["id"], _fe)
+                        if _errors:
+                            await _gc().send_message(
+                                chat_id,
+                                f"⚠️ Auto-forward failed for: {', '.join(_errors)}",
+                            )
+                    else:
+                        # Auto-forward OFF → ask with inline keyboard
+                        rows = []
+                        for ch in _channels:
+                            cid   = ch["id"]
+                            cname = ch.get("name", str(cid))[:28]
+                            rows.append([InlineKeyboardButton(
+                                f"📢 {cname}",
+                                callback_data=f"fwd|one|{sent.chat.id}|{sent.id}|{cid}",
+                            )])
+                        if len(_channels) > 1:
+                            rows.append([InlineKeyboardButton(
+                                "📡 Forward to ALL channels",
+                                callback_data=f"fwd|all|{sent.chat.id}|{sent.id}|0",
+                            )])
+                        rows.append([InlineKeyboardButton(
+                            "✖ Skip",
+                            callback_data=f"fwd|skip|{sent.chat.id}|{sent.id}|0",
+                        )])
+                        await _gc().send_message(
+                            chat_id,
+                            f"📨 <b>Forward this file?</b>\n"
+                            f"<code>{fname}</code>",
+                            parse_mode=enums.ParseMode.HTML,
+                            reply_markup=InlineKeyboardMarkup(rows),
+                        )
+            except Exception as _fwe:
+                log.warning("Forward prompt failed: %s", _fwe)
+        # ─────────────────────────────────────────────────────────────────────
     except FloodWait as fw:
         if fw.value <= 60:
             log.warning("FloodWait %ds — waiting", fw.value)
