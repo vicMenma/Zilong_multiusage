@@ -50,24 +50,24 @@ def _start_kb() -> InlineKeyboardMarkup:
 
 
 def _settings_kb(s: dict) -> InlineKeyboardMarkup:
-    rename      = s.get("rename_file", False)
-    custom_name = s.get("custom_name", "").strip()
-    mode        = "📄 Document" if s.get("upload_mode") == "document" else "📁 Auto"
+    mode   = "📄 Document" if s.get("upload_mode") == "document" else "📁 Auto"
+    prefix = s.get("prefix", "").strip()
+    suffix = s.get("suffix", "").strip()
 
-    if rename and custom_name:
-        rename_label = f"✏️ Rename: ✅ → {custom_name[:20]}"
-    elif rename:
-        rename_label = "✏️ Auto-Rename: ✅ (send a name)"
-    else:
-        rename_label = "✏️ Auto-Rename: ❌ OFF"
+    prefix_lbl = f"🔡 Prefix: {prefix[:18]}" if prefix else "🔡 Prefix: none"
+    suffix_lbl = f"🔤 Suffix: {suffix[:18]}" if suffix else "🔤 Suffix: none"
 
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(rename_label,               callback_data="st_rename")],
-        [InlineKeyboardButton(f"📤 Upload Mode: {mode}",  callback_data="st_mode")],
-        [InlineKeyboardButton("🖼️ Set Thumbnail",          callback_data="st_thumb"),
-         InlineKeyboardButton("🗑️ Clear Thumbnail",        callback_data="st_clearthumb")],
-        [InlineKeyboardButton("❌ Close",                   callback_data="st_close")],
-    ])
+    rows = [
+        [InlineKeyboardButton(prefix_lbl,               callback_data="st_prefix"),
+         InlineKeyboardButton("🗑", callback_data="st_clrprefix")],
+        [InlineKeyboardButton(suffix_lbl,               callback_data="st_suffix"),
+         InlineKeyboardButton("🗑", callback_data="st_clrsuffix")],
+        [InlineKeyboardButton(f"📤 Upload Mode: {mode}", callback_data="st_mode")],
+        [InlineKeyboardButton("🖼️ Set Thumbnail",         callback_data="st_thumb"),
+         InlineKeyboardButton("🗑️ Clear Thumbnail",       callback_data="st_clearthumb")],
+        [InlineKeyboardButton("❌ Close",                  callback_data="st_close")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def _back_kb() -> InlineKeyboardMarkup:
@@ -173,35 +173,6 @@ async def cq_account(client: Client, cb: CallbackQuery):
     await cb.answer()
 
 
-@Client.on_callback_query(filters.regex("^st_rename$"))
-async def cq_st_rename(client: Client, cb: CallbackQuery):
-    uid = cb.from_user.id
-    s   = await settings.get(uid)
-    new = not s.get("rename_file", False)
-    await settings.update(uid, {"rename_file": new})
-
-    if new:
-        # Mark user as waiting for a rename template reply
-        _RENAME_WAITING.add(uid)
-        await cb.answer("Auto-Rename ON ✅ — send me the name to use")
-        await cb.message.edit(
-            "✏️ <b>Auto-Rename is ON</b>\n\n"
-            "Reply with the <b>filename</b> to use for all future downloads.\n"
-            "<i>The original file extension is kept automatically.</i>\n\n"
-            "Example: <code>My Series S01E01</code>\n\n"
-            "<i>Send /cancel to cancel.</i>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-    else:
-        # Turn OFF — clear saved name too
-        await settings.update(uid, {"custom_name": ""})
-        _RENAME_WAITING.discard(uid)
-        s["rename_file"] = False
-        s["custom_name"] = ""
-        await cb.message.edit_reply_markup(_settings_kb(s))
-        await cb.answer("Auto-Rename OFF ❌")
-
-
 @Client.on_callback_query(filters.regex("^st_mode$"))
 async def cq_st_mode(client: Client, cb: CallbackQuery):
     s   = await settings.get(cb.from_user.id)
@@ -233,49 +204,104 @@ async def cq_st_close(client: Client, cb: CallbackQuery):
     await cb.answer()
 
 
-# ── Rename name collector ─────────────────────────────────────────────────────
-# Users who tapped "Auto-Rename ON" are placed in this set.
-# The next plain-text message they send is captured as their rename template.
-_RENAME_WAITING: set[int] = set()
+# ── Prefix / Suffix handlers ──────────────────────────────────────────────────
+# Track which users are waiting to type a prefix or suffix value
+_PREFIX_WAITING: set[int] = set()
+_SUFFIX_WAITING: set[int] = set()
 
 
-@Client.on_message(filters.private & filters.text & ~filters.command(
-    ["start","help","settings","info","status","log","restart","broadcast",
-     "admin","ban_user","unban_user","banned_list","cancel",
-     "show_thumb","del_thumb","json_formatter","bulk_url"]
-), group=8)
-async def rename_name_collector(client: Client, msg: Message):
+@Client.on_callback_query(filters.regex("^st_prefix$"))
+async def cq_st_prefix(client: Client, cb: CallbackQuery):
+    _PREFIX_WAITING.add(cb.from_user.id)
+    _SUFFIX_WAITING.discard(cb.from_user.id)
+    await cb.answer()
+    await cb.message.edit(
+        "🔡 <b>Set Prefix</b>\n\n"
+        "Reply with the text to <b>prepend</b> before every filename.\n\n"
+        "Example: <code>[VOSTFR] </code> → <code>[VOSTFR] Oshi no Ko S03E10.mkv</code>\n\n"
+        "<i>Send /cancel to cancel.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@Client.on_callback_query(filters.regex("^st_suffix$"))
+async def cq_st_suffix(client: Client, cb: CallbackQuery):
+    _SUFFIX_WAITING.add(cb.from_user.id)
+    _PREFIX_WAITING.discard(cb.from_user.id)
+    await cb.answer()
+    await cb.message.edit(
+        "🔤 <b>Set Suffix</b>\n\n"
+        "Reply with the text to <b>append</b> after the filename (before extension).\n\n"
+        "Example: <code> [FR]</code> → <code>Oshi no Ko S03E10 [FR].mkv</code>\n\n"
+        "<i>Send /cancel to cancel.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@Client.on_callback_query(filters.regex("^st_clrprefix$"))
+async def cq_st_clrprefix(client: Client, cb: CallbackQuery):
+    await settings.update(cb.from_user.id, {"prefix": ""})
+    _PREFIX_WAITING.discard(cb.from_user.id)
+    s = await settings.get(cb.from_user.id)
+    await cb.message.edit_reply_markup(_settings_kb(s))
+    await cb.answer("Prefix cleared ✅")
+
+
+@Client.on_callback_query(filters.regex("^st_clrsuffix$"))
+async def cq_st_clrsuffix(client: Client, cb: CallbackQuery):
+    await settings.update(cb.from_user.id, {"suffix": ""})
+    _SUFFIX_WAITING.discard(cb.from_user.id)
+    s = await settings.get(cb.from_user.id)
+    await cb.message.edit_reply_markup(_settings_kb(s))
+    await cb.answer("Suffix cleared ✅")
+
+
+# ── Text collector for prefix / suffix ───────────────────────────────────────
+@Client.on_message(
+    filters.private & filters.text & ~filters.command(
+        ["start","help","settings","info","status","log","restart",
+         "broadcast","admin","ban_user","unban_user","banned_list",
+         "cancel","show_thumb","del_thumb","json_formatter","bulk_url"]
+    ),
+    group=8,
+)
+async def prefix_suffix_collector(client: Client, msg: Message):
     uid = msg.from_user.id
-    if uid not in _RENAME_WAITING:
+    waiting_prefix = uid in _PREFIX_WAITING
+    waiting_suffix = uid in _SUFFIX_WAITING
+    if not waiting_prefix and not waiting_suffix:
         return
 
-    raw_name = msg.text.strip()
+    text = msg.text.strip()
 
-    # /cancel → abort rename setup
-    if raw_name.lower() in ("/cancel", "cancel"):
-        _RENAME_WAITING.discard(uid)
-        await settings.update(uid, {"rename_file": False, "custom_name": ""})
-        await msg.reply("❌ Auto-Rename cancelled.")
+    if text.lower() in ("/cancel", "cancel"):
+        _PREFIX_WAITING.discard(uid)
+        _SUFFIX_WAITING.discard(uid)
+        await msg.reply("❌ Cancelled.")
         msg.stop_propagation()
         return
 
-    # Strip any extension the user accidentally included
-    import os as _os
-    name_no_ext = _os.path.splitext(raw_name)[0].strip()
-    if not name_no_ext:
-        await msg.reply("❌ Name cannot be empty. Try again or send /cancel.")
-        return
+    if waiting_prefix:
+        _PREFIX_WAITING.discard(uid)
+        await settings.update(uid, {"prefix": text})
+        s = await settings.get(uid)
+        await msg.reply(
+            f"✅ <b>Prefix saved!</b>\n\n"
+            f"Files will be named: <code>{text}Oshi no Ko S03E10.mkv</code>\n\n"
+            f"Use /settings to change or clear it.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    else:
+        _SUFFIX_WAITING.discard(uid)
+        await settings.update(uid, {"suffix": text})
+        s = await settings.get(uid)
+        await msg.reply(
+            f"✅ <b>Suffix saved!</b>\n\n"
+            f"Files will be named: <code>Oshi no Ko S03E10{text}.mkv</code>\n\n"
+            f"Use /settings to change or clear it.",
+            parse_mode=enums.ParseMode.HTML,
+        )
 
-    _RENAME_WAITING.discard(uid)
-    await settings.update(uid, {"custom_name": name_no_ext})
-
-    s = await settings.get(uid)
-    await msg.reply(
-        f"✅ <b>Auto-Rename set!</b>\n\n"
-        f"Every downloaded file will be renamed to:\n"
-        f"<code>{name_no_ext}.[original_ext]</code>\n\n"
-        f"<i>Tap Auto-Rename again in /settings to change or turn off.</i>",
-        parse_mode=enums.ParseMode.HTML,
-    )
     msg.stop_propagation()
+
 
