@@ -222,8 +222,8 @@ tracker = GlobalTracker()
 # Panel renderer  — redesigned card-style layout
 # ─────────────────────────────────────────────────────────────
 
-def _bar(pct: float, w: int = 18) -> str:
-    """No-bracket block bar:  ██████████░░░░░░░░  57.3%"""
+def _bar(pct: float, w: int = 22) -> str:
+    """Block bar — wider for more visual impact"""
     pct    = min(max(pct, 0), 100)
     filled = int(pct / 100 * w)
     return "█" * filled + "░" * (w - filled)
@@ -241,13 +241,15 @@ def _spd_icon(bps: float) -> str:
 def _ring(p: float) -> str:
     return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
 
+# Bold straight Unicode line — replaces the dashed ——— separator everywhere
+_SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
     from services.utils import human_size, human_dur, system_stats
 
     tasks    = tracker.tasks_for_user(target_uid) if target_uid else tracker.all_tasks()
     active   = [t for t in tasks if not t.is_terminal]
-    finished = [t for t in tasks if t.is_terminal]
 
     n_running = sum(
         1 for t in active
@@ -258,16 +260,16 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
     lines: list[str] = [
         "⚡️ <b>ZILONG MULTIUSAGE BOT</b>",
-        "——————————————————————",
+        _SEP,
     ]
 
     # ── Active tasks ──────────────────────────────────────────
     for t in active:
         pct     = t.pct()
-        bar     = _bar(pct, 18)
+        bar     = _bar(pct, 22)
         elapsed = human_dur(int(t.elapsed)) if t.elapsed else "0s"
         fname   = t.fname or t.label
-        fname_s = (fname[:46] + "…") if len(fname) > 46 else fname
+        fname_s = (fname[:52] + "…") if len(fname) > 52 else fname
 
         lines.append(f"📁 <code>{fname_s}</code>")
 
@@ -318,26 +320,6 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
         lines.append("")
 
-    # ── Finished tasks ────────────────────────────────────────
-    if finished:
-        lines.append("——————————————————————")
-        now = time.time()
-        for t in finished[-3:]:
-            ago     = int(now - t.finished) if t.finished else 0
-            ago_s   = f"({ago}s ago)" if ago < 60 else f"({human_dur(ago)} ago)"
-            elapsed = human_dur(int(t.elapsed)) if t.elapsed else "—"
-            size_s  = human_size(t.total or t.done) if (t.total or t.done) else ""
-            icon    = "✅" if t.state.startswith("✅") else "❌"
-            mode_icon = {"dl": "📥", "ul": "📤", "magnet": "🧲", "proc": "⚙️"}.get(t.mode, "📦")
-            fname   = t.fname or t.label
-            fname_s = (fname[:30] + "…") if len(fname) > 30 else fname
-            parts   = [f"{icon} {mode_icon} <code>{fname_s}</code>"]
-            if size_s:  parts.append(f"<code>{size_s}</code>")
-            if elapsed: parts.append(f"<code>{elapsed}</code>")
-            parts.append(f"<i>{ago_s}</i>")
-            lines.append("  ".join(parts))
-        lines.append("")
-
     # ── sysINFO footer ────────────────────────────────────────
     stats = await system_stats()
     cpu   = stats.get("cpu", 0.0)
@@ -351,7 +333,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     q_tag   = f" · ⏳ {n_queued} queued"     if n_queued  else ""
 
     lines += [
-        "——————————————————————",
+        _SEP,
         f"🖥 <b>CPU:</b> <code>{cpu:.1f}%</code> | 💿 <b>FREE:</b> <code>{human_size(df)}</code>",
         f"💾 <b>RAM:</b> <code>{rp:.1f}%</code> | {_ring(rp)} <b>DL Slots:</b> <code>{slots_s}</code>{ul_tag}{q_tag}",
         f"⬇️ <b>DL:</b> <code>{human_size(dl)}/s</code> | ⬆️ <b>UL:</b> <code>{human_size(ul)}/s</code>",
@@ -372,20 +354,12 @@ class LivePanel:
         self._wake_ev  = asyncio.Event()
         self._last_edit = 0.0
         self._last_activity = time.time()
-        self._sent_at   = time.time()   # when the panel message was sent
-        self._relocate  = False          # request to delete+resend at bottom
 
     def wake(self, immediate: bool = False) -> None:
-        """Wake the panel loop for a re-render.
-        immediate=True bypasses the 1.0s cooldown and requests a relocate
-        if the panel message is older than 30 seconds.
-        """
+        """Wake the panel loop for a re-render."""
         self._last_activity = time.time()
         if immediate:
             self._last_edit = 0.0
-            # Mark for relocate if panel is >30s old (new task arrived)
-            if time.time() - self._sent_at > 30:
-                self._relocate = True
         self._wake_ev.set()
 
     def start(self) -> None:
@@ -416,7 +390,7 @@ class LivePanel:
                 log.debug("LivePanel edit uid=%d: %s", self._uid, exc)
 
     async def _loop(self) -> None:
-        had_tasks = False   # flips True once at least one task is registered
+        had_tasks = False
 
         while not self._stopped:
             try:
@@ -435,36 +409,10 @@ class LivePanel:
 
             tasks = tracker.tasks_for_user(self._uid)
 
-            # Track whether we ever had tasks
             if tasks:
                 had_tasks = True
 
-            # Relocate panel to bottom of chat when a new task arrives
-            # and the panel is >30s old. Rate-limited: only if not done recently.
-            if self._relocate and tasks:
-                self._relocate = False
-                try:
-                    from core.session import get_client
-                    from pyrogram import enums
-                    client = get_client()
-                    text = await render_panel(self._uid)
-                    new_msg = await client.send_message(
-                        self._uid, text, parse_mode=enums.ParseMode.HTML,
-                    )
-                    try:
-                        await self._msg.delete()
-                    except Exception:
-                        pass
-                    self._msg      = new_msg
-                    self._last_txt = text
-                    self._last_edit = time.time()
-                    self._sent_at   = time.time()
-                    continue
-                except Exception as exc:
-                    log.debug("LivePanel relocate uid=%d: %s", self._uid, exc)
-
-            # Only delete when ALL tasks are gone from memory (evicted after TASK_LINGER)
-            # This ensures we never delete mid-download or between download→upload
+            # Delete panel only when ALL tasks are fully gone from memory
             if had_tasks and not tasks:
                 try:
                     await self._msg.delete()
@@ -567,15 +515,8 @@ class TaskRunner:
         async with self._panel_lock(uid):
             existing = self._panels.get(uid)
 
-            # Reuse existing panel if it's still alive and was sent recently.
-            # This prevents FLOOD_WAIT: download task + upload task both call
-            # auto_panel within seconds — without this guard we'd send two new
-            # panel messages in rapid succession and get Telegram flood-banned.
-            if existing and not existing._stopped:
-                existing.wake(immediate=True)
-                return
-
-            # Stop the old dead panel and delete its message
+            # Always stop the old panel and delete its message so the new
+            # panel appears at the bottom of the chat on every new link sent.
             if existing:
                 existing.stop()
                 try:
