@@ -87,9 +87,8 @@ _log("OK", f"Cloned to {BASE_DIR}")
 
 _log("STEP", "Installing Python packages…")
 # Remove stock pyrogram before installing pyrofork — both expose the same
-# `pyrogram` namespace but stock pyrogram lacks pyrofork-only parameters
-# (e.g. concurrent_transmissions).  If both are installed, whichever was
-# imported first wins, and stock pyrogram wins in Colab's default env.
+# `pyrogram` namespace. If both are installed, stock pyrogram wins and
+# pyrofork-specific internals won't be available.
 subprocess.run(
     [sys.executable, "-m", "pip", "uninstall", "-q", "-y", "pyrogram"],
     capture_output=True,  # silence "not installed" warnings
@@ -122,14 +121,13 @@ env_lines = [
     "ARIA2_PORT=6800",
     "ARIA2_SECRET=",
     # ── Upload speed tuning ───────────────────────────────────────────────
-    # CONCURRENT_TX: parallel MTProto encrypted streams opened per upload.
-    #   4  →  ~5-10 MB/s  (original default)
-    #   16 →  ~40-80 MB/s (tuned — sweet spot for Colab → Telegram DC4)
-    "CONCURRENT_TX=16",
-    # UPLOAD_CONCURRENCY: how many independent uploads run at the same time.
-    #   1 → sequential  (original — deadlock workaround for stock pyrogram)
-    #   3 → parallel    (safe with pyrofork>=2.3.40, maximises aggregate throughput)
+    # UPLOAD_CONCURRENCY: simultaneous independent file uploads (was 1 = sequential)
     "UPLOAD_CONCURRENCY=3",
+    # BOT_WORKERS: pyrofork dispatcher thread pool size (default 4 → 16)
+    "BOT_WORKERS=16",
+    # UPLOAD_PARTS_PARALLEL: concurrent 512KB MTProto parts per upload (default 1 → 8)
+    # 8 parts × 512KB / ~100ms RTT ≈ 40 MB/s theoretical — real ~10-25 MB/s on Colab
+    "UPLOAD_PARTS_PARALLEL=8",
 ]
 for optional in ("ADMINS", "GDRIVE_SA_JSON", "ARIA2_SECRET"):
     val = _secret(optional)

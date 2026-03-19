@@ -1,8 +1,6 @@
-# pyrofork>=2.3.40 added concurrent_transmissions (parallel MTProto upload slots).
-# Pin to a known-good range; the bot gracefully falls back if an older build is used.
+# pyrofork>=2.3.40 — stable modern fork of pyrogram.
 pyrofork>=2.3.40
-# uvloop replaces Python's default asyncio event loop with libuv (same engine as Node.js).
-# Gives 2-4x improvement on network I/O — critical for high-throughput Telegram uploads.
+# uvloop: replaces Python's default asyncio with libuv — 2-4x faster I/O for uploads.
 uvloop
 TgCrypto
 aiohttp

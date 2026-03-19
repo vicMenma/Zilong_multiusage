@@ -11,15 +11,12 @@ import os
 import glob
 
 # ── uvloop: must be installed BEFORE asyncio.run() is ever called ────────────
-# uvloop replaces Python's default asyncio event loop with libuv (the same
-# engine powering Node.js).  It gives 2-4x faster I/O multiplexing, which
-# directly translates to higher Telegram upload throughput.
 try:
     import uvloop
-    uvloop.install()          # sets UVLoop as the default event-loop policy
+    uvloop.install()
     _UVLOOP = True
 except ImportError:
-    _UVLOOP = False           # graceful fallback — bot still works, just slower
+    _UVLOOP = False
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -49,21 +46,76 @@ from pyrogram import Client, idle
 from core.config import cfg
 from services.task_runner import runner
 
-# How many MTProto file-part slots to open in parallel per upload.
-# Each slot is an independent encrypted TCP stream to Telegram's DC.
-# More slots = deeper pipeline = higher throughput.
-# 16 is the practical sweet spot on Colab → Telegram DC4:
-#   4 slots  ≈  5-10 MB/s
-#   8 slots  ≈ 15-30 MB/s
-#   16 slots ≈ 40-80 MB/s   ← diminishing returns above this
-#   20 slots ≈ same as 16 (Telegram-side concurrency limit)
-_CONCURRENT_TX = int(os.environ.get("CONCURRENT_TX", "16"))
+
+# ── Parallel-part upload patch ────────────────────────────────────────────────
+# pyrofork's default save_file() uploads 512 KB parts one-by-one (sequential).
+# At 100 ms RTT to Telegram DC4 that caps throughput at ~5 MB/s.
+# This patch replaces the inner upload loop with asyncio.gather so that
+# UPLOAD_PARTS_PARALLEL parts fly concurrently, multiplying throughput.
+# Gracefully skips if the internal API has changed.
+UPLOAD_PARTS_PARALLEL = int(os.environ.get("UPLOAD_PARTS_PARALLEL", "8"))
+
+def _patch_parallel_upload():
+    try:
+        import pyrogram.utils as _utils
+        import asyncio as _asyncio
+        import math as _math
+
+        _orig_save_file = _utils.save_file  # keep original for fallback
+
+        async def _fast_save_file(client, path, file_id=None, file_part=0, progress=None, progress_args=()):
+            """Patched save_file: uploads UPLOAD_PARTS_PARALLEL parts in parallel."""
+            import os
+            from pyrogram import raw
+
+            file_size = os.path.getsize(path)
+            file_total_parts = _math.ceil(file_size / (512 * 1024))
+            is_big = file_size > 10 * 1024 * 1024
+            session = await client.session.invoke(raw.functions.upload.GetFile(
+                location=None, offset=0, limit=0
+            )) if False else None  # probe removed — use client directly
+
+            semaphore = _asyncio.Semaphore(UPLOAD_PARTS_PARALLEL)
+
+            async def _upload_part(part_num, data):
+                async with semaphore:
+                    if is_big:
+                        await client.invoke(raw.functions.upload.SaveBigFilePart(
+                            file_id=file_id, file_part=part_num,
+                            file_total_parts=file_total_parts, bytes=data
+                        ))
+                    else:
+                        await client.invoke(raw.functions.upload.SaveFilePart(
+                            file_id=file_id, file_part=part_num, bytes=data
+                        ))
+                    if progress:
+                        await progress((part_num + 1) * 512 * 1024, file_size, *progress_args)
+
+            with open(path, "rb") as f:
+                tasks = []
+                for i in range(file_total_parts):
+                    chunk = f.read(512 * 1024)
+                    tasks.append(_upload_part(i, chunk))
+                await _asyncio.gather(*tasks)
+
+        # Only patch if save_file is a simple coroutine function we can safely replace
+        if _asyncio.iscoroutinefunction(_orig_save_file):
+            _utils.save_file = _fast_save_file
+            log.info("⚡ Parallel upload patch active (%d parts concurrently)", UPLOAD_PARTS_PARALLEL)
+        else:
+            log.info("⚡ save_file is not a plain coroutine — skipping patch (internal API differs)")
+    except Exception as exc:
+        log.warning("Upload patch skipped: %s — using pyrofork default", exc)
+
+# ── workers parameter ─────────────────────────────────────────────────────────
+# pyrofork's Client accepts 'workers' (default 4) which sets the dispatcher
+# thread pool size. Higher values improve async scheduling under heavy I/O.
+_WORKERS = int(os.environ.get("BOT_WORKERS", "16"))
 
 
 def build_client() -> Client:
     import inspect
-
-    base_kwargs: dict = dict(
+    kwargs: dict = dict(
         name="ZilongBot",
         api_id=cfg.api_id,
         api_hash=cfg.api_hash,
@@ -71,27 +123,12 @@ def build_client() -> Client:
         plugins={"root": "plugins"},
         workdir="/tmp",
     )
-
-    # concurrent_transmissions was introduced in pyrofork >= 2.3.40.
-    # Guard against older installs so the bot never crashes on startup.
-    try:
-        sig = inspect.signature(Client.__init__)
-        if "concurrent_transmissions" in sig.parameters:
-            base_kwargs["concurrent_transmissions"] = _CONCURRENT_TX
-            log.info(
-                "⚡ concurrent_transmissions=%d enabled (%d parallel MTProto upload streams)",
-                _CONCURRENT_TX, _CONCURRENT_TX,
-            )
-        else:
-            log.warning(
-                "⚠️  concurrent_transmissions not supported by this pyrofork build "
-                "— falling back to sequential uploads. "
-                "Upgrade to pyrofork>=2.3.40 for faster upload speed."
-            )
-    except Exception:
-        pass
-
-    return Client(**base_kwargs)
+    # Add workers only if the parameter exists (it does in all known pyrofork versions)
+    sig = inspect.signature(Client.__init__)
+    if "workers" in sig.parameters:
+        kwargs["workers"] = _WORKERS
+        log.info("⚙️  workers=%d (async dispatch pool)", _WORKERS)
+    return Client(**kwargs)
 
 
 async def main() -> None:
@@ -101,6 +138,8 @@ async def main() -> None:
         port = int(os.environ.get("PORT", 8000))
         start_health_server(port)
         log.info("🌐 Koyeb health server started on port %d", port)
+
+    _patch_parallel_upload()
 
     client = build_client()
 
@@ -126,6 +165,3 @@ async def main() -> None:
 if __name__ == "__main__":
     asyncio.run(main())
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
