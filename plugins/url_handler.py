@@ -861,12 +861,19 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
 
 
 async def _upload_and_cleanup(client, msg, path: str, tmp: str) -> None:
-    try:
-        await upload_file(client, msg, path)
-    except Exception as exc:
-        log.error("Upload failed for %s: %s", path, exc)
-    finally:
-        cleanup(tmp)
+    """Run upload serialised through the global upload semaphore.
+    This ensures only _UPLOAD_CONCURRENCY uploads run at once even when
+    multiple downloads finish at the same time.
+    """
+    from services.task_runner import runner as _r
+    sem = _r._get_upload_sem()
+    async with sem:
+        try:
+            await upload_file(client, msg, path)
+        except Exception as exc:
+            log.error("Upload failed for %s: %s", path, exc)
+        finally:
+            cleanup(tmp)
 
 
 # ─────────────────────────────────────────────────────────────
