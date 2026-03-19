@@ -175,8 +175,15 @@ def progress_panel(
 # Telegram helpers
 # ─────────────────────────────────────────────────────────────
 
+_TG_MAX = 4096   # Telegram hard message length limit
+
 async def safe_edit(msg, text: str, **kwargs) -> None:
-    """Edit message, swallow idempotent / not-found errors."""
+    """Edit message, swallow idempotent / not-found errors.
+    Automatically truncates text to Telegram's 4096-char limit.
+    """
+    # Hard truncate — never let an oversized panel kill the live loop
+    if len(text) > _TG_MAX:
+        text = text[:_TG_MAX - 64] + "\n\n<i>⚠️ Panel truncated — too many active tasks</i>"
     try:
         await msg.edit(text, **kwargs)
     except Exception as e:
@@ -185,6 +192,7 @@ async def safe_edit(msg, text: str, **kwargs) -> None:
             "MESSAGE_NOT_MODIFIED", "message was not modified",
             "MESSAGE_ID_INVALID", "message to edit not found",
             "Bad Request: message is not modified",
+            "MESSAGE_TOO_LONG", "message is too long",
         )):
             return
         # Don't re-raise floods or peer not found quietly

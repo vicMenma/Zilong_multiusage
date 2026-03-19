@@ -386,7 +386,7 @@ class LivePanel:
                 self._last_txt  = text
                 self._last_edit = time.time()
             except Exception as exc:
-                log.debug("LivePanel edit uid=%d: %s", self._uid, exc)
+                log.warning("LivePanel edit uid=%d failed: %s", self._uid, exc)
 
     async def _loop(self) -> None:
         had_tasks = False
