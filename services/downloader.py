@@ -354,6 +354,12 @@ async def download_aria2(
     last_wake = [start]
     in_meta   = [task_record is not None and not is_file]
 
+    # Metadata timeout: if no progress appears within 3 minutes the magnet
+    # is dead (no peers / trackers offline). Kill and raise a clear error.
+    META_TIMEOUT  = 180   # seconds to wait for first progress line
+    # Total download timeout: 6 hours max for any single file
+    TOTAL_TIMEOUT = 21600
+
     def _wake(uid: int) -> None:
         now = time.time()
         if now - last_wake[0] >= 1.0:
@@ -364,50 +370,76 @@ async def download_aria2(
             except Exception:
                 pass
 
+    # Drain stderr concurrently so it never fills the pipe buffer and deadlocks
+    async def _drain_stderr():
+        if proc.stderr:
+            try:
+                await proc.stderr.read()
+            except Exception:
+                pass
+
+    asyncio.ensure_future(_drain_stderr())
+
     assert proc.stdout is not None
-    async for raw in proc.stdout:
-        line = raw.decode(errors="replace").strip()
-        if not line:
-            continue
 
-        elapsed = time.time() - start
+    async def _read_stdout():
+        nonlocal in_meta
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
 
-        # ── Progress line ─────────────────────────────────────
-        m = _ARIA2_PROG_RE.search(line)
-        if m:
-            done_b  = _aria2_bytes(m.group(1) or "0")
-            total_b = _aria2_bytes(m.group(2) or "0")
-            spd_b   = _aria2_bytes(m.group(4) or "0") if m.group(4) else 0
-            eta_sec = _aria2_eta(m.group(5) or "") if m.group(5) else 0
+            elapsed = time.time() - start
 
-            if in_meta[0]:
-                in_meta[0] = False
-                # Try to get the actual filename once data starts flowing
-                fname_now = largest_file(dest)
-                fname_s   = os.path.basename(fname_now)[:40] if fname_now else ""
+            m = _ARIA2_PROG_RE.search(line)
+            if m:
+                done_b  = _aria2_bytes(m.group(1) or "0")
+                total_b = _aria2_bytes(m.group(2) or "0")
+                spd_b   = _aria2_bytes(m.group(4) or "0") if m.group(4) else 0
+                eta_sec = _aria2_eta(m.group(5) or "") if m.group(5) else 0
+
+                if in_meta[0]:
+                    in_meta[0] = False
+                    fname_now = largest_file(dest)
+                    fname_s   = os.path.basename(fname_now)[:40] if fname_now else ""
+                    if task_record is not None:
+                        task_record.update(
+                            meta_phase=False, state="📥 Downloading",
+                            **({"label": fname_s, "fname": fname_s} if fname_s else {}),
+                        )
+
                 if task_record is not None:
                     task_record.update(
-                        meta_phase=False, state="📥 Downloading",
-                        **({"label": fname_s, "fname": fname_s} if fname_s else {}),
+                        done=done_b, total=total_b,
+                        speed=float(spd_b), eta=eta_sec,
+                        elapsed=elapsed, state="📥 Downloading",
                     )
+                    _wake(task_record.user_id)
 
-            if task_record is not None:
+                if progress:
+                    await progress(done_b, total_b, float(spd_b), eta_sec)
+
+            elif in_meta[0] and task_record is not None:
                 task_record.update(
-                    done=done_b, total=total_b,
-                    speed=float(spd_b), eta=eta_sec,
-                    elapsed=elapsed, state="📥 Downloading",
+                    meta_phase=True, state="🔍 Fetching metadata…", elapsed=elapsed,
                 )
                 _wake(task_record.user_id)
 
-            if progress:
-                await progress(done_b, total_b, float(spd_b), eta_sec)
-
-        # ── Still in metadata phase — tick the elapsed counter ─
-        elif in_meta[0] and task_record is not None:
-            task_record.update(
-                meta_phase=True, state="🔍 Fetching metadata…", elapsed=elapsed,
-            )
-            _wake(task_record.user_id)
+    # Apply timeouts: metadata phase gets META_TIMEOUT, full download gets TOTAL_TIMEOUT
+    timeout = META_TIMEOUT if (task_record is not None and not is_file) else TOTAL_TIMEOUT
+    try:
+        await asyncio.wait_for(_read_stdout(), timeout=TOTAL_TIMEOUT)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        phase = "metadata resolution" if in_meta[0] else "download"
+        raise RuntimeError(
+            f"aria2c timed out during {phase} "
+            f"({'3 min' if in_meta[0] else '6 h'} limit). "
+            "The magnet may have no active peers or trackers."
+        )
 
     await proc.wait()
 
