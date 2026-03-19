@@ -84,6 +84,34 @@ async def upload_file(
 
     vid_meta: dict = {"duration": 0, "width": 0, "height": 0, "thumb": None}
     auto_thumb: str | None = None
+    user_thumb: str | None = None  # downloaded from Telegram, needs cleanup after upload
+
+    # ── Load user's saved thumbnail from settings ────────────────────────────
+    # This is the thumbnail set via /settings → Set Thumbnail.
+    # It takes priority over the auto-generated ffprobe thumbnail.
+    if not thumb:
+        try:
+            from core.session import settings as _settings
+            _s = await _settings.get(chat_id)
+            _thumb_id = _s.get("thumb_id")
+            if _thumb_id:
+                import tempfile
+                from core.session import get_client as _get_client
+                _cl = _get_client()
+                _tmp_thumb = tempfile.NamedTemporaryFile(
+                    suffix=".jpg", dir=cfg.download_dir, delete=False
+                )
+                _tmp_thumb.close()
+                await _cl.download_media(_thumb_id, file_name=_tmp_thumb.name)
+                if os.path.isfile(_tmp_thumb.name) and os.path.getsize(_tmp_thumb.name) > 0:
+                    thumb      = _tmp_thumb.name
+                    user_thumb = _tmp_thumb.name
+                    log.info("Using user thumbnail: %s", _thumb_id[:16])
+                else:
+                    os.remove(_tmp_thumb.name)
+        except Exception as _te:
+            log.warning("Could not load user thumbnail: %s", _te)
+    # ─────────────────────────────────────────────────────────────────────────
 
     if ext in _VIDEO_EXTS and method in ("video", "document"):
         # Show "Analyzing…" state while ffprobe runs (can take 10–30s for large files)
@@ -103,6 +131,7 @@ async def upload_file(
             log.warning("video_meta failed for %s: %s", fname, exc)
 
         if not thumb:
+            # No user thumbnail — try the auto-generated ffprobe one
             thumb = vid_meta.get("thumb")
             if thumb and os.path.isfile(thumb):
                 auto_thumb = thumb
@@ -231,5 +260,10 @@ async def upload_file(
         if auto_thumb and os.path.isfile(auto_thumb):
             try:
                 os.remove(auto_thumb)
+            except OSError:
+                pass
+        if user_thumb and os.path.isfile(user_thumb):
+            try:
+                os.remove(user_thumb)
             except OSError:
                 pass
