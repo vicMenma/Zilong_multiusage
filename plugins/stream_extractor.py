@@ -505,11 +505,12 @@ async def se_fp_cb(client: Client, cb: CallbackQuery):
 
         ext = rec.get("ext", "mkv")
         fname_base = session["title"].replace("/", "_").replace(" ", "_")[:40]
-        lang  = rec.get("lang", "")
-        if lang and lang != "und":
-            out = os.path.join(tmp, f"{fname_base}_{lang}.{ext}")
-        else:
-            out = os.path.join(tmp, f"{fname_base}_stream{idx}.{ext}")
+        lang  = rec.get("lang", "und")
+        # derive stype from the rec (audio / subtitle / video)
+        _rtype = rec.get("type", "video")
+        _stype_map = {"audio": "audio", "subs": "subtitle", "video": "video"}
+        _stype = _stype_map.get(_rtype, "video")
+        out = _stream_fname(tmp, _stype, lang, idx, f".{ext}")
 
         await safe_edit(st, f"⬇️ Downloading & extracting stream #{idx} via ffmpeg…")
 
@@ -993,15 +994,15 @@ async def _extract_single_stream(
         out_ext = FF.subtitle_ext(codec)
         tags    = target.get("tags", {}) or {}
         lang    = (tags.get("language") or "und").lower()
-        out     = os.path.join(tmp, f"{base}_sub_{idx_str}_{lang}{out_ext}")
+        out     = _stream_fname(tmp, "subtitle", lang, idx_str, out_ext)
     elif stype == "audio":
         out_ext = FF.audio_ext(codec)
         tags    = target.get("tags", {}) or {}
         lang    = (tags.get("language") or "und").lower()
-        out     = os.path.join(tmp, f"{base}_audio_{idx_str}_{lang}{out_ext}")
+        out     = _stream_fname(tmp, "audio", lang, idx_str, out_ext)
     else:
         out_ext = session.ext or os.path.splitext(path)[1] or ".mp4"
-        out     = os.path.join(tmp, f"{base}_video_{idx_str}{out_ext}")
+        out     = _stream_fname(tmp, "video", "", idx_str, out_ext)
 
     await FF.stream_op(path, out, ["-map", f"0:{idx_str}", "-c", "copy"])
 
@@ -1043,7 +1044,7 @@ async def _extract_all_streams(
         else:
             out_ext = FF.audio_ext(codec)
 
-        out = os.path.join(tmp, f"{base}_{stype}_{idx}_{lang}{out_ext}")
+        out = _stream_fname(tmp, stype, lang, idx, out_ext)
         try:
             await FF.stream_op(path, out, ["-map", f"0:{idx}", "-c", "copy"])
             caption = _stream_caption(s, stype, codec)
@@ -1055,6 +1056,36 @@ async def _extract_all_streams(
             log.warning("Extract stream %d failed: %s", idx, exc)
 
     await st.delete()
+
+
+
+def _stream_fname(tmp: str, stype: str, lang: str, idx, ext: str) -> str:
+    """Build a clean, human-readable filename for an extracted stream.
+
+    Examples:
+        subtitle / fre  → sub_fre.ass
+        audio    / jpn  → audio_jpn.mka
+        video    / 0    → video_0.mkv
+    """
+    lang = (lang or "und").strip().lower()
+    if stype == "subtitle":
+        prefix = f"sub_{lang}"
+    elif stype == "audio":
+        prefix = f"audio_{lang}"
+    else:
+        prefix = f"video_{idx}"
+
+    base_name = os.path.join(tmp, f"{prefix}{ext}")
+
+    # Avoid clobbering an existing file (e.g. two audio tracks with same lang)
+    if not os.path.exists(base_name):
+        return base_name
+    counter = 2
+    while True:
+        candidate = os.path.join(tmp, f"{prefix}_{counter}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
 
 
 def _stream_caption(s: dict, stype: str, codec: str) -> str:
