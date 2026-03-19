@@ -112,7 +112,7 @@ async def _extract_thumb_ffmpeg(path: str, out_path: str) -> bool:
 
 async def _extract_thumb_moviepy(path: str, out_path: str) -> bool:
     try:
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
 
         def _do():
             from moviepy.video.io.VideoFileClip import VideoFileClip
@@ -194,7 +194,7 @@ async def _get_video_meta(path: str) -> dict:
 
     if not meta["duration"] or not meta["width"]:
         try:
-            loop = asyncio.get_running_loop()
+            loop = asyncio.get_event_loop()
 
             def _mv():
                 from moviepy.video.io.VideoFileClip import VideoFileClip
