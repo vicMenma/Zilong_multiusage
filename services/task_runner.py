@@ -280,6 +280,19 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         lines.append(f"<code>{fname_s}</code>")
         lines.append("")
 
+        # ── Analyzing (ffprobe running before upload) ─────────
+        if t.state == "🔍 Analyzing…":
+            lines += [
+                f"🔍 <b>Analyzing…</b>",
+                f"──────────────────",
+                f"⚙️  <b>Engine</b>   <code>ffprobe</code>",
+                f"🕰  <b>Elapsed</b>  <code>{elapsed}</code>",
+                f"<i>Reading video metadata, please wait…</i>",
+                "──────────────────",
+                "",
+            ]
+            continue
+
         # ── Queued ────────────────────────────────────────────
         if t.state.startswith("⏳"):
             lines += [
@@ -517,24 +530,16 @@ class TaskRunner:
 
     async def auto_panel(self, uid: int) -> None:
         async with self._panel_lock(uid):
-            existing = self._panels.get(uid)
-
-            # Fix F: if a panel is already running for this user, just wake it
-            # rather than destroying it and creating a new one.  The destroy+create
-            # cycle causes a visible "blank gap" between the delete and the new send,
-            # and is especially noticeable when a download task transitions to upload.
-            if existing and not existing._stopped:
-                existing.wake(immediate=True)   # immediate=True → no 1s cooldown
-                return
-
-            # No panel exists (or it stopped) — clean up and create a fresh one.
-            if existing:
-                existing.stop()
+            # Always stop the old panel and delete its message so the new panel
+            # appears at the BOTTOM of the chat, near the user's latest message.
+            # This is the reference-bot behaviour — the panel follows the conversation.
+            old = self._panels.pop(uid, None)
+            if old:
+                old.stop()
                 try:
-                    await existing._msg.delete()
+                    await old._msg.delete()
                 except Exception:
                     pass
-                self._panels.pop(uid, None)
 
             try:
                 from core.session import get_client

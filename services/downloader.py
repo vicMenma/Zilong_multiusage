@@ -76,6 +76,9 @@ async def download_direct(
                 fname = cd.split("filename=")[-1].strip().strip('"').strip("'")
             if not fname:
                 fname = Path(url.split("?")[0]).name or "download"
+            # URL-decode so "Oshi%20no%20Ko" → "Oshi no Ko" on disk
+            import urllib.parse as _up
+            fname = _up.unquote_plus(fname)
             fname = re.sub(r'[\\/:*?"<>|]', "_", fname)
 
             fpath = os.path.join(dest, fname)

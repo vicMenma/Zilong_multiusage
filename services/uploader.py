@@ -94,6 +94,16 @@ async def upload_file(
     auto_thumb: str | None = None
 
     if ext in _VIDEO_EXTS and method in ("video", "document"):
+        # Show "Analyzing…" state while ffprobe runs (can take 10–30s for large files)
+        # so the user knows the bot is working, not frozen at 0%.
+        if task_record is not None:
+            task_record.update(state="🔍 Analyzing…", fname=fname)
+        try:
+            from services.task_runner import tracker as _tracker, TaskRecord as _TR, runner as _runner
+            _runner._wake_panel(chat_id, immediate=True)
+        except Exception:
+            pass
+
         try:
             from services.ffmpeg import video_meta
             vid_meta = await video_meta(path)
