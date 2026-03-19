@@ -50,9 +50,12 @@ def _start_kb() -> InlineKeyboardMarkup:
 
 
 def _settings_kb(s: dict) -> InlineKeyboardMarkup:
-    mode   = "📄 Document" if s.get("upload_mode") == "document" else "📁 Auto"
-    prefix = s.get("prefix", "").strip()
-    suffix = s.get("suffix", "").strip()
+    mode     = "📄 Document" if s.get("upload_mode") == "document" else "📁 Auto"
+    prefix   = s.get("prefix", "").strip()
+    suffix   = s.get("suffix", "").strip()
+    af       = s.get("auto_forward", False)
+    chs      = s.get("forward_channels", [])
+    af_lbl   = f"📡 Auto-Forward: ✅ ({len(chs)} ch)" if af else "📡 Auto-Forward: ❌"
 
     prefix_lbl = f"🔡 Prefix: {prefix[:18]}" if prefix else "🔡 Prefix: none"
     suffix_lbl = f"🔤 Suffix: {suffix[:18]}" if suffix else "🔤 Suffix: none"
@@ -65,6 +68,8 @@ def _settings_kb(s: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"📤 Upload Mode: {mode}", callback_data="st_mode")],
         [InlineKeyboardButton("🖼️ Set Thumbnail",         callback_data="st_thumb"),
          InlineKeyboardButton("🗑️ Clear Thumbnail",       callback_data="st_clearthumb")],
+        [InlineKeyboardButton(af_lbl,                    callback_data="st_af_toggle"),
+         InlineKeyboardButton("⚙️ Channels",              callback_data="st_af_manage")],
         [InlineKeyboardButton("❌ Close",                  callback_data="st_close")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -305,3 +310,191 @@ async def prefix_suffix_collector(client: Client, msg: Message):
     msg.stop_propagation()
 
 
+
+# ── Auto-Forward handlers ─────────────────────────────────────────────────────
+_AF_ADD_WAITING: set[int] = set()
+
+
+def _af_manage_kb(channels: list) -> InlineKeyboardMarkup:
+    rows = []
+    for i, ch in enumerate(channels):
+        name = ch.get("name", str(ch["id"]))[:28]
+        rows.append([
+            InlineKeyboardButton(f"📢 {name}", callback_data=f"af_info|{i}"),
+            InlineKeyboardButton("🗑", callback_data=f"af_del|{i}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ Add channel", callback_data="af_add")])
+    rows.append([InlineKeyboardButton("🔙 Back to Settings", callback_data="cb_settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+@Client.on_callback_query(filters.regex("^st_af_toggle$"))
+async def cq_af_toggle(client: Client, cb: CallbackQuery):
+    uid = cb.from_user.id
+    s   = await settings.get(uid)
+    chs = s.get("forward_channels", [])
+    if not chs and not s.get("auto_forward"):
+        await cb.answer("⚠️ Add at least one channel first via ⚙️ Channels", show_alert=True)
+        return
+    new = not s.get("auto_forward", False)
+    await settings.update(uid, {"auto_forward": new})
+    s["auto_forward"] = new
+    await cb.message.edit_reply_markup(_settings_kb(s))
+    await cb.answer(f"Auto-Forward {'✅ ON' if new else '❌ OFF'}")
+
+
+@Client.on_callback_query(filters.regex("^st_af_manage$"))
+async def cq_af_manage(client: Client, cb: CallbackQuery):
+    uid = cb.from_user.id
+    s   = await settings.get(uid)
+    chs = s.get("forward_channels", [])
+    count = len(chs)
+    text = (
+        f"📡 <b>Forward Channels</b>  ({count} saved)\n\n"
+        + ("\n".join(f"  {i+1}. <code>{ch.get('name', ch['id'])}</code>" for i, ch in enumerate(chs)) if chs
+           else "  <i>No channels yet.</i>")
+        + "\n\n<i>Add a channel by tapping ➕. The bot must be an admin of that channel.</i>"
+    )
+    await cb.message.edit(text, parse_mode=enums.ParseMode.HTML, reply_markup=_af_manage_kb(chs))
+    await cb.answer()
+
+
+@Client.on_callback_query(filters.regex("^af_add$"))
+async def cq_af_add(client: Client, cb: CallbackQuery):
+    uid = cb.from_user.id
+    _AF_ADD_WAITING.add(uid)
+    await cb.answer()
+    await cb.message.edit(
+        "➕ <b>Add Forward Channel</b>\n\n"
+        "Send the channel <b>username</b> or <b>numeric ID</b>:\n\n"
+        "Examples:\n"
+        "  <code>@mychannel</code>\n"
+        "  <code>-1001234567890</code>\n\n"
+        "<i>The bot must be an admin of that channel.\n"
+        "Send /cancel to cancel.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^af_del\|(\d+)$"))
+async def cq_af_del(client: Client, cb: CallbackQuery):
+    uid = cb.from_user.id
+    idx = int(cb.data.split("|")[1])
+    s   = await settings.get(uid)
+    chs = list(s.get("forward_channels", []))
+    if 0 <= idx < len(chs):
+        removed = chs.pop(idx)
+        await settings.update(uid, {"forward_channels": chs})
+        await cb.answer(f"Removed: {removed.get('name', removed['id'])}")
+    else:
+        await cb.answer("Not found")
+    s["forward_channels"] = chs
+    count = len(chs)
+    text = (
+        f"📡 <b>Forward Channels</b>  ({count} saved)\n\n"
+        + ("\n".join(f"  {i+1}. <code>{ch.get('name', ch['id'])}</code>" for i, ch in enumerate(chs)) if chs
+           else "  <i>No channels yet.</i>")
+        + "\n\n<i>Add a channel by tapping ➕.</i>"
+    )
+    await cb.message.edit(text, parse_mode=enums.ParseMode.HTML, reply_markup=_af_manage_kb(chs))
+
+
+@Client.on_message(
+    filters.private & filters.text & ~filters.command(
+        ["start","help","settings","info","status","log","restart","broadcast",
+         "admin","ban_user","unban_user","banned_list","cancel",
+         "show_thumb","del_thumb","json_formatter","bulk_url"]
+    ),
+    group=9,
+)
+async def af_channel_collector(client: Client, msg: Message):
+    uid = msg.from_user.id
+    if uid not in _AF_ADD_WAITING:
+        return
+
+    text = msg.text.strip()
+    if text.lower() in ("/cancel", "cancel"):
+        _AF_ADD_WAITING.discard(uid)
+        await msg.reply("❌ Cancelled.")
+        msg.stop_propagation()
+        return
+
+    # Resolve username or numeric ID
+    try:
+        if text.lstrip("-").isdigit():
+            target = int(text)
+        else:
+            target = text if text.startswith("@") else f"@{text}"
+
+        chat = await client.get_chat(target)
+        ch_id   = chat.id
+        ch_name = chat.title or chat.username or str(ch_id)
+
+        s   = await settings.get(uid)
+        chs = list(s.get("forward_channels", []))
+
+        # Prevent duplicates
+        if any(c["id"] == ch_id for c in chs):
+            await msg.reply(f"⚠️ <b>{ch_name}</b> is already in your list.", parse_mode=enums.ParseMode.HTML)
+            _AF_ADD_WAITING.discard(uid)
+            msg.stop_propagation()
+            return
+
+        chs.append({"id": ch_id, "name": ch_name})
+        await settings.update(uid, {"forward_channels": chs})
+        _AF_ADD_WAITING.discard(uid)
+
+        await msg.reply(
+            f"✅ <b>{ch_name}</b> added to forward list!\n\n"
+            f"Total channels: <b>{len(chs)}</b>\n"
+            f"Use /settings → ⚙️ Channels to manage.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception as e:
+        await msg.reply(
+            f"❌ Could not resolve channel: <code>{e}</code>\n\n"
+            "<i>Make sure the bot is an admin of that channel and try again.</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    msg.stop_propagation()
+
+
+# ── Forward callback (ask-mode: one channel / all / skip) ────────────────────
+@Client.on_callback_query(filters.regex(r"^fwd\|"))
+async def cq_forward(client: Client, cb: CallbackQuery):
+    parts   = cb.data.split("|")
+    action  = parts[1]                          # one | all | skip
+    src_cid = int(parts[2])                     # source chat id
+    msg_id  = int(parts[3])                     # source message id
+    dest_id = int(parts[4]) if parts[4] != "0" else None
+
+    if action == "skip":
+        await cb.message.delete()
+        await cb.answer("Skipped ✖")
+        return
+
+    uid = cb.from_user.id
+    s   = await settings.get(uid)
+    chs = s.get("forward_channels", [])
+
+    targets = [ch for ch in chs if ch["id"] == dest_id] if action == "one" else chs
+
+    ok, fail = 0, []
+    for ch in targets:
+        try:
+            await client.copy_message(
+                chat_id=ch["id"],
+                from_chat_id=src_cid,
+                message_id=msg_id,
+            )
+            ok += 1
+        except Exception as e:
+            fail.append(ch.get("name", str(ch["id"])))
+
+    result = f"✅ Forwarded to {ok} channel{'s' if ok != 1 else ''}."
+    if fail:
+        result += f"\n⚠️ Failed: {', '.join(fail)}"
+
+    await cb.message.edit(result)
+    await cb.answer()
