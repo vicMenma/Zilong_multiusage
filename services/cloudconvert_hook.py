@@ -4,17 +4,10 @@ services/cloudconvert_hook.py
 Receives CloudConvert webhooks and auto-downloads + uploads
 finished files through the existing Zilong pipeline.
 
-Integrates with:
-  - smart_download()  for downloading the export URL
-  - upload_file()     for uploading to Telegram
-  - task_runner       for progress tracking in the live panel
-  - settings store    for prefix/suffix/auto-forward
-
-Setup:
-  1. Set NGROK_TOKEN in .env (free from ngrok.com)
-  2. Optionally set CC_WEBHOOK_SECRET for signature verification
-  3. Bot prints the webhook URL on startup — paste it into
-     CloudConvert → Dashboard → API → Webhooks
+FIXES:
+  - Uses upload semaphore (prevents FloodWait when multiple jobs finish at once)
+  - Better error messages with file size info
+  - Graceful handling of expired CloudConvert download URLs
 """
 from __future__ import annotations
 
@@ -78,13 +71,15 @@ def _extract_urls(data: dict) -> list[dict]:
 
 async def _process_file(url: str, filename: str, owner_id: int) -> None:
     """Download from CloudConvert URL and upload to owner via existing pipeline."""
+    from core.config import cfg
     from core.session import get_client, settings as _settings
     from services.downloader import smart_download
     from services.uploader import upload_file
-    from services.utils import cleanup, make_tmp, smart_clean_filename, largest_file
+    from services.task_runner import runner as _runner
+    from services.utils import cleanup, make_tmp, smart_clean_filename, largest_file, human_size
 
     client = get_client()
-    tmp = make_tmp("/tmp/zilong_dl", owner_id)
+    tmp = make_tmp(cfg.download_dir, owner_id)
 
     try:
         # Download using the existing smart_download (aria2 for direct links)
@@ -110,6 +105,21 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             cleanup(tmp)
             return
 
+        fsize = os.path.getsize(path)
+
+        # Check file size limit
+        if fsize > cfg.file_limit_b:
+            await client.send_message(
+                owner_id,
+                f"❌ <b>CloudConvert file too large</b>\n"
+                f"<code>{filename}</code>\n"
+                f"Size: <code>{human_size(fsize)}</code>\n"
+                f"Limit: <code>{human_size(cfg.file_limit_b)}</code>",
+                parse_mode="html",
+            )
+            cleanup(tmp)
+            return
+
         # Apply smart filename cleaning + prefix/suffix from settings
         s = await _settings.get(owner_id)
         cleaned = smart_clean_filename(os.path.basename(path))
@@ -126,14 +136,17 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             except OSError:
                 pass
 
-        # Upload using the existing uploader (handles video meta, thumb, auto-forward)
-        from types import SimpleNamespace
-        dummy_msg = SimpleNamespace(
-            edit=lambda *a, **kw: asyncio.sleep(0),
-            delete=lambda: asyncio.sleep(0),
-            chat=SimpleNamespace(id=owner_id),
-        )
-        await upload_file(client, dummy_msg, path)
+        # FIX: Use upload semaphore so multiple CloudConvert files don't
+        # all try to upload simultaneously and trigger FloodWait
+        sem = _runner._get_upload_sem()
+        async with sem:
+            from types import SimpleNamespace
+            dummy_msg = SimpleNamespace(
+                edit=lambda *a, **kw: asyncio.sleep(0),
+                delete=lambda: asyncio.sleep(0),
+                chat=SimpleNamespace(id=owner_id),
+            )
+            await upload_file(client, dummy_msg, path)
 
     except Exception as exc:
         log.error("[CC-Hook] Pipeline failed for %s: %s", filename, exc)
@@ -142,7 +155,7 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
                 owner_id,
                 f"❌ <b>CloudConvert auto-upload failed</b>\n"
                 f"<code>{filename}</code>\n"
-                f"<code>{str(exc)[:100]}</code>",
+                f"<code>{str(exc)[:200]}</code>",
                 parse_mode="html",
             )
         except Exception:
@@ -184,14 +197,17 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
             url  = f["url"]
             name = f["filename"]
 
-            await client.send_message(
-                cfg.owner_id,
-                f"☁️ <b>CloudConvert Auto-Upload</b>\n"
-                f"──────────────────────\n\n"
-                f"📁 <b>File:</b> <code>{name[:50]}</code>\n\n"
-                f"<i>Downloading and uploading automatically…</i>",
-                parse_mode="html",
-            )
+            try:
+                await client.send_message(
+                    cfg.owner_id,
+                    f"☁️ <b>CloudConvert Auto-Upload</b>\n"
+                    f"──────────────────────\n\n"
+                    f"📁 <b>File:</b> <code>{name[:50]}</code>\n\n"
+                    f"<i>Downloading and uploading automatically…</i>",
+                    parse_mode="html",
+                )
+            except Exception as notify_exc:
+                log.warning("[CC-Hook] Could not notify owner: %s", notify_exc)
 
             # Fire-and-forget — each file processes independently
             asyncio.create_task(_process_file(url, name, cfg.owner_id))

@@ -2,11 +2,8 @@
 services/task_runner.py
 Global task registry + unified live progress panel.
 
-Changes:
-- MAX_CONCURRENT = 5: hard cap on parallel active tasks via asyncio.Semaphore
-- Panel completely redesigned: card-style layout, richer visual hierarchy
-- Panel auto-send on task arrival (auto_panel) preserved
-- EDIT_INTERVAL kept at 1.5 s
+SPEED FIX: _UPLOAD_CONCURRENCY now read lazily in start() AFTER dotenv loads,
+so UPLOAD_CONCURRENCY=3 from .env actually takes effect (was silently defaulting to 1).
 """
 from __future__ import annotations
 
@@ -156,7 +153,6 @@ class GlobalTracker:
         return uuid.uuid4().hex[:8].upper()
 
     async def register(self, record: TaskRecord) -> None:
-        # Uploads start immediately — show correct state from the start
         if record.mode == "ul" and record.state == "⏳ Queued":
             record.state = "📤 Uploading"
         async with self._lock:
@@ -193,7 +189,6 @@ class GlobalTracker:
         return [t for t in self.all_tasks() if not t.is_terminal]
 
     def queued_count(self) -> int:
-        """Tasks waiting for a semaphore slot."""
         return sum(1 for t in self._tasks.values() if t.state == "⏳ Queued")
 
     def _evict(self) -> None:
@@ -219,7 +214,7 @@ tracker = GlobalTracker()
 
 
 # ─────────────────────────────────────────────────────────────
-# Panel renderer  — redesigned card-style layout
+# Panel renderer
 # ─────────────────────────────────────────────────────────────
 
 def _ring(p: float) -> str:
@@ -227,7 +222,6 @@ def _ring(p: float) -> str:
 
 
 def _prog_bar(pct: float, cells: int = 10) -> str:
-    """█░ ASCII progress bar inside <code> — renders on every Android font."""
     filled = round(pct / 100 * cells)
     return "█" * filled + "░" * (cells - filled)
 
@@ -277,7 +271,6 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         }.get(t.mode, t.mode)
         mode_hdr = _MODE_HEADER.get(t.mode, f"⚙️ {mode_lbl}")
 
-        # Dashed divider between tasks (not before the first one)
         if i > 0:
             lines += ["", _SEP2, ""]
 
@@ -321,7 +314,6 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         if t.seeds:
             lines.append(f"🌱 <b>Seeds</b>    <code>{t.seeds}</code>")
 
-    # ── System footer — pairs layout ─────────────────────────
     stats   = await system_stats()
     cpu     = stats.get("cpu", 0.0)
     rp      = stats.get("ram_pct", 0.0)
@@ -355,7 +347,6 @@ class LivePanel:
         self._last_activity = time.time()
 
     def wake(self, immediate: bool = False) -> None:
-        """Wake the panel loop for a re-render."""
         self._last_activity = time.time()
         if immediate:
             self._last_edit = 0.0
@@ -411,7 +402,6 @@ class LivePanel:
             if tasks:
                 had_tasks = True
 
-            # Delete panel only when ALL tasks are fully gone from memory
             if had_tasks and not tasks:
                 try:
                     await self._msg.delete()
@@ -436,25 +426,19 @@ class LivePanel:
 # ─────────────────────────────────────────────────────────────
 
 class TaskRunner:
-    # How many uploads can run concurrently.
-    # The original semaphore=1 was a workaround for a stock pyrogram deadlock
-    # where two concurrent send_video() calls competed for the same single DC
-    # connection.  pyrofork >= 2.3.40 with concurrent_transmissions=N opens N
-    # independent encrypted streams per upload, so each upload manages its own
-    # connection pool internally — the deadlock cannot occur anymore.
-    # 3 is the safe maximum: above this Telegram's MTProto rate-limiter starts
-    # dropping chunks for a single bot token, which actually reduces throughput.
-    _UPLOAD_CONCURRENCY: int = int(os.environ.get("UPLOAD_CONCURRENCY", "1"))
+    # FIX #2: Don't read env at class definition time — dotenv hasn't loaded yet.
+    # Default is now 3 (was silently 1). Actual value read in start().
 
     def __init__(self) -> None:
         self._panels:       dict[int, LivePanel] = {}
         self._panel_locks:  dict[int, asyncio.Lock] = {}
         self._running       = False
         self._upload_sem:   asyncio.Semaphore | None = None
+        self._upload_concurrency: int = 3  # will be overridden in start()
 
     def _get_upload_sem(self) -> asyncio.Semaphore:
         if self._upload_sem is None:
-            self._upload_sem = asyncio.Semaphore(self._UPLOAD_CONCURRENCY)
+            self._upload_sem = asyncio.Semaphore(self._upload_concurrency)
         return self._upload_sem
 
     def _panel_lock(self, uid: int) -> asyncio.Lock:
@@ -464,16 +448,20 @@ class TaskRunner:
 
     def start(self) -> None:
         self._running = True
-        # Pre-create the semaphore on the running event loop
         global _task_semaphore
-        _task_semaphore  = asyncio.Semaphore(MAX_CONCURRENT)
-        self._upload_sem = asyncio.Semaphore(self._UPLOAD_CONCURRENCY)
+        _task_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+        # FIX: Read UPLOAD_CONCURRENCY NOW, after dotenv has loaded the .env file.
+        # Before this fix, the class attribute read os.environ at import time (before
+        # load_dotenv), so UPLOAD_CONCURRENCY=3 in .env was silently ignored → default 1.
+        self._upload_concurrency = int(os.environ.get("UPLOAD_CONCURRENCY", "3"))
+        self._upload_sem = asyncio.Semaphore(self._upload_concurrency)
+        log.info("⚡ Upload concurrency: %d simultaneous uploads", self._upload_concurrency)
 
     def stop(self) -> None:
         self._running = False
         for p in self._panels.values():
             p.stop()
-        # Shut down the yt-dlp process pool if it was created
         try:
             from services.downloader import _YTDLP_POOL
             if _YTDLP_POOL is not None:
@@ -514,8 +502,6 @@ class TaskRunner:
         async with self._panel_lock(uid):
             existing = self._panels.get(uid)
 
-            # Always stop the old panel and delete its message so the new
-            # panel appears at the bottom of the chat on every new link sent.
             if existing:
                 existing.stop()
                 try:
@@ -524,7 +510,6 @@ class TaskRunner:
                     pass
                 self._panels.pop(uid, None)
 
-            # Send a fresh panel — handle FloodWait by waiting then retrying once
             for attempt in range(2):
                 try:
                     from core.session import get_client
@@ -584,8 +569,6 @@ class TaskRunner:
         return record
 
     async def _run_task(self, record: TaskRecord, factory) -> None:
-        # Uploads are pure network I/O — never gate them, always run immediately.
-        # Only downloads (dl/magnet) and processing (proc) consume CPU/disk slots.
         needs_slot = record.mode in ("dl", "proc", "magnet")
 
         if needs_slot:
@@ -603,7 +586,6 @@ class TaskRunner:
                     log.error("Task %s failed: %s", record.tid, exc)
                     record.update(state=f"❌ {str(exc)[:60]}")
         else:
-            # Uploads and other I/O — run freely, no slot consumed
             record.update(state="📤 Uploading")
             try:
                 await factory(record)
