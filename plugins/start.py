@@ -31,6 +31,11 @@ HELP_TEXT = """⚡ <b>ZILONG BOT — Features</b>
 › Google Drive · Mediafire
 › Torrents &amp; Magnet links via aria2c
 
+🔥 <b>Hardsub</b>
+› /hardsub — burn subtitles via CloudConvert
+› Supports: video file, URL, magnet + subtitle (.ass/.srt)
+› Output: MP4 with hardcoded subs, auto-uploaded
+
 📦 <b>Archives</b>
 › Extract: zip rar 7z tar.gz
 › Create: zip 7z tar.gz
@@ -91,6 +96,7 @@ def _welcome(name: str) -> str:
         "📥 Download from any URL\n"
         "🧲 Torrents &amp; magnet links\n"
         "🎬 Full video toolkit\n"
+        "🔥 /hardsub — CloudConvert hardsub\n"
         "📦 Archive management\n\n"
         "<i>Tap <b>Help</b> to see everything.</i>"
     )
@@ -312,7 +318,8 @@ async def cq_st_clrsuffix(client: Client, cb: CallbackQuery):
     filters.private & filters.text & ~filters.command(
         ["start","help","settings","info","status","log","restart",
          "broadcast","admin","ban_user","unban_user","banned_list",
-         "cancel","show_thumb","del_thumb","json_formatter","bulk_url"]
+         "cancel","show_thumb","del_thumb","json_formatter","bulk_url",
+         "hardsub"]
     ),
     group=8,
 )
@@ -449,7 +456,7 @@ async def cq_af_del(client: Client, cb: CallbackQuery):
     filters.private & filters.text & ~filters.command(
         ["start","help","settings","info","status","log","restart","broadcast",
          "admin","ban_user","unban_user","banned_list","cancel",
-         "show_thumb","del_thumb","json_formatter","bulk_url"]
+         "show_thumb","del_thumb","json_formatter","bulk_url","hardsub"]
     ),
     group=9,
 )
