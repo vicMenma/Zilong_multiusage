@@ -153,19 +153,6 @@ async def main() -> None:
         webhook_url = await cc_hook.start_webhook_server(
             port=8765, ngrok_token=cfg.ngrok_token,
         )
-        if webhook_url:
-            try:
-                await client.send_message(
-                    cfg.owner_id,
-                    f"☁️ <b>CloudConvert Webhook Ready</b>\n"
-                    f"──────────────────────\n\n"
-                    f"📡 <b>URL:</b>\n<code>{webhook_url}</code>\n\n"
-                    f"Paste this into CloudConvert → API → Webhooks\n"
-                    f"Event: <code>job.finished</code>",
-                    parse_mode=enums.ParseMode.HTML,
-                )
-            except Exception as exc:
-                log.warning("Could not send webhook URL to owner: %s", exc)
         log.info("☁️ CloudConvert webhook started: %s", webhook_url or "localhost only")
     else:
         log.info("ℹ️ No NGROK_TOKEN — CloudConvert webhook disabled")
