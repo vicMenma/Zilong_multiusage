@@ -1,17 +1,55 @@
 """
 plugins/admin.py
 Admin-only commands: ban/unban, stats, log, restart, broadcast.
+
+CHANGES:
+- Added owner_only_gate (group=-1) — any non-owner gets redirected to @kingkum_1
+- Added owner_only_cb_gate for callback queries
+- Removed redundant ban check (non-owners can't reach bot at all now)
 """
 import asyncio
 import os
 import sys
 
 from pyrogram import Client, filters, enums
-from pyrogram.types import Message
+from pyrogram.types import CallbackQuery, Message
 
 from core.config import cfg
 from core.session import users
 
+
+# ── Owner-only gate ───────────────────────────────────────────
+# Runs before every other handler. Non-owners get one reply and nothing else.
+
+@Client.on_message(filters.private, group=-1)
+async def owner_only_gate(client: Client, msg: Message):
+    if not msg.from_user:
+        return
+    if msg.from_user.id == cfg.owner_id:
+        return  # owner passes through
+    await msg.reply(
+        "🔒 <b>Private Bot</b>\n\n"
+        "This bot is for private use only.\n"
+        "To request access, contact "
+        "<a href='https://t.me/kingkum_1'>@kingkum_1</a>",
+        parse_mode=enums.ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    msg.stop_propagation()
+
+
+@Client.on_callback_query(group=-1)
+async def owner_only_cb_gate(client: Client, cb: CallbackQuery):
+    if cb.from_user.id != cfg.owner_id:
+        await cb.answer(
+            "🔒 Private bot. Contact @kingkum_1",
+            show_alert=True,
+        )
+        cb.stop_propagation()
+
+
+# ── Admin filter ──────────────────────────────────────────────
+# Kept for forward-compatibility (admin set may grow beyond owner_id).
 
 def _admin_filter(_, __, msg: Message) -> bool:
     return (msg.from_user.id if msg.from_user else 0) in cfg.admins
@@ -19,7 +57,7 @@ def _admin_filter(_, __, msg: Message) -> bool:
 ADMIN = filters.create(_admin_filter)
 
 
-# ── Ban gate (runs on every private message) ──────────────────
+# ── Ban gate (group=2) — kept but now only reached by owner ───
 
 @Client.on_message(filters.private, group=2)
 async def ban_gate(client: Client, msg: Message):
