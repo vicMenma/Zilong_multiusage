@@ -34,6 +34,7 @@ async def create_hardsub_job(
     output_filename: str = "output.mp4",
     crf: int = 20,
     preset: str = "medium",
+    scale_height: int = 0,
 ) -> dict:
     """
     Create a CloudConvert job that hardcodes a subtitle into a video.
@@ -82,11 +83,19 @@ async def create_hardsub_job(
     # Escape for FFmpeg subtitles filter: colons and backslashes
     sub_escaped = sub_path.replace("\\", "\\\\").replace(":", "\\:")
 
+    # Build -vf filter chain: optional scale + subtitles
+    if scale_height > 0:
+        # Scale first (so subtitles render at the target resolution),
+        # -2 keeps width divisible by 2 for h264
+        vf = f"scale=-2:{scale_height},subtitles='{sub_escaped}'"
+    else:
+        vf = f"subtitles='{sub_escaped}'"
+
     ffmpeg_args = (
         f"-i /input/import-video/{v_safe} "
-        f"-vf subtitles='{sub_escaped}' "
+        f"-vf {vf} "
         f"-c:v libx264 -crf {crf} -preset {preset} "
-        f"-c:a aac -b:a 192k "
+        f"-c:a aac -b:a {'128k' if scale_height and scale_height <= 480 else '192k'} "
         f"-movflags +faststart "
         f"/output/{o_safe}"
     )
@@ -200,6 +209,7 @@ async def submit_hardsub(
     subtitle_path: str = "",
     output_name: str = "hardsub.mp4",
     crf: int = 20,
+    scale_height: int = 0,
 ) -> str:
     """
     High-level: create hardsub job, upload files, return job ID.
@@ -214,6 +224,7 @@ async def submit_hardsub(
         subtitle_path: Local path to .ass / .srt subtitle file
         output_name:   Desired output filename
         crf:           FFmpeg CRF quality (lower = better, 18-23 recommended)
+        scale_height:  Target height in pixels (0 = keep original)
 
     Returns:
         Job ID string
@@ -234,6 +245,7 @@ async def submit_hardsub(
         subtitle_filename=sub_fname,
         output_filename=output_name,
         crf=crf,
+        scale_height=scale_height,
     )
 
     job_id = job.get("id", "?")
