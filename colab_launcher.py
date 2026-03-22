@@ -16,6 +16,9 @@ LOG_CHANNEL   = 0      # @param {type:"integer"}
 NGROK_TOKEN       = ""  # @param {type:"string"}
 CC_WEBHOOK_SECRET = ""  # @param {type:"string"}
 
+# CloudConvert hardsub API key (for /hardsub command)
+CC_API_KEY        = ""  # @param {type:"string"}
+
 import os, sys, subprocess, shutil, time, glob
 from datetime import datetime
 
@@ -60,6 +63,7 @@ if not LOG_CHANNEL:
     except: LOG_CHANNEL = 0
 if not NGROK_TOKEN:       NGROK_TOKEN       = _secret("NGROK_TOKEN")
 if not CC_WEBHOOK_SECRET: CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET")
+if not CC_API_KEY:        CC_API_KEY        = _secret("CC_API_KEY")
 
 errors = []
 if not API_ID:    errors.append("API_ID is required")
@@ -75,6 +79,8 @@ if errors:
 _log("OK", f"Credentials loaded  (API_ID={API_ID}, OWNER_ID={OWNER_ID})")
 if NGROK_TOKEN:
     _log("OK", "CloudConvert webhook enabled (NGROK_TOKEN set)")
+if CC_API_KEY:
+    _log("OK", "CloudConvert hardsub enabled (CC_API_KEY set)")
 
 _log("STEP", "Installing system packages…")
 subprocess.run(
@@ -131,14 +137,16 @@ env_lines = [
     # ── CloudConvert webhook ──────────────────────────────────────────────
     f"NGROK_TOKEN={NGROK_TOKEN}",
     f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
+    # ── CloudConvert hardsub API key ──────────────────────────────────────
+    f"CC_API_KEY={CC_API_KEY}",
     # ── Upload speed tuning ───────────────────────────────────────────────
     # UPLOAD_CONCURRENCY: simultaneous independent file uploads (was 1 = sequential)
     "UPLOAD_CONCURRENCY=3",
     # BOT_WORKERS: pyrofork dispatcher thread pool size (default 4 → 16)
     "BOT_WORKERS=16",
-    # UPLOAD_PARTS_PARALLEL: concurrent 512KB MTProto parts per upload (default 1 → 8)
-    # 8 parts × 512KB / ~100ms RTT ≈ 40 MB/s theoretical — real ~10-25 MB/s on Colab
-    "UPLOAD_PARTS_PARALLEL=8",
+    # UPLOAD_PARTS_PARALLEL: concurrent 512KB MTProto parts per upload (default 1 → 16)
+    # 16 parts × 512KB / ~100ms RTT ≈ 80 MB/s theoretical — real ~15-30 MB/s on Colab
+    "UPLOAD_PARTS_PARALLEL=16",
 ]
 for optional in ("ADMINS", "GDRIVE_SA_JSON", "ARIA2_SECRET"):
     val = _secret(optional)
