@@ -10,14 +10,12 @@ import logging
 import os
 import glob
 
-# ── uvloop: must be installed BEFORE asyncio.run() is ever called ────────────
 try:
     import uvloop
     uvloop.install()
     _UVLOOP = True
 except ImportError:
     _UVLOOP = False
-# ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +32,6 @@ if _UVLOOP:
 else:
     log.warning("⚠️  uvloop not installed — using default asyncio event loop (slower)")
 
-# Remove stale sessions before import
 for _f in glob.glob("*.session") + glob.glob("*.session-journal"):
     try:
         os.remove(_f)
@@ -45,13 +42,8 @@ for _f in glob.glob("*.session") + glob.glob("*.session-journal"):
 from pyrogram import Client, idle, filters, handlers, enums
 from core.config import cfg
 from core.bot_name import get_bot_name, set_bot_name, is_name_configured
-from services.task_runner import runner
+from services.task_runner import runner, MAX_CONCURRENT  # FIX: import MAX_CONCURRENT
 
-
-
-# ── workers parameter ─────────────────────────────────────────────────────────
-# pyrofork's Client accepts 'workers' (default 4) which sets the dispatcher
-# thread pool size. Higher values improve async scheduling under heavy I/O.
 _WORKERS = int(os.environ.get("BOT_WORKERS", "16"))
 
 
@@ -65,7 +57,6 @@ def build_client() -> Client:
         plugins={"root": "plugins"},
         workdir="/tmp",
     )
-    # Add workers only if the parameter exists (it does in all known pyrofork versions)
     sig = inspect.signature(Client.__init__)
     if "workers" in sig.parameters:
         kwargs["workers"] = _WORKERS
@@ -77,15 +68,9 @@ def build_client() -> Client:
     return Client(**kwargs)
 
 
-
 async def _ask_bot_name(client) -> None:
-    """
-    Interactively ask the owner for a bot name on first launch.
-    Registers a one-shot private-message handler, waits up to 5 minutes,
-    then removes the handler and persists the chosen name.
-    """
     loop = asyncio.get_running_loop()
-    fut = loop.create_future()
+    fut  = loop.create_future()
 
     async def _on_name(_, msg):
         name = msg.text.strip()
@@ -124,14 +109,13 @@ async def _ask_bot_name(client) -> None:
     )
     log.info("Bot name configured: %s", name)
 
+
 async def main() -> None:
-    # ── Koyeb health server ────────────────────────────────────
     if os.environ.get("KOYEB", "").strip() == "1":
         from koyeb_server import start_health_server
         port = int(os.environ.get("PORT", 8000))
         start_health_server(port)
         log.info("🌐 Koyeb health server started on port %d", port)
-
 
     client = build_client()
 
@@ -143,9 +127,9 @@ async def main() -> None:
     log.info("✅ @%s (id=%d) started", me.username or me.first_name, me.id)
 
     runner.start()
-    log.info("🚀 Task runner started (max %d concurrent)", 5)
+    # FIX: use imported MAX_CONCURRENT constant instead of hardcoded 5
+    log.info("🚀 Task runner started (max %d concurrent)", MAX_CONCURRENT)
 
-    # ── CloudConvert webhook server ────────────────────────────
     if cfg.ngrok_token:
         import services.cloudconvert_hook as cc_hook
         if cfg.cc_webhook_secret:
@@ -157,7 +141,6 @@ async def main() -> None:
     else:
         log.info("ℹ️ No NGROK_TOKEN — CloudConvert webhook disabled")
 
-    # ── First-launch: ask owner for a bot name ─────────────────
     if not is_name_configured():
         await _ask_bot_name(client)
 
@@ -165,7 +148,6 @@ async def main() -> None:
     await idle()
 
     log.info("👋 Shutting down…")
-    # Stop CloudConvert webhook if running
     if cfg.ngrok_token:
         try:
             from services.cloudconvert_hook import stop_webhook_server
