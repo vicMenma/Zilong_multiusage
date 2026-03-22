@@ -1,16 +1,26 @@
 """
 services/telegraph.py
 Post MediaInfo to Telegra.ph.
-Token is persisted to /tmp/zilong_telegraph.token so Colab restarts
-don't create a new orphaned account every time.
+
+FIX: Token is now stored in data/telegraph.token inside the repo directory
+instead of /tmp/zilong_telegraph.token. /tmp is wiped on every EC2 reboot
+which caused a new orphaned Telegraph account to be created on each restart.
+The data/ directory is already used for bot_name.txt so it's always present.
 """
 from __future__ import annotations
+
+import pathlib as _pathlib
 
 import aiohttp
 import re
 
-_TOKEN_FILE = "/tmp/zilong_telegraph.token"
-_BASE       = "https://api.telegra.ph"
+# FIX: use repo-relative path so the token survives reboots on EC2/VPS
+_TOKEN_FILE = str(
+    _pathlib.Path(__file__).parent.parent / "data" / "telegraph.token"
+)
+_pathlib.Path(_TOKEN_FILE).parent.mkdir(parents=True, exist_ok=True)
+
+_BASE  = "https://api.telegra.ph"
 _token: str = ""
 
 
@@ -50,12 +60,6 @@ async def post_mediainfo(filename: str, text: str) -> str:
     if len(clean) > 60_000:
         clean = clean[:60_000] + "\n\n...(truncated)"
 
-    # ── Mobile-friendly rendering ─────────────────────────────────────────────
-    # A single <pre> block works on desktop (horizontal scroll) but on mobile
-    # Telegraph has no horizontal scroll — long lines overflow off-screen.
-    # Solution: one <p> node per line. Section headers (all-caps like "General",
-    # "Video", "Audio") get a <strong> tag so they stand out visually.
-    # Empty lines become a <br> spacer for breathing room between sections.
     nodes = [
         {"tag": "p", "children": [{"tag": "em", "children": [filename]}]},
     ]
@@ -69,14 +73,12 @@ async def post_mediainfo(filename: str, text: str) -> str:
             nodes.append({"tag": "p", "children": [{"tag": "br", "children": []}]})
             continue
 
-        # Section header — bold
         if _SECTION_RE.match(stripped) and len(stripped) < 40 and ":" not in stripped:
             nodes.append({"tag": "p", "children": [
                 {"tag": "strong", "children": [stripped]}
             ]})
             continue
 
-        # Key : Value line — split so key is plain and value is code
         if ":" in stripped:
             key, _, val = stripped.partition(":")
             key_s = key.rstrip()
@@ -92,10 +94,10 @@ async def post_mediainfo(filename: str, text: str) -> str:
 
     async with aiohttp.ClientSession() as sess:
         async with sess.post(f"{_BASE}/createPage", json={
-            "access_token":  token,
-            "title":         title,
-            "author_name":   "Zilong Bot",
-            "content":       nodes,
+            "access_token":   token,
+            "title":          title,
+            "author_name":    "Zilong Bot",
+            "content":        nodes,
             "return_content": False,
         }) as r:
             data = await r.json()

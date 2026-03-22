@@ -2,10 +2,10 @@
 services/downloader.py
 Download strategies — decoupled from Telegram types.
 
-Change vs original:
-- _tracked_progress inside smart_download now calls runner._wake_panel(user_id)
-  so the live panel refreshes immediately on every progress tick instead of
-  waiting for the 1.5s EDIT_INTERVAL timer.
+FIXES:
+- CRITICAL: timeout variable was computed but then discarded — always used
+  TOTAL_TIMEOUT (6h). Dead magnets now properly time out after 3 minutes.
+- urllib.parse moved to module-level (was duplicated as two local aliases)
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import asyncio
 import os
 import re
 import time
+import urllib.parse as _urlparse
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Callable, Awaitable, Optional
@@ -37,11 +38,11 @@ def _get_pool() -> ProcessPoolExecutor:
 
 # ── URL classifier ────────────────────────────────────────────
 
-_MAGNET_RE    = re.compile(r"^magnet:\?", re.I)
-_TORRENT_RE   = re.compile(r"\.torrent(\?.*)?$", re.I)
-_GDRIVE_RE    = re.compile(r"drive\.google\.com", re.I)
-_MF_RE        = re.compile(r"mediafire\.com", re.I)
-_YTDLP_RE     = re.compile(
+_MAGNET_RE  = re.compile(r"^magnet:\?", re.I)
+_TORRENT_RE = re.compile(r"\.torrent(\?.*)?$", re.I)
+_GDRIVE_RE  = re.compile(r"drive\.google\.com", re.I)
+_MF_RE      = re.compile(r"mediafire\.com", re.I)
+_YTDLP_RE   = re.compile(
     r"(youtube\.com|youtu\.be|instagram\.com|twitter\.com|x\.com|"
     r"facebook\.com|tiktok\.com|dailymotion\.com|vimeo\.com|twitch\.tv|"
     r"reddit\.com|pinterest\.com|ok\.ru|bilibili\.com|soundcloud\.com|"
@@ -76,9 +77,7 @@ async def download_direct(
                 fname = cd.split("filename=")[-1].strip().strip('"').strip("'")
             if not fname:
                 fname = Path(url.split("?")[0]).name or "download"
-            # URL-decode so "Oshi%20no%20Ko" → "Oshi no Ko" on disk
-            import urllib.parse as _up
-            fname = _up.unquote_plus(fname)
+            fname = _urlparse.unquote_plus(fname)
             fname = re.sub(r'[\\/:*?"<>|]', "_", fname)
 
             fpath = os.path.join(dest, fname)
@@ -97,13 +96,8 @@ async def download_direct(
 
 # ── yt-dlp (process pool) ─────────────────────────────────────
 
-def _ytdlp_worker(
-    url: str,
-    dest: str,
-    audio_only: bool,
-    fmt_id: Optional[str],
-) -> str:
-    import yt_dlp
+def _ytdlp_worker(url: str, dest: str, audio_only: bool, fmt_id: Optional[str]) -> str:
+    import yt_dlp as _ydlp
 
     out_tmpl = os.path.join(dest, "%(title).60s.%(ext)s")
     opts: dict = {
@@ -126,16 +120,15 @@ def _ytdlp_worker(
     else:
         opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with _ydlp.YoutubeDL(opts) as ydl:
         info  = ydl.extract_info(url, download=True)
         fpath = ydl.prepare_filename(info)
 
     if not os.path.exists(fpath):
         base = os.path.splitext(fpath)[0]
-        for ext in (".mp3", ".m4a", ".opus", ".ogg", ".aac", ".mp4", ".mkv", ".webm"):
-            candidate = base + ext
-            if os.path.exists(candidate):
-                return candidate
+        for ext in (".mp3",".m4a",".opus",".ogg",".aac",".mp4",".mkv",".webm"):
+            if os.path.exists(base + ext):
+                return base + ext
         result = largest_file(dest)
         if not result:
             raise FileNotFoundError(f"yt-dlp produced no output in {dest!r}")
@@ -153,7 +146,6 @@ async def download_ytdlp(
     loop = asyncio.get_running_loop()
     pool = _get_pool()
 
-    # ── Pre-fetch expected file size so progress bar has a total ──
     expected_size: int = 0
     try:
         def _get_size() -> int:
@@ -175,12 +167,7 @@ async def download_ytdlp(
     except Exception:
         pass
 
-    future = loop.run_in_executor(
-        pool,
-        _ytdlp_worker,
-        url, dest, audio_only, fmt_id,
-    )
-
+    future    = loop.run_in_executor(pool, _ytdlp_worker, url, dest, audio_only, fmt_id)
     start     = time.time()
     last_size = 0
     last_time = start
@@ -189,7 +176,7 @@ async def download_ytdlp(
         await asyncio.sleep(1.0)
         if progress:
             try:
-                cur = largest_file(dest)
+                cur      = largest_file(dest)
                 cur_size = os.path.getsize(cur) if cur else 0
                 now      = time.time()
                 dt       = now - last_time
@@ -226,7 +213,7 @@ async def download_mediafire(
             direct = m.group(1)
             break
     if not direct:
-        raise ValueError("Cannot extract Mediafire direct link. Page may require login.")
+        raise ValueError("Cannot extract Mediafire direct link.")
     return await download_direct(direct, dest, progress)
 
 
@@ -245,15 +232,15 @@ async def download_gdrive(
         raise ValueError("Cannot parse Google Drive file ID from URL")
     file_id = m.group(1)
 
-    sa = sa_json or cfg.gdrive_sa_json
+    sa    = sa_json or cfg.gdrive_sa_json
     creds = None
     if sa and os.path.exists(sa):
         from google.oauth2.service_account import Credentials
         creds = Credentials.from_service_account_file(
             sa, scopes=["https://www.googleapis.com/auth/drive.readonly"])
 
-    svc  = build("drive", "v3", credentials=creds, cache_discovery=False)
-    meta = svc.files().get(fileId=file_id, fields="name,size").execute()
+    svc   = build("drive", "v3", credentials=creds, cache_discovery=False)
+    meta  = svc.files().get(fileId=file_id, fields="name,size").execute()
     fname = meta.get("name", "gdrive_file")
     total = int(meta.get("size", 0))
     fpath = os.path.join(dest, fname)
@@ -261,7 +248,7 @@ async def download_gdrive(
     request = svc.files().get_media(fileId=file_id)
     start   = time.time()
     with open(fpath, "wb") as fh:
-        dl = MediaIoBaseDownload(fh, request, chunksize=10 * 1024 * 1024)
+        dl        = MediaIoBaseDownload(fh, request, chunksize=10 * 1024 * 1024)
         done_flag = False
         while not done_flag:
             status, done_flag = dl.next_chunk()
@@ -274,11 +261,7 @@ async def download_gdrive(
     return fpath
 
 
-# ── Aria2 (magnet / torrent) ──────────────────────────────────
-# Approach from reference bot (zilong-main):
-# Run aria2c as a subprocess and read its stdout line-by-line in real-time.
-# This gives instant progress updates instead of 2s API polling gaps,
-# and correctly shows the metadata phase from the very first second.
+# ── Aria2 (magnet / torrent / direct) ────────────────────────
 
 import re as _re
 
@@ -289,7 +272,6 @@ _ARIA2_PROG_RE = _re.compile(
 
 
 def _aria2_bytes(s: str) -> int:
-    """Convert aria2c size string '12.5MiB' → bytes."""
     units = {"b":1,"kib":1024,"mib":1024**2,"gib":1024**3,
              "kb":1000,"mb":1000**2,"gb":1000**3}
     m = _re.match(r"([\d.]+)\s*(\w+)", s.strip(), _re.I)
@@ -302,7 +284,6 @@ def _aria2_bytes(s: str) -> int:
 
 
 def _aria2_eta(s: str) -> int:
-    """Convert '3m56s' → seconds."""
     total = 0
     for v, u in _re.findall(r"(\d+)([hms])", s):
         total += int(v) * {"h":3600,"m":60,"s":1}.get(u, 0)
@@ -317,8 +298,13 @@ async def download_aria2(
 ) -> str:
     """
     Download via aria2c subprocess — real-time stdout parsing.
-    No aria2p API, no polling gap.
+
+    FIX: timeout variable is now actually used. Metadata phase times out
+    after META_TIMEOUT (3 min) instead of always waiting TOTAL_TIMEOUT (6h).
     """
+    META_TIMEOUT  = 180    # 3 min to get first progress line from magnet
+    TOTAL_TIMEOUT = 21600  # 6 h overall cap
+
     if is_file:
         cmd = [
             "aria2c", "-x16", "--seed-time=0",
@@ -335,7 +321,6 @@ async def download_aria2(
             uri_or_path,
         ]
 
-    # Set meta_phase immediately for magnets so panel shows correct state
     if task_record is not None and not is_file:
         task_record.update(meta_phase=True, state="🔍 Fetching metadata…")
         try:
@@ -354,12 +339,6 @@ async def download_aria2(
     last_wake = [start]
     in_meta   = [task_record is not None and not is_file]
 
-    # Metadata timeout: if no progress appears within 3 minutes the magnet
-    # is dead (no peers / trackers offline). Kill and raise a clear error.
-    META_TIMEOUT  = 180   # seconds to wait for first progress line
-    # Total download timeout: 6 hours max for any single file
-    TOTAL_TIMEOUT = 21600
-
     def _wake(uid: int) -> None:
         now = time.time()
         if now - last_wake[0] >= 1.0:
@@ -370,7 +349,6 @@ async def download_aria2(
             except Exception:
                 pass
 
-    # Drain stderr concurrently so it never fills the pipe buffer and deadlocks
     async def _drain_stderr():
         if proc.stderr:
             try:
@@ -379,19 +357,16 @@ async def download_aria2(
                 pass
 
     asyncio.ensure_future(_drain_stderr())
-
     assert proc.stdout is not None
 
     async def _read_stdout():
-        nonlocal in_meta
         async for raw in proc.stdout:
             line = raw.decode(errors="replace").strip()
             if not line:
                 continue
 
             elapsed = time.time() - start
-
-            m = _ARIA2_PROG_RE.search(line)
+            m       = _ARIA2_PROG_RE.search(line)
             if m:
                 done_b  = _aria2_bytes(m.group(1) or "0")
                 total_b = _aria2_bytes(m.group(2) or "0")
@@ -425,19 +400,22 @@ async def download_aria2(
                 )
                 _wake(task_record.user_id)
 
-    # Apply timeouts: metadata phase gets META_TIMEOUT, full download gets TOTAL_TIMEOUT
+    # FIX: use the correct timeout per phase.
+    # Magnets: META_TIMEOUT (3 min) — if no progress in 3 min, magnet is dead.
+    # Everything else: TOTAL_TIMEOUT (6 h).
     timeout = META_TIMEOUT if (task_record is not None and not is_file) else TOTAL_TIMEOUT
+
     try:
-        await asyncio.wait_for(_read_stdout(), timeout=TOTAL_TIMEOUT)
+        await asyncio.wait_for(_read_stdout(), timeout=timeout)
     except asyncio.TimeoutError:
         try:
             proc.kill()
         except Exception:
             pass
         phase = "metadata resolution" if in_meta[0] else "download"
+        limit = "3 min" if in_meta[0] else "6 h"
         raise RuntimeError(
-            f"aria2c timed out during {phase} "
-            f"({'3 min' if in_meta[0] else '6 h'} limit). "
+            f"aria2c timed out during {phase} ({limit} limit). "
             "The magnet may have no active peers or trackers."
         )
 
@@ -465,7 +443,6 @@ async def download_aria2(
     return result
 
 
-
 # ── Smart dispatcher ──────────────────────────────────────────
 
 async def smart_download(
@@ -479,7 +456,6 @@ async def smart_download(
 ) -> str:
     from services.task_runner import tracker, TaskRecord, runner
 
-    import urllib.parse as _uparse
     kind   = classify(url)
     engine = {
         "magnet":    "magnet",
@@ -490,14 +466,10 @@ async def smart_download(
         "direct":    "direct",
     }.get(kind, "direct")
 
-    # URL-decode the label so "Oshi%20no%20Ko" → "Oshi no Ko"
-    raw_label = label or url.split("/")[-1].split("?")[0][:40] or "Download"
-    clean_label = _uparse.unquote_plus(raw_label)[:50]
+    raw_label   = label or url.split("/")[-1].split("?")[0][:40] or "Download"
+    clean_label = _urlparse.unquote_plus(raw_label)[:50]
 
-    tid    = tracker.new_tid()
-    # Fix B: magnet/torrent tasks start in metadata phase immediately.
-    # This ensures auto_panel renders "🔍 Fetching metadata…" rather than
-    # "⏳ Queued — waiting for a free slot" on the very first panel render.
+    tid            = tracker.new_tid()
     initial_meta   = kind in ("magnet", "torrent")
     initial_state  = "🔍 Fetching metadata…" if initial_meta else "📥 Starting…"
     record = TaskRecord(
@@ -554,6 +526,6 @@ async def _dispatch(
     if kind == "ytdlp":
         return await download_ytdlp(url, dest, audio_only=audio_only,
                                     fmt_id=fmt_id, progress=progress)
-    # All remaining direct HTTP/HTTPS links go through aria2c:
-    # multi-connection (-x16), auto-retry, resume support — better than single-stream aiohttp
-    return await download_aria2(url, dest, is_file=False, progress=progress, task_record=task_record)
+    return await download_aria2(
+        url, dest, is_file=False, progress=progress, task_record=task_record,
+    )

@@ -1,6 +1,11 @@
 """
 services/utils.py
 Pure helper functions — no Telegram types, no side effects.
+
+FIX: smart_clean_filename now only applies the noise-token stop rule after
+the 3rd token (index >= 2). Previously "TS Online - Episode 01.mkv" would
+be cleaned to just "Online - Episode 01" because "TS" matched the noise
+pattern on the very first token.
 """
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
-# Shared language lookup tables (single source of truth)
+# Shared language lookup tables
 # ─────────────────────────────────────────────────────────────
 
 LANG_FLAG: dict[str, str] = {
@@ -82,7 +87,6 @@ def human_dur(secs: float) -> str:
 
 
 def fmt_hms(secs: float) -> str:
-    """Format as H:MM:SS or M:SS."""
     s = int(max(0, secs))
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
@@ -175,13 +179,9 @@ def progress_panel(
 # Telegram helpers
 # ─────────────────────────────────────────────────────────────
 
-_TG_MAX = 4096   # Telegram hard message length limit
+_TG_MAX = 4096
 
 async def safe_edit(msg, text: str, **kwargs) -> None:
-    """Edit message, swallow idempotent / not-found errors.
-    Automatically truncates text to Telegram's 4096-char limit.
-    """
-    # Hard truncate — never let an oversized panel kill the live loop
     if len(text) > _TG_MAX:
         text = text[:_TG_MAX - 64] + "\n\n<i>⚠️ Panel truncated — too many active tasks</i>"
     try:
@@ -195,7 +195,6 @@ async def safe_edit(msg, text: str, **kwargs) -> None:
             "MESSAGE_TOO_LONG", "message is too long",
         )):
             return
-        # Don't re-raise floods or peer not found quietly
         if "FLOOD_WAIT" in err or "peer_id_invalid" in err.lower():
             log.debug("safe_edit suppressed: %s", err[:100])
             return
@@ -232,17 +231,15 @@ def safe_fname(name: str) -> str:
 # ─────────────────────────────────────────────────────────────
 import re as _re
 
-# Language/audio tags we explicitly KEEP — they are meaningful to the user
 _KEEP_TAGS: frozenset[str] = frozenset({
     "VOSTFR", "VOSTA", "VF", "VO", "VOFR", "MULTI", "FRENCH", "ENGLISH",
     "ENG", "FR", "JAP", "JPN", "KOR", "CHI", "SPA", "ITA", "GER", "POR",
     "DUAL", "TRUEFRENCH", "SUBFRENCH", "VOSTEN", "VOSTJP",
 })
 
-# Technical noise we strip — matched case-insensitively as whole tokens
 _NOISE_RE = _re.compile(
     r"^("
-    r"\d{3,4}p"                              # 720p 1080p 480p 2160p
+    r"\d{3,4}p"
     r"|4[Kk]|UHD|SDR|HDR|HDR10|HDR10\+|DV|DoVi|10[Bb]it|8[Bb]it"
     r"|WEB[\-\.]?DL|WEB|BluRay|Blu[\-\.]?Ray|BDRip|BRRip|HDRip"
     r"|HDTV|PDTV|DVDRip|DVDScr|CAMRip|TELESYNC|TS"
@@ -259,44 +256,34 @@ def smart_clean_filename(fname: str) -> str:
     Strip technical release tags from an anime/series filename, keeping
     the show name, episode identifier, and language tag.
 
-    Examples
-    --------
-    "Oshi no Ko S03E10 VOSTFR 720p WEB x264 AAC -Tsundere-Raws (ADN).mkv"
-        → "Oshi no Ko S03E10 VOSTFR.mkv"
-    "Jujutsu Kaisen S03E09 1080p BluRay x265.mkv"
-        → "Jujutsu Kaisen S03E09.mkv"
-    "[SubsPlease] Vinland Saga - 24 (1080p) [ABC123].mkv"
-        → "Vinland Saga - 24.mkv"
+    FIX: noise token matching now only kicks in after the 3rd token (i >= 2).
+    This prevents show names like "TS Online", "WEB Series", or "BluRay
+    Adventures" from being eaten by the noise pattern on the first token.
     """
     name, ext = os.path.splitext(fname)
 
-    # 1. Strip leading group tag in square brackets e.g. "[SubsPlease]"
+    # Strip leading group tag in square brackets e.g. "[SubsPlease]"
     name = _re.sub(r"^\[[^\]]{1,40}\]\s*", "", name).strip()
 
     # Replace dots/underscores used as word separators with spaces
-    # (but only if the whole string looks like it uses them as separators)
     if " " not in name and ("." in name or "_" in name):
         name = name.replace(".", " ").replace("_", " ")
 
     tokens = name.split()
     keep: list[str] = []
-    last_lang_idx: int = -1
 
     for i, tok in enumerate(tokens):
-        bare = _re.sub(r"[^\w\+]", "", tok).upper()  # strip punctuation for matching
+        bare = _re.sub(r"[^\w\+]", "", tok).upper()
 
         if bare in _KEEP_TAGS:
             keep.append(tok)
-            last_lang_idx = len(keep) - 1
             continue
 
-        if _NOISE_RE.match(bare):
-            # Stop here — everything from this token on is technical noise.
-            # If a lang tag was the previous token, we already kept it.
+        # FIX: only stop on noise tokens after the 3rd position (index >= 2)
+        # so show names like "TS Online" or "WEB Series" are preserved.
+        if i >= 2 and _NOISE_RE.match(bare):
             break
 
-        # Strip trailing release-group tokens: "-GroupName" (hyphen + text, no spaces)
-        # A bare "-" token (episode separator like "Vinland Saga - 24") must be kept.
         if tok.startswith("-") and len(tok) > 1 and i > 0:
             break
         if tok.startswith("(") and tok.endswith(")") and i > 0:
@@ -308,7 +295,7 @@ def smart_clean_filename(fname: str) -> str:
 
     result = " ".join(keep).strip(" -_.,")
     if not result:
-        return fname          # fallback: return original if we stripped everything
+        return fname
     return result + ext
 
 
@@ -341,8 +328,8 @@ async def system_stats() -> dict:
     out = {"cpu": 0.0, "ram_pct": 0.0, "ram_used": 0, "disk_free": 0, "dl_speed": 0.0, "ul_speed": 0.0}
     try:
         import psutil
-        out["cpu"] = psutil.cpu_percent(interval=None)
-        vm = psutil.virtual_memory()
+        out["cpu"]      = psutil.cpu_percent(interval=None)
+        vm              = psutil.virtual_memory()
         out["ram_pct"]  = vm.percent
         out["ram_used"] = vm.used
         out["disk_free"] = psutil.disk_usage("/").free

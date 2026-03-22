@@ -2,8 +2,14 @@
 services/task_runner.py
 Global task registry + unified live progress panel.
 
-SPEED FIX: _UPLOAD_CONCURRENCY now read lazily in start() AFTER dotenv loads,
-so UPLOAD_CONCURRENCY=3 from .env actually takes effect (was silently defaulting to 1).
+FIXES:
+- render_panel no longer calls system_stats() directly — that blocked the
+  event loop for 250ms per call. Stats now come from a background cache
+  updated every 5 seconds by _stats_updater().
+- TaskRecord._dirty removed — it was created but never awaited (dead code).
+- auto_panel now checks for an existing live panel before spawning a new one,
+  preventing the race when two tasks finish simultaneously for the same user.
+- UPLOAD_CONCURRENCY read lazily in start() after dotenv loads (pre-existing fix kept).
 """
 from __future__ import annotations
 
@@ -17,13 +23,32 @@ from typing import Awaitable, Callable, Optional
 
 log = logging.getLogger(__name__)
 
-MAX_CONCURRENT = 5          # hard parallel task cap
+MAX_CONCURRENT = 5
 EDIT_INTERVAL  = 1.5
 PANEL_TTL      = 600
-TASK_LINGER    = 15   # finished tasks stay 15s so panel sees them before eviction
+TASK_LINGER    = 15
 
-# Global semaphore — limits truly concurrent task execution to 5
 _task_semaphore: Optional[asyncio.Semaphore] = None
+
+# ── Background stats cache ────────────────────────────────────
+# Updated every 5 s by _stats_updater() — render_panel reads this dict
+# synchronously instead of sleeping 250 ms per call for net sampling.
+_stats_cache: dict = {
+    "cpu": 0.0, "ram_pct": 0.0, "ram_used": 0,
+    "disk_free": 0, "dl_speed": 0.0, "ul_speed": 0.0,
+}
+
+
+async def _stats_updater() -> None:
+    """Background coroutine — samples system stats every 5 s."""
+    from services.utils import system_stats
+    while True:
+        try:
+            result = await system_stats()
+            _stats_cache.update(result)
+        except Exception:
+            pass
+        await asyncio.sleep(5)
 
 
 def _get_semaphore() -> asyncio.Semaphore:
@@ -34,86 +59,54 @@ def _get_semaphore() -> asyncio.Semaphore:
 
 
 # ─────────────────────────────────────────────────────────────
-# TaskRecord
+# TaskRecord  (_dirty field removed — was never awaited)
 # ─────────────────────────────────────────────────────────────
 
 _ENGINE_ICON: dict[str, str] = {
-    "telegram": "📲",
-    "ytdlp":    "▶️",
-    "aria2":    "🧨",
-    "direct":   "🔗",
-    "gdrive":   "☁️",
-    "ffmpeg":   "⚙️",
-    "magnet":   "🧲",
-    "mediafire":"📁",
+    "telegram": "📲", "ytdlp": "▶️", "aria2": "🧨", "direct": "🔗",
+    "gdrive": "☁️", "ffmpeg": "⚙️", "magnet": "🧲", "mediafire": "📁",
 }
-
 _ENGINE_LABEL: dict[str, str] = {
-    "telegram": "Telegram",
-    "ytdlp":    "yt-dlp",
-    "aria2":    "Aria2",
-    "direct":   "Direct",
-    "gdrive":   "GDrive",
-    "ffmpeg":   "FFmpeg",
-    "magnet":   "Aria2",
-    "mediafire":"Mediafire",
+    "telegram": "Telegram", "ytdlp": "yt-dlp", "aria2": "Aria2",
+    "direct": "Direct", "gdrive": "GDrive", "ffmpeg": "FFmpeg",
+    "magnet": "Aria2", "mediafire": "Mediafire",
 }
-
 _MODE_ICON: dict[str, str] = {
-    "dl":     "📥",
-    "ul":     "📤",
-    "proc":   "⚙️",
-    "magnet": "🧲",
-    "queue":  "⏳",
+    "dl": "📥", "ul": "📤", "proc": "⚙️", "magnet": "🧲", "queue": "⏳",
 }
-
 _MODE_LABEL: dict[str, str] = {
-    "dl":     "Download",
-    "ul":     "Upload",
-    "proc":   "Processing",
-    "magnet": "Torrent",
-    "queue":  "Queued",
+    "dl": "Download", "ul": "Upload", "proc": "Processing",
+    "magnet": "Torrent", "queue": "Queued",
 }
 
 
 @dataclass
 class TaskRecord:
-    tid:      str
-    user_id:  int
-    label:    str
-    mode:     str   = "dl"
-    engine:   str   = ""
-    state:    str   = "⏳ Queued"
-    fname:    str   = ""
-    done:     int   = 0
-    total:    int   = 0
-    speed:    float = 0.0
-    eta:      int   = 0
-    elapsed:  float = 0.0
-    seeds:    int   = 0
-    meta_phase: bool = False
-    started:  float = field(default_factory=time.time)
-    finished: Optional[float] = None
-    seq:      int   = 0
-
-    _dirty:   asyncio.Event      = field(default_factory=asyncio.Event, repr=False)
+    tid:        str
+    user_id:    int
+    label:      str
+    mode:       str   = "dl"
+    engine:     str   = ""
+    state:      str   = "⏳ Queued"
+    fname:      str   = ""
+    done:       int   = 0
+    total:      int   = 0
+    speed:      float = 0.0
+    eta:        int   = 0
+    elapsed:    float = 0.0
+    seeds:      int   = 0
+    meta_phase: bool  = False
+    started:    float = field(default_factory=time.time)
+    finished:   Optional[float] = None
+    seq:        int   = 0
 
     def update(self, **kw) -> None:
-        changed = False
         for k, v in kw.items():
-            if hasattr(self, k) and k not in ("_dirty",):
-                if getattr(self, k) != v:
-                    setattr(self, k, v)
-                    changed = True
+            if hasattr(self, k):
+                setattr(self, k, v)
         self.elapsed = time.time() - self.started
         if self.state.startswith(("✅", "❌")) and self.finished is None:
             self.finished = time.time()
-            changed = True
-        if changed:
-            try:
-                self._dirty.set()
-            except Exception:
-                pass
 
     def pct(self) -> float:
         return min((self.done / self.total * 100) if self.total else 0.0, 100.0)
@@ -160,9 +153,10 @@ class GlobalTracker:
             self._seq += 1
             record.seq = self._seq
             self._tasks[record.tid] = record
-        asyncio.create_task(
-            runner.auto_panel(record.user_id)
-        )
+        # FIX: only spawn auto_panel if no panel is already live for this user
+        existing = runner._panels.get(record.user_id)
+        if not existing or existing._stopped:
+            asyncio.create_task(runner.auto_panel(record.user_id))
 
     async def update(self, tid: str, **kw) -> None:
         async with self._lock:
@@ -193,33 +187,21 @@ class GlobalTracker:
 
     def _evict(self) -> None:
         now  = time.time()
-        dead = [
-            tid for tid, t in self._tasks.items()
-            if t.is_terminal and t.finished and now - t.finished > TASK_LINGER
-        ]
+        dead = [k for k, t in self._tasks.items()
+                if t.is_terminal and t.finished and now - t.finished > TASK_LINGER]
         for k in dead:
             self._tasks.pop(k, None)
 
     def _evict_sync(self) -> None:
-        now  = time.time()
-        dead = [
-            tid for tid, t in self._tasks.items()
-            if t.is_terminal and t.finished and now - t.finished > TASK_LINGER
-        ]
-        for k in dead:
-            self._tasks.pop(k, None)
+        self._evict()
 
 
 tracker = GlobalTracker()
 
 
 # ─────────────────────────────────────────────────────────────
-# Panel renderer
+# Panel renderer  (FIX: reads cached stats — no sleep)
 # ─────────────────────────────────────────────────────────────
-
-def _ring(p: float) -> str:
-    return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
-
 
 def _prog_bar(pct: float, cells: int = 10) -> str:
     filled = round(pct / 100 * cells)
@@ -239,7 +221,7 @@ _MODE_HEADER = {
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
     from core.bot_name import get_bot_name
-    from services.utils import human_size, human_dur, system_stats
+    from services.utils import human_size, human_dur
 
     tasks  = tracker.tasks_for_user(target_uid) if target_uid else tracker.all_tasks()
     active = [t for t in tasks if not t.is_terminal]
@@ -248,7 +230,6 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         1 for t in active
         if t.mode in ("dl", "proc", "magnet") and not t.state.startswith("⏳")
     )
-    n_queued  = sum(1 for t in active if t.state.startswith("⏳"))
 
     bot_name   = get_bot_name().upper()
     active_lbl = f"{len(active)} active" if active else "idle"
@@ -263,13 +244,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         elapsed  = human_dur(int(t.elapsed)) if t.elapsed else "0s"
         fname    = t.fname or t.label
         fname_s  = (fname[:38] + "…") if len(fname) > 38 else fname
-        mode_lbl = {
-            "dl":     "Downloading",
-            "ul":     "Uploading",
-            "magnet": "Torrent",
-            "proc":   "Processing",
-        }.get(t.mode, t.mode)
-        mode_hdr = _MODE_HEADER.get(t.mode, f"⚙️ {mode_lbl}")
+        mode_hdr = _MODE_HEADER.get(t.mode, f"⚙️ {t.mode}")
 
         if i > 0:
             lines += ["", _SEP2, ""]
@@ -291,8 +266,9 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
             ]
             continue
 
-        spd_s = (human_size(t.speed) + "/s") if t.speed else "—"
-        eta_s = human_dur(t.eta) if t.eta > 0 else "—"
+        spd_s   = (human_size(t.speed) + "/s") if t.speed else "—"
+        eta_s   = human_dur(t.eta) if t.eta > 0 else "—"
+        mode_lbl = _MODE_HEADER.get(t.mode, t.mode).split(" ", 1)[-1]
 
         lines.append(f"🏷️ <b>Name</b>     <code>{fname_s}</code>")
         lines.append(f"🔄 <b>Status</b>   {mode_lbl}  via {t.engine_lbl}")
@@ -310,11 +286,11 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         lines.append(
             f"⏳ <b>Remains</b>  <code>{eta_s}</code>   elapsed <code>{elapsed}</code>"
         )
-
         if t.seeds:
             lines.append(f"🌱 <b>Seeds</b>    <code>{t.seeds}</code>")
 
-    stats   = await system_stats()
+    # FIX: read from cache — no asyncio.sleep()
+    stats   = _stats_cache
     cpu     = stats.get("cpu", 0.0)
     rp      = stats.get("ram_pct", 0.0)
     df      = stats.get("disk_free", 0)
@@ -333,17 +309,20 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────────────────────
+# LivePanel
+# ─────────────────────────────────────────────────────────────
 
 class LivePanel:
     def __init__(self, msg, uid: int) -> None:
-        self._msg      = msg
-        self._uid      = uid
-        self._lock     = asyncio.Lock()
-        self._task:    Optional[asyncio.Task] = None
-        self._stopped  = False
-        self._last_txt = ""
-        self._wake_ev  = asyncio.Event()
-        self._last_edit = 0.0
+        self._msg           = msg
+        self._uid           = uid
+        self._lock          = asyncio.Lock()
+        self._task:         Optional[asyncio.Task] = None
+        self._stopped       = False
+        self._last_txt      = ""
+        self._wake_ev       = asyncio.Event()
+        self._last_edit     = 0.0
         self._last_activity = time.time()
 
     def wake(self, immediate: bool = False) -> None:
@@ -390,7 +369,6 @@ class LivePanel:
 
             if self._stopped:
                 break
-
             self._wake_ev.clear()
 
             since_last = time.time() - self._last_edit
@@ -398,7 +376,6 @@ class LivePanel:
                 await asyncio.sleep(1.0 - since_last)
 
             tasks = tracker.tasks_for_user(self._uid)
-
             if tasks:
                 had_tasks = True
 
@@ -426,15 +403,12 @@ class LivePanel:
 # ─────────────────────────────────────────────────────────────
 
 class TaskRunner:
-    # FIX #2: Don't read env at class definition time — dotenv hasn't loaded yet.
-    # Default is now 3 (was silently 1). Actual value read in start().
-
     def __init__(self) -> None:
-        self._panels:       dict[int, LivePanel] = {}
-        self._panel_locks:  dict[int, asyncio.Lock] = {}
-        self._running       = False
-        self._upload_sem:   asyncio.Semaphore | None = None
-        self._upload_concurrency: int = 3  # will be overridden in start()
+        self._panels:             dict[int, LivePanel] = {}
+        self._panel_locks:        dict[int, asyncio.Lock] = {}
+        self._running             = False
+        self._upload_sem:         asyncio.Semaphore | None = None
+        self._upload_concurrency: int = 3
 
     def _get_upload_sem(self) -> asyncio.Semaphore:
         if self._upload_sem is None:
@@ -451,12 +425,17 @@ class TaskRunner:
         global _task_semaphore
         _task_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-        # FIX: Read UPLOAD_CONCURRENCY NOW, after dotenv has loaded the .env file.
-        # Before this fix, the class attribute read os.environ at import time (before
-        # load_dotenv), so UPLOAD_CONCURRENCY=3 in .env was silently ignored → default 1.
         self._upload_concurrency = int(os.environ.get("UPLOAD_CONCURRENCY", "3"))
         self._upload_sem = asyncio.Semaphore(self._upload_concurrency)
         log.info("⚡ Upload concurrency: %d simultaneous uploads", self._upload_concurrency)
+
+        # Start background stats updater
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(_stats_updater())
+            log.info("📊 Background stats updater started (every 5s)")
+        except Exception as e:
+            log.warning("Could not start stats updater: %s", e)
 
     def stop(self) -> None:
         self._running = False
@@ -468,8 +447,6 @@ class TaskRunner:
                 _YTDLP_POOL.shutdown(wait=False)
         except Exception:
             pass
-
-    # ── Panel lifecycle ───────────────────────────────────────
 
     def open_panel(self, uid: int, msg, target_uid: Optional[int] = None) -> LivePanel:
         old = self._panels.get(uid)
@@ -502,6 +479,12 @@ class TaskRunner:
         async with self._panel_lock(uid):
             existing = self._panels.get(uid)
 
+            # FIX: if a live (non-stopped) panel already exists, just wake it
+            if existing and not existing._stopped:
+                existing.wake()
+                return
+
+            # Stop and clean up any dead panel
             if existing:
                 existing.stop()
                 try:
@@ -515,12 +498,10 @@ class TaskRunner:
                     from core.session import get_client
                     from pyrogram import enums
                     from pyrogram.errors import FloodWait
-                    client = get_client()
+                    client       = get_client()
                     initial_text = await render_panel(uid)
                     msg = await client.send_message(
-                        uid,
-                        initial_text,
-                        parse_mode=enums.ParseMode.HTML,
+                        uid, initial_text, parse_mode=enums.ParseMode.HTML,
                     )
                     new_panel = LivePanel(msg, uid=uid)
                     self._panels[uid] = new_panel
@@ -546,17 +527,12 @@ class TaskRunner:
         if p:
             p.wake(immediate=immediate)
 
-    # ── Task submission with semaphore ─────────────────────────
-
     async def submit(
         self,
-        user_id: int,
-        label:   str,
+        user_id: int, label: str,
         coro_factory: Callable[[TaskRecord], Awaitable[None]],
-        fname:  str = "",
-        total:  int = 0,
-        mode:   str = "dl",
-        engine: str = "",
+        fname: str = "", total: int = 0,
+        mode: str = "dl", engine: str = "",
     ) -> TaskRecord:
         tid    = tracker.new_tid()
         record = TaskRecord(

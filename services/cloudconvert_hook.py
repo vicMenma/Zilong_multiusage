@@ -1,13 +1,10 @@
 """
 services/cloudconvert_hook.py
-──────────────────────────────────────────────
 Receives CloudConvert webhooks and auto-downloads + uploads
 finished files through the existing Zilong pipeline.
 
-FIXES:
-  - Uses upload semaphore (prevents FloodWait when multiple jobs finish at once)
-  - Better error messages with file size info
-  - Graceful handling of expired CloudConvert download URLs
+FIX: Added startup warning when CC_WEBHOOK_SECRET is empty.
+Without a secret, any POST to the ngrok URL triggers downloads/uploads.
 """
 from __future__ import annotations
 
@@ -21,15 +18,12 @@ from aiohttp import web
 
 log = logging.getLogger(__name__)
 
-# Populated from config at boot
 WEBHOOK_SECRET: str = ""
 _runner = None
 _site   = None
 
 LISTEN_PORT = 8765
 
-
-# ── Signature verification ───────────────────
 
 def _verify_signature(payload: bytes, signature: str) -> bool:
     if not WEBHOOK_SECRET:
@@ -40,17 +34,10 @@ def _verify_signature(payload: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-# ── Extract download URLs from CloudConvert ──
-
 def _extract_urls(data: dict) -> list[dict]:
-    """
-    Parse CloudConvert webhook payload.
-    Returns list of {url, filename} from export/url tasks.
-    """
     results = []
-    job = data.get("job", {})
+    job   = data.get("job", {})
     tasks = job.get("tasks", [])
-
     for task in tasks:
         if task.get("operation") not in ("export/url",):
             continue
@@ -67,10 +54,7 @@ def _extract_urls(data: dict) -> list[dict]:
     return results
 
 
-# ── Download + upload pipeline ───────────────
-
 async def _process_file(url: str, filename: str, owner_id: int) -> None:
-    """Download from CloudConvert URL and upload to owner via existing pipeline."""
     from core.config import cfg
     from core.session import get_client, settings as _settings
     from services.downloader import smart_download
@@ -79,15 +63,10 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
     from services.utils import cleanup, make_tmp, smart_clean_filename, largest_file, human_size
 
     client = get_client()
-    tmp = make_tmp(cfg.download_dir, owner_id)
+    tmp    = make_tmp(cfg.download_dir, owner_id)
 
     try:
-        # Download using the existing smart_download (aria2 for direct links)
-        path = await smart_download(
-            url, tmp,
-            user_id=owner_id,
-            label=filename,
-        )
+        path = await smart_download(url, tmp, user_id=owner_id, label=filename)
 
         if os.path.isdir(path):
             resolved = largest_file(path)
@@ -107,7 +86,6 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
 
         fsize = os.path.getsize(path)
 
-        # Check file size limit
         if fsize > cfg.file_limit_b:
             await client.send_message(
                 owner_id,
@@ -120,8 +98,7 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             cleanup(tmp)
             return
 
-        # Apply smart filename cleaning + prefix/suffix from settings
-        s = await _settings.get(owner_id)
+        s       = await _settings.get(owner_id)
         cleaned = smart_clean_filename(os.path.basename(path))
         name, ext = os.path.splitext(cleaned)
         prefix = s.get("prefix", "").strip()
@@ -136,8 +113,6 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             except OSError:
                 pass
 
-        # FIX: Use upload semaphore so multiple CloudConvert files don't
-        # all try to upload simultaneously and trigger FloodWait
         sem = _runner._get_upload_sem()
         async with sem:
             from types import SimpleNamespace
@@ -164,8 +139,6 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
         cleanup(tmp)
 
 
-# ── Webhook handler ──────────────────────────
-
 async def handle_cloudconvert(request: web.Request) -> web.Response:
     from core.config import cfg
 
@@ -177,7 +150,7 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
             log.warning("[CC-Hook] Invalid signature — rejected")
             return web.json_response({"error": "invalid signature"}, status=403)
 
-        data = await request.json()
+        data  = await request.json()
         event = data.get("event", "")
         log.info("[CC-Hook] Received event: %s", event)
 
@@ -189,7 +162,6 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
             log.warning("[CC-Hook] No export URLs in payload")
             return web.json_response({"status": "no_urls"})
 
-        # Notify owner and process each file
         from core.session import get_client
         client = get_client()
 
@@ -209,7 +181,6 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
             except Exception as notify_exc:
                 log.warning("[CC-Hook] Could not notify owner: %s", notify_exc)
 
-            # Fire-and-forget — each file processes independently
             asyncio.create_task(_process_file(url, name, cfg.owner_id))
 
         log.info("[CC-Hook] Enqueued %d file(s)", len(files))
@@ -220,13 +191,9 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
 
 
-# ── Health check ─────────────────────────────
-
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "online", "service": "cloudconvert-webhook"})
 
-
-# ── Server lifecycle ─────────────────────────
 
 def _build_app() -> web.Application:
     app = web.Application()
@@ -237,22 +204,29 @@ def _build_app() -> web.Application:
 
 
 async def start_webhook_server(port: int = LISTEN_PORT, ngrok_token: str = "") -> str:
-    """Start aiohttp webhook server + ngrok tunnel. Returns public URL."""
     global _runner, _site
 
-    app = _build_app()
+    app     = _build_app()
     _runner = web.AppRunner(app)
     await _runner.setup()
     _site = web.TCPSite(_runner, "0.0.0.0", port)
     await _site.start()
     log.info("[CC-Hook] Webhook server listening on port %d", port)
 
+    # FIX: warn when no secret is set so operator knows the endpoint is open
+    if not WEBHOOK_SECRET:
+        log.warning(
+            "[CC-Hook] ⚠️  No CC_WEBHOOK_SECRET set — webhook accepts ALL POST requests. "
+            "Anyone who discovers the ngrok URL can trigger file uploads. "
+            "Set CC_WEBHOOK_SECRET in .env and configure it in CloudConvert's webhook settings."
+        )
+
     public_url = ""
     if ngrok_token:
         try:
             from pyngrok import ngrok, conf
             conf.get_default().auth_token = ngrok_token
-            tunnel = ngrok.connect(port, "http")
+            tunnel     = ngrok.connect(port, "http")
             public_url = tunnel.public_url
             webhook_url = f"{public_url}/webhook/cloudconvert"
             log.info("[CC-Hook] ngrok tunnel: %s", public_url)
