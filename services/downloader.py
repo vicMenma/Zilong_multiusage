@@ -3,9 +3,13 @@ services/downloader.py
 Download strategies — decoupled from Telegram types.
 
 FIXES:
-- CRITICAL: timeout variable was computed but then discarded — always used
-  TOTAL_TIMEOUT (6h). Dead magnets now properly time out after 3 minutes.
-- urllib.parse moved to module-level (was duplicated as two local aliases)
+  - BUG 2 (CRITICAL): META_TIMEOUT (180 s) was applied to every download
+    that went through the task tracker, not just magnets. A 1 GB file at
+    2 MB/s takes 500 s — well past the 180 s limit — so every large direct
+    download was silently killed. Fixed by guarding with _MAGNET_RE.match().
+  - BUG 3 (CRITICAL): direct URL downloads only tried aria2c with no
+    fallback. On AWS when aria2c is stopped they all fail. Fixed by
+    catching aria2c failure and retrying with aiohttp in _dispatch().
 """
 from __future__ import annotations
 
@@ -58,7 +62,7 @@ def classify(url: str) -> str:
     return "direct"
 
 
-# ── Direct HTTP ───────────────────────────────────────────────
+# ── Direct HTTP (aiohttp) ─────────────────────────────────────
 
 async def download_direct(
     url: str, dest: str, progress: Optional[ProgressCB] = None
@@ -261,7 +265,7 @@ async def download_gdrive(
     return fpath
 
 
-# ── Aria2 (magnet / torrent / direct) ────────────────────────
+# ── Aria2 (magnet / torrent / direct fallback) ────────────────
 
 import re as _re
 
@@ -299,11 +303,16 @@ async def download_aria2(
     """
     Download via aria2c subprocess — real-time stdout parsing.
 
-    FIX: timeout variable is now actually used. Metadata phase times out
-    after META_TIMEOUT (3 min) instead of always waiting TOTAL_TIMEOUT (6h).
+    FIX (BUG 2): timeout is now computed correctly per transfer type.
+      - Magnet links:  META_TIMEOUT (3 min) to get first progress → if no
+                       peers respond within 3 min the link is dead.
+      - Everything else: TOTAL_TIMEOUT (6 h) overall cap.
+      Previously the condition was `task_record is not None and not is_file`
+      which was True for ALL tracked downloads including large direct HTTP
+      files — causing them to be killed after 3 minutes.
     """
-    META_TIMEOUT  = 180    # 3 min to get first progress line from magnet
-    TOTAL_TIMEOUT = 21600  # 6 h overall cap
+    META_TIMEOUT  = 180    # 3 min — dead magnet detection
+    TOTAL_TIMEOUT = 21600  # 6 h  — overall cap for everything else
 
     if is_file:
         cmd = [
@@ -321,7 +330,12 @@ async def download_aria2(
             uri_or_path,
         ]
 
-    if task_record is not None and not is_file:
+    # FIX: is_magnet guards the short timeout — direct HTTP uses TOTAL_TIMEOUT
+    is_magnet = _MAGNET_RE.match(uri_or_path) is not None
+
+    in_meta = [is_magnet and task_record is not None and not is_file]
+
+    if in_meta[0] and task_record is not None:
         task_record.update(meta_phase=True, state="🔍 Fetching metadata…")
         try:
             from services.task_runner import runner as _r
@@ -337,7 +351,8 @@ async def download_aria2(
 
     start     = time.time()
     last_wake = [start]
-    in_meta   = [task_record is not None and not is_file]
+    # FIX: apply META_TIMEOUT only to magnets, TOTAL_TIMEOUT to everything else
+    timeout   = META_TIMEOUT if is_magnet else TOTAL_TIMEOUT
 
     def _wake(uid: int) -> None:
         now = time.time()
@@ -399,11 +414,6 @@ async def download_aria2(
                     meta_phase=True, state="🔍 Fetching metadata…", elapsed=elapsed,
                 )
                 _wake(task_record.user_id)
-
-    # FIX: use the correct timeout per phase.
-    # Magnets: META_TIMEOUT (3 min) — if no progress in 3 min, magnet is dead.
-    # Everything else: TOTAL_TIMEOUT (6 h).
-    timeout = META_TIMEOUT if (task_record is not None and not is_file) else TOTAL_TIMEOUT
 
     try:
         await asyncio.wait_for(_read_stdout(), timeout=timeout)
@@ -469,9 +479,9 @@ async def smart_download(
     raw_label   = label or url.split("/")[-1].split("?")[0][:40] or "Download"
     clean_label = _urlparse.unquote_plus(raw_label)[:50]
 
-    tid            = tracker.new_tid()
-    initial_meta   = kind in ("magnet", "torrent")
-    initial_state  = "🔍 Fetching metadata…" if initial_meta else "📥 Starting…"
+    tid           = tracker.new_tid()
+    initial_meta  = kind in ("magnet", "torrent")
+    initial_state = "🔍 Fetching metadata…" if initial_meta else "📥 Starting…"
     record = TaskRecord(
         tid=tid, user_id=user_id,
         label=clean_label,
@@ -508,6 +518,9 @@ async def _dispatch(
     sa_json: Optional[str], progress: Optional[ProgressCB],
     task_record=None,
 ) -> str:
+    import logging as _log
+    _dlog = _log.getLogger(__name__)
+
     if kind == "magnet":
         return await download_aria2(
             url, dest, is_file=False,
@@ -526,6 +539,22 @@ async def _dispatch(
     if kind == "ytdlp":
         return await download_ytdlp(url, dest, audio_only=audio_only,
                                     fmt_id=fmt_id, progress=progress)
-    return await download_aria2(
-        url, dest, is_file=False, progress=progress, task_record=task_record,
-    )
+
+    # "direct" — FIX (BUG 3): try aria2c first, fall back to aiohttp
+    # On AWS when aria2c is stopped (or on Koyeb where there's no aria2c
+    # daemon), aria2c fails immediately. aiohttp handles direct HTTP reliably.
+    try:
+        return await download_aria2(
+            url, dest, is_file=False,
+            progress=progress, task_record=task_record,
+        )
+    except Exception as aria2_exc:
+        _dlog.warning(
+            "[Downloader] aria2c failed for direct URL (%s) — falling back to aiohttp",
+            aria2_exc,
+        )
+        if task_record is not None:
+            task_record.update(
+                state="📥 Downloading", engine="direct", meta_phase=False,
+            )
+        return await download_direct(url, dest, progress=progress)

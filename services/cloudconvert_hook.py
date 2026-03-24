@@ -3,8 +3,14 @@ services/cloudconvert_hook.py
 Receives CloudConvert webhooks and auto-downloads + uploads
 finished files through the existing Zilong pipeline.
 
-FIX: Added startup warning when CC_WEBHOOK_SECRET is empty.
-Without a secret, any POST to the ngrok URL triggers downloads/uploads.
+FIXES:
+  - Auto-registers webhook URL with CC API on startup:
+      1. Lists all existing CC webhooks and deletes them (avoids duplicates)
+      2. Registers the new ngrok URL
+      3. DMs the webhook URL to the owner via Telegram
+  - Added startup warning when CC_WEBHOOK_SECRET is empty.
+  - Webhook is now BONUS / redundant — ccstatus.py poller handles delivery
+    independently. The webhook just speeds up delivery.
 """
 from __future__ import annotations
 
@@ -101,8 +107,8 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
         s       = await _settings.get(owner_id)
         cleaned = smart_clean_filename(os.path.basename(path))
         name, ext = os.path.splitext(cleaned)
-        prefix = s.get("prefix", "").strip()
-        suffix = s.get("suffix", "").strip()
+        prefix    = s.get("prefix", "").strip()
+        suffix    = s.get("suffix", "").strip()
         final_name = f"{prefix}{name}{suffix}{ext}"
 
         if final_name != os.path.basename(path):
@@ -154,7 +160,7 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
         event = data.get("event", "")
         log.info("[CC-Hook] Received event: %s", event)
 
-        if event != "job.finished":
+        if event not in ("job.finished", "job.failed"):
             return web.json_response({"status": "ignored", "event": event})
 
         files = _extract_urls(data)
@@ -172,7 +178,7 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
             try:
                 await client.send_message(
                     cfg.owner_id,
-                    f"☁️ <b>CloudConvert Auto-Upload</b>\n"
+                    f"☁️ <b>CloudConvert Webhook Received</b>\n"
                     f"──────────────────────\n\n"
                     f"📁 <b>File:</b> <code>{name[:50]}</code>\n\n"
                     f"<i>Downloading and uploading automatically…</i>",
@@ -203,6 +209,98 @@ def _build_app() -> web.Application:
     return app
 
 
+# ─────────────────────────────────────────────────────────────
+# CC API webhook registration
+# ─────────────────────────────────────────────────────────────
+
+async def _register_cc_webhook(public_url: str) -> None:
+    """
+    Delete all existing CC webhooks (avoids duplicates), then register
+    the new one. DMs the owner with the webhook URL so it's easy to copy
+    into the CloudConvert dashboard if manual configuration is needed.
+    """
+    from core.config import cfg
+
+    api_key = cfg.cc_api_key
+    if not api_key:
+        log.warning("[CC-Hook] No CC_API_KEY — skipping webhook auto-registration")
+        return
+
+    import aiohttp
+
+    webhook_url = f"{public_url}/webhook/cloudconvert"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as sess:
+            # 1 — list existing webhooks and delete them
+            async with sess.get(
+                "https://api.cloudconvert.com/v2/webhooks", headers=headers
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for wh in data.get("data", []):
+                        wh_id = wh.get("id")
+                        if wh_id:
+                            async with sess.delete(
+                                f"https://api.cloudconvert.com/v2/webhooks/{wh_id}",
+                                headers=headers,
+                            ) as del_resp:
+                                if del_resp.status in (200, 204):
+                                    log.info("[CC-Hook] Deleted old webhook id=%s url=%s",
+                                             wh_id, wh.get("url", "?"))
+                else:
+                    log.warning("[CC-Hook] Could not list existing webhooks: HTTP %d", resp.status)
+
+            # 2 — register new webhook
+            payload: dict = {
+                "url":    webhook_url,
+                "events": ["job.finished", "job.failed"],
+            }
+            if WEBHOOK_SECRET:
+                payload["signing_secret"] = WEBHOOK_SECRET
+
+            async with sess.post(
+                "https://api.cloudconvert.com/v2/webhooks",
+                json=payload, headers=headers,
+            ) as resp:
+                data = await resp.json()
+                if resp.status in (200, 201):
+                    wh_id = (data.get("data") or data).get("id", "?")
+                    log.info("[CC-Hook] Webhook registered id=%s url=%s", wh_id, webhook_url)
+                else:
+                    log.error("[CC-Hook] Webhook registration failed %d: %s",
+                              resp.status, data)
+
+    except Exception as exc:
+        log.error("[CC-Hook] Webhook registration error: %s", exc)
+
+    # 3 — DM the owner with the webhook URL
+    try:
+        from core.session import get_client
+        client = get_client()
+        await client.send_message(
+            cfg.owner_id,
+            f"☁️ <b>CloudConvert Webhook Active</b>\n"
+            f"──────────────────────\n\n"
+            f"🌐 <b>Webhook URL:</b>\n"
+            f"<code>{webhook_url}</code>\n\n"
+            f"🔑 <b>Secret set:</b> {'✅ Yes' if WEBHOOK_SECRET else '❌ No (open endpoint)'}\n\n"
+            f"<i>This URL has been automatically registered with CloudConvert.\n"
+            f"It will change on next restart — re-registration is automatic.</i>",
+            parse_mode="html",
+        )
+    except Exception as exc:
+        log.warning("[CC-Hook] Could not DM owner webhook URL: %s", exc)
+
+
+# ─────────────────────────────────────────────────────────────
+# Server lifecycle
+# ─────────────────────────────────────────────────────────────
+
 async def start_webhook_server(port: int = LISTEN_PORT, ngrok_token: str = "") -> str:
     global _runner, _site
 
@@ -213,12 +311,10 @@ async def start_webhook_server(port: int = LISTEN_PORT, ngrok_token: str = "") -
     await _site.start()
     log.info("[CC-Hook] Webhook server listening on port %d", port)
 
-    # FIX: warn when no secret is set so operator knows the endpoint is open
     if not WEBHOOK_SECRET:
         log.warning(
-            "[CC-Hook] ⚠️  No CC_WEBHOOK_SECRET set — webhook accepts ALL POST requests. "
-            "Anyone who discovers the ngrok URL can trigger file uploads. "
-            "Set CC_WEBHOOK_SECRET in .env and configure it in CloudConvert's webhook settings."
+            "[CC-Hook] No CC_WEBHOOK_SECRET set — webhook accepts ALL POST requests. "
+            "Set CC_WEBHOOK_SECRET in .env to restrict access."
         )
 
     public_url = ""
@@ -228,14 +324,17 @@ async def start_webhook_server(port: int = LISTEN_PORT, ngrok_token: str = "") -
             conf.get_default().auth_token = ngrok_token
             tunnel     = ngrok.connect(port, "http")
             public_url = tunnel.public_url
-            webhook_url = f"{public_url}/webhook/cloudconvert"
             log.info("[CC-Hook] ngrok tunnel: %s", public_url)
-            log.info("[CC-Hook] Webhook URL: %s", webhook_url)
-            return webhook_url
+            log.info("[CC-Hook] Webhook URL: %s/webhook/cloudconvert", public_url)
+
+            # Auto-register with CC API and DM owner
+            asyncio.create_task(_register_cc_webhook(public_url))
+
+            return f"{public_url}/webhook/cloudconvert"
         except ImportError:
             log.error("[CC-Hook] pyngrok not installed — pip install pyngrok")
-        except Exception as e:
-            log.error("[CC-Hook] ngrok error: %s", e)
+        except Exception as exc:
+            log.error("[CC-Hook] ngrok error: %s", exc)
     else:
         log.info("[CC-Hook] No NGROK_TOKEN — server on localhost:%d only", port)
 
