@@ -2,7 +2,7 @@
 # @markdown ## Credentials
 # @markdown
 # @markdown **Recommended:** Add secrets via the 🔑 icon in the left panel:
-# @markdown - `API_ID`, `API_HASH`, `BOT_TOKEN`, `OWNER_ID`
+# @markdown - `API_ID`, `API_HASH`, `BOT_TOKEN`, `OWNER_ID`, `GITHUB_TOKEN`
 
 API_ID    = 0      # @param {type:"integer"}
 API_HASH  = ""     # @param {type:"string"}
@@ -17,13 +17,17 @@ NGROK_TOKEN       = ""  # @param {type:"string"}
 CC_WEBHOOK_SECRET = ""  # @param {type:"string"}
 
 # CloudConvert hardsub API key (for /hardsub command)
-CC_API_KEY        = ""  # @param {type:"string"}
+CC_API_KEY = ""  # @param {type:"string"}
+
+# GitHub personal access token — required for private repo clone
+GITHUB_TOKEN = ""  # @param {type:"string"}
 
 import os, sys, subprocess, shutil, time, glob
 from datetime import datetime
 
-REPO_URL = "https://github.com/vicMenma/Zilong_multiusage.git"
-BASE_DIR = "/content/zilong"
+# FIX (BUG 1): correct repo URL — Zilong_v2, not Zilong_multiusage
+REPO_NAME = "Zilong_v2"
+BASE_DIR  = f"/content/zilong"
 
 
 def _log(level: str, msg: str):
@@ -61,9 +65,12 @@ if not FILE_LIMIT_MB:
 if not LOG_CHANNEL:
     try: LOG_CHANNEL = int(_secret("LOG_CHANNEL") or 0)
     except: LOG_CHANNEL = 0
-if not NGROK_TOKEN:       NGROK_TOKEN       = _secret("NGROK_TOKEN")
+# FIX: also check NGROK_AUTHTOKEN as alias
+if not NGROK_TOKEN:
+    NGROK_TOKEN = _secret("NGROK_TOKEN") or _secret("NGROK_AUTHTOKEN")
 if not CC_WEBHOOK_SECRET: CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET")
 if not CC_API_KEY:        CC_API_KEY        = _secret("CC_API_KEY")
+if not GITHUB_TOKEN:      GITHUB_TOKEN      = _secret("GITHUB_TOKEN")
 
 errors = []
 if not API_ID:    errors.append("API_ID is required")
@@ -77,10 +84,9 @@ if errors:
     raise SystemExit("Fill in credentials and run again.")
 
 _log("OK", f"Credentials loaded  (API_ID={API_ID}, OWNER_ID={OWNER_ID})")
-if NGROK_TOKEN:
-    _log("OK", "CloudConvert webhook enabled (NGROK_TOKEN set)")
-if CC_API_KEY:
-    _log("OK", "CloudConvert hardsub enabled (CC_API_KEY set)")
+if NGROK_TOKEN:  _log("OK", "CloudConvert webhook enabled (NGROK_TOKEN set)")
+if CC_API_KEY:   _log("OK", "CloudConvert hardsub enabled (CC_API_KEY set)")
+if GITHUB_TOKEN: _log("OK", "GitHub token set — will clone private repo")
 
 _log("STEP", "Installing system packages…")
 subprocess.run(
@@ -93,19 +99,25 @@ _log("OK", "System packages ready")
 _log("STEP", "Cloning repository…")
 if os.path.exists(BASE_DIR):
     shutil.rmtree(BASE_DIR)
+
+# FIX (BUG 1): inject GITHUB_TOKEN into clone URL for private repo access
+if GITHUB_TOKEN:
+    REPO_URL = f"https://{GITHUB_TOKEN}@github.com/vicMenma/{REPO_NAME}.git"
+else:
+    REPO_URL = f"https://github.com/vicMenma/{REPO_NAME}.git"
+
 r = subprocess.run(["git", "clone", "--depth=1", REPO_URL, BASE_DIR],
                    capture_output=True, text=True)
 if r.returncode != 0:
-    raise SystemExit(f"❌ Clone failed:\n{r.stderr[:300]}")
-_log("OK", f"Cloned to {BASE_DIR}")
+    # Sanitize token from error message before printing
+    err_clean = r.stderr.replace(GITHUB_TOKEN, "***") if GITHUB_TOKEN else r.stderr
+    raise SystemExit(f"❌ Clone failed:\n{err_clean[:300]}")
+_log("OK", f"Cloned {REPO_NAME} to {BASE_DIR}")
 
 _log("STEP", "Installing Python packages…")
-# Remove stock pyrogram before installing pyrofork — both expose the same
-# `pyrogram` namespace. If both are installed, stock pyrogram wins and
-# pyrofork-specific internals won't be available.
 subprocess.run(
     [sys.executable, "-m", "pip", "uninstall", "-q", "-y", "pyrogram"],
-    capture_output=True,  # silence "not installed" warnings
+    capture_output=True,
 )
 subprocess.run(
     [sys.executable, "-m", "pip", "install", "-q",
@@ -123,6 +135,9 @@ subprocess.Popen(
 time.sleep(2)
 _log("OK", "aria2c started")
 
+# FIX (BUG 9): inject ALL resolved credentials directly into Popen env so they
+# override any stale values that may already be set in os.environ.
+# This also ensures load_dotenv(override=True) in config.py sees the right values.
 env_lines = [
     f"API_ID={API_ID}",
     f"API_HASH={API_HASH}",
@@ -134,18 +149,11 @@ env_lines = [
     "ARIA2_HOST=http://localhost",
     "ARIA2_PORT=6800",
     "ARIA2_SECRET=",
-    # ── CloudConvert webhook ──────────────────────────────────────────────
     f"NGROK_TOKEN={NGROK_TOKEN}",
     f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
-    # ── CloudConvert hardsub API key ──────────────────────────────────────
     f"CC_API_KEY={CC_API_KEY}",
-    # ── Upload speed tuning ───────────────────────────────────────────────
-    # UPLOAD_CONCURRENCY: simultaneous independent file uploads (was 1 = sequential)
     "UPLOAD_CONCURRENCY=3",
-    # BOT_WORKERS: pyrofork dispatcher thread pool size (default 4 → 16)
     "BOT_WORKERS=16",
-    # UPLOAD_PARTS_PARALLEL: concurrent 512KB MTProto parts per upload (default 1 → 16)
-    # 16 parts × 512KB / ~100ms RTT ≈ 80 MB/s theoretical — real ~15-30 MB/s on Colab
     "UPLOAD_PARTS_PARALLEL=16",
 ]
 for optional in ("ADMINS", "GDRIVE_SA_JSON", "ARIA2_SECRET"):
@@ -210,19 +218,14 @@ except Exception as _e:
 os.chdir(BASE_DIR)
 
 # ── Keep Colab alive ──────────────────────────────────────────
-# Two tricks to prevent Colab from killing the runtime:
-#   1. JavaScript: clicks the "connect" button every 60s (prevents idle disconnect)
-#   2. Heartbeat thread: prints a dot every 5 min so stdout stays active
 _log("STEP", "Activating Colab keep-alive…")
 try:
     from IPython.display import display, Javascript
     display(Javascript('''
     function ColabKeepAlive() {
-        // Try multiple selectors — Colab changes its DOM occasionally
         document.querySelector("#top-toolbar .colab-connect-button")?.click();
         document.querySelector("colab-connect-button")?.shadowRoot
             ?.querySelector("#connect")?.click();
-        // Also prevent the "runtime disconnected" dialog
         document.querySelector("#ok")?.click();
     }
     setInterval(ColabKeepAlive, 60000);
@@ -235,7 +238,6 @@ except Exception:
 import threading
 
 def _heartbeat():
-    """Print a silent heartbeat every 5 min to keep stdout active."""
     while True:
         time.sleep(300)
         ts = datetime.now().strftime("%H:%M")
@@ -247,8 +249,17 @@ _log("OK", "Heartbeat thread started (every 5 min)")
 
 _log("OK", "Starting bot…\n" + "─" * 50)
 
-MAX_RESTARTS = 50  # only counts fast crashes (<5 min) — long-running crashes reset the counter
+MAX_RESTARTS = 50
+
 restart_count = 0
+
+# FIX (BUG 9): inject credentials directly into subprocess env so they survive
+# even if the subprocess re-reads os.environ and load_dotenv hasn't fired yet
+_bot_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+for line in env_lines:
+    if "=" in line:
+        k, _, v = line.partition("=")
+        _bot_env[k] = v
 
 while restart_count < MAX_RESTARTS:
     t_start = datetime.now()
@@ -257,7 +268,7 @@ while restart_count < MAX_RESTARTS:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True, bufsize=1,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        env=_bot_env,
     )
     for line in proc.stdout:
         print(line, end="", flush=True)
@@ -268,7 +279,6 @@ while restart_count < MAX_RESTARTS:
         _log("OK", "Bot stopped cleanly.")
         break
 
-    # If bot ran >5 min before crashing, it's not a startup bug — reset counter
     if elapsed > 300:
         restart_count = 0
 
