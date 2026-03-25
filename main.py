@@ -4,6 +4,14 @@ Entry point. Loads config, builds client, registers plugins, starts.
 
 Koyeb support: if KOYEB=1 is set in env, a lightweight HTTP health-check
 server is started on port PORT (default 8000) so Koyeb's health probe passes.
+
+AWS FIX:
+  The ccstatus poller (plugins/ccstatus.py) is now started automatically at
+  bot boot, regardless of whether the webhook is reachable. This means:
+  - On Colab: webhook fires first (fast), poller confirms delivery
+  - On AWS without WEBHOOK_BASE_URL: poller polls CC API every 5s and
+    downloads + uploads results directly — no inbound HTTP needed at all
+  - On AWS with WEBHOOK_BASE_URL: webhook fires first, poller as backup
 """
 import asyncio
 import logging
@@ -42,7 +50,7 @@ for _f in glob.glob("*.session") + glob.glob("*.session-journal"):
 from pyrogram import Client, idle, filters, handlers, enums
 from core.config import cfg
 from core.bot_name import get_bot_name, set_bot_name, is_name_configured
-from services.task_runner import runner, MAX_CONCURRENT  # FIX: import MAX_CONCURRENT
+from services.task_runner import runner, MAX_CONCURRENT
 
 _WORKERS = int(os.environ.get("BOT_WORKERS", "16"))
 
@@ -127,19 +135,48 @@ async def main() -> None:
     log.info("✅ @%s (id=%d) started", me.username or me.first_name, me.id)
 
     runner.start()
-    # FIX: use imported MAX_CONCURRENT constant instead of hardcoded 5
     log.info("🚀 Task runner started (max %d concurrent)", MAX_CONCURRENT)
 
-    if cfg.ngrok_token:
+    # ── Webhook server (optional — for receiving CC callbacks) ────────────
+    webhook_url = ""
+    has_webhook_config = bool(
+        os.environ.get("WEBHOOK_BASE_URL", "").strip()
+        or cfg.ngrok_token
+    )
+
+    if cfg.cc_api_key or has_webhook_config:
         import services.cloudconvert_hook as cc_hook
         if cfg.cc_webhook_secret:
             cc_hook.WEBHOOK_SECRET = cfg.cc_webhook_secret
+
         webhook_url = await cc_hook.start_webhook_server(
-            port=8765, ngrok_token=cfg.ngrok_token,
+            port=8765,
+            ngrok_token=cfg.ngrok_token,
         )
-        log.info("☁️ CloudConvert webhook started: %s", webhook_url or "localhost only")
+        if webhook_url:
+            log.info("☁️  CloudConvert webhook active: %s", webhook_url)
+        else:
+            log.info(
+                "☁️  Webhook server running (local only). "
+                "Set WEBHOOK_BASE_URL in .env to enable inbound callbacks on AWS."
+            )
     else:
-        log.info("ℹ️ No NGROK_TOKEN — CloudConvert webhook disabled")
+        log.info("ℹ️  No CC_API_KEY — CloudConvert features disabled")
+
+    # ── ccstatus auto-poller — always start if CC_API_KEY is set ─────────
+    # This is the PRIMARY delivery path on AWS when no inbound webhook is
+    # reachable. It polls the CC API every 5 s (processing) / 60 s (idle)
+    # and downloads + uploads results directly via aiohttp.
+    if cfg.cc_api_key:
+        try:
+            from plugins.ccstatus import _ensure_poller
+            _ensure_poller()
+            log.info(
+                "📡 ccstatus auto-poller started "
+                "(polls CC API; delivers jobs even without inbound webhook)"
+            )
+        except Exception as exc:
+            log.warning("ccstatus poller startup failed: %s", exc)
 
     if not is_name_configured():
         await _ask_bot_name(client)
@@ -148,7 +185,7 @@ async def main() -> None:
     await idle()
 
     log.info("👋 Shutting down…")
-    if cfg.ngrok_token:
+    if has_webhook_config or cfg.cc_api_key:
         try:
             from services.cloudconvert_hook import stop_webhook_server
             await stop_webhook_server()
