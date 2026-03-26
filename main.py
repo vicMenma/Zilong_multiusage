@@ -70,7 +70,8 @@ def build_client() -> Client:
         kwargs["workers"] = _WORKERS
         log.info("⚙️  workers=%d (async dispatch pool)", _WORKERS)
     if "max_concurrent_transmissions" in sig.parameters:
-        ct = int(os.environ.get("UPLOAD_PARTS_PARALLEL", "8"))
+        # PATCH: raised default from 8 → 25 to saturate Colab's uplink
+        ct = int(os.environ.get("UPLOAD_PARTS_PARALLEL", "25"))
         kwargs["max_concurrent_transmissions"] = ct
         log.info("⚡ max_concurrent_transmissions=%d (parallel upload streams)", ct)
     return Client(**kwargs)
@@ -164,9 +165,6 @@ async def main() -> None:
         log.info("ℹ️  No CC_API_KEY — CloudConvert features disabled")
 
     # ── ccstatus auto-poller — always start if CC_API_KEY is set ─────────
-    # This is the PRIMARY delivery path on AWS when no inbound webhook is
-    # reachable. It polls the CC API every 5 s (processing) / 60 s (idle)
-    # and downloads + uploads results directly via aiohttp.
     if cfg.cc_api_key:
         try:
             from plugins.ccstatus import _ensure_poller

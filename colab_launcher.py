@@ -25,7 +25,6 @@ GITHUB_TOKEN = ""  # @param {type:"string"}
 import os, sys, subprocess, shutil, time, glob
 from datetime import datetime
 
-# FIX (BUG 1): correct repo URL — Zilong_v2, not Zilong_multiusage
 REPO_NAME = "Zilong_v2"
 BASE_DIR  = f"/content/zilong"
 
@@ -65,7 +64,6 @@ if not FILE_LIMIT_MB:
 if not LOG_CHANNEL:
     try: LOG_CHANNEL = int(_secret("LOG_CHANNEL") or 0)
     except: LOG_CHANNEL = 0
-# FIX: also check NGROK_AUTHTOKEN as alias
 if not NGROK_TOKEN:
     NGROK_TOKEN = _secret("NGROK_TOKEN") or _secret("NGROK_AUTHTOKEN")
 if not CC_WEBHOOK_SECRET: CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET")
@@ -100,7 +98,6 @@ _log("STEP", "Cloning repository…")
 if os.path.exists(BASE_DIR):
     shutil.rmtree(BASE_DIR)
 
-# FIX (BUG 1): inject GITHUB_TOKEN into clone URL for private repo access
 if GITHUB_TOKEN:
     REPO_URL = f"https://{GITHUB_TOKEN}@github.com/vicMenma/{REPO_NAME}.git"
 else:
@@ -109,7 +106,6 @@ else:
 r = subprocess.run(["git", "clone", "--depth=1", REPO_URL, BASE_DIR],
                    capture_output=True, text=True)
 if r.returncode != 0:
-    # Sanitize token from error message before printing
     err_clean = r.stderr.replace(GITHUB_TOKEN, "***") if GITHUB_TOKEN else r.stderr
     raise SystemExit(f"❌ Clone failed:\n{err_clean[:300]}")
 _log("OK", f"Cloned {REPO_NAME} to {BASE_DIR}")
@@ -135,9 +131,6 @@ subprocess.Popen(
 time.sleep(2)
 _log("OK", "aria2c started")
 
-# FIX (BUG 9): inject ALL resolved credentials directly into Popen env so they
-# override any stale values that may already be set in os.environ.
-# This also ensures load_dotenv(override=True) in config.py sees the right values.
 env_lines = [
     f"API_ID={API_ID}",
     f"API_HASH={API_HASH}",
@@ -152,9 +145,12 @@ env_lines = [
     f"NGROK_TOKEN={NGROK_TOKEN}",
     f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
     f"CC_API_KEY={CC_API_KEY}",
-    "UPLOAD_CONCURRENCY=3",
+    # PATCH: raised from 3 → 5 (more concurrent file uploads)
+    "UPLOAD_CONCURRENCY=5",
     "BOT_WORKERS=16",
-    "UPLOAD_PARTS_PARALLEL=16",
+    # PATCH: raised from 16 → 25 (more parallel MTProto streams per upload)
+    # Colab's ~100 Mbps uplink was under-saturated at 16 streams.
+    "UPLOAD_PARTS_PARALLEL=25",
 ]
 for optional in ("ADMINS", "GDRIVE_SA_JSON", "ARIA2_SECRET"):
     val = _secret(optional)
@@ -250,11 +246,8 @@ _log("OK", "Heartbeat thread started (every 5 min)")
 _log("OK", "Starting bot…\n" + "─" * 50)
 
 MAX_RESTARTS = 50
-
 restart_count = 0
 
-# FIX (BUG 9): inject credentials directly into subprocess env so they survive
-# even if the subprocess re-reads os.environ and load_dotenv hasn't fired yet
 _bot_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
 for line in env_lines:
     if "=" in line:
