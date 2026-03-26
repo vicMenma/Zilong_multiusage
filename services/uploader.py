@@ -7,7 +7,13 @@ SPEED FIXES APPLIED:
   2. User thumbnail cached to disk per-session (no re-download per file)
   3. Auto-forward runs as fire-and-forget task (no serial blocking)
   4. Thumbnail extraction reduced to 2 attempts max
-  5. Progress callback kept at 1.0s (fine, not a bottleneck)
+  5. Progress callback kept at 3.0s — PATCH: raised from 1.0s to cut
+     API calls during upload (each msg.edit is a round-trip that competes
+     with MTProto upload streams and can trigger FloodWait stalls).
+  6. PATCH: skip progress callbacks entirely for files < 50 MB — they
+     finish before the first edit would fire anyway.
+  7. PATCH: ffprobe head-start reduced 2.0s → 0.3s so MTProto connections
+     open immediately; ffprobe keeps running in the background.
 """
 from __future__ import annotations
 
@@ -31,8 +37,6 @@ _VIDEO_EXTS = {
 }
 
 # ── User thumbnail cache (avoids re-downloading same thumb per file) ──────────
-# Maps uid → local file path of the downloaded thumbnail JPEG.
-# Cleared when the bot restarts (in-memory only — fine for Colab sessions).
 _thumb_cache: dict[int, str] = {}
 
 
@@ -62,7 +66,6 @@ def _apply_caption_style(fname: str, style: str) -> str:
 
 async def _get_cached_user_thumb(chat_id: int) -> str | None:
     """Return cached user thumbnail path, or download + cache it once."""
-    # Check cache first
     cached = _thumb_cache.get(chat_id)
     if cached and os.path.isfile(cached) and os.path.getsize(cached) > 0:
         return cached
@@ -114,13 +117,13 @@ async def _fire_and_forget_forward(sent, chat_id: int, channels: list, fname: st
 
 async def upload_file(
     client:         Client,
-    msg,                         # legacy: may be _up_dummy or a real message
+    msg,
     path:           str,
     caption:        str  = "",
     thumb:          str | None = None,
     force_document: bool = False,
     task_record     = None,
-    status_msg      = None,      # accepted for API compatibility, not used
+    status_msg      = None,
 ) -> None:
     """Upload `path` to Telegram."""
     if not os.path.isfile(path):
@@ -155,27 +158,17 @@ async def upload_file(
 
     vid_meta: dict = {"duration": 0, "width": 0, "height": 0, "thumb": None}
     auto_thumb: str | None = None
-    user_thumb: str | None = None  # downloaded from Telegram, needs cleanup after upload
 
-    # ── Load user's saved thumbnail (CACHED — not re-downloaded per file) ─────
+    # ── Load user's saved thumbnail (CACHED — not re-downloaded per file) ─
     if not thumb:
         cached_thumb = await _get_cached_user_thumb(chat_id)
         if cached_thumb:
             thumb = cached_thumb
-            # Don't set user_thumb — cached file persists across uploads
 
-    # ── FIX #1: Start upload IMMEDIATELY, probe metadata in parallel ──────────
-    # For video files, we launch video_meta() as a background task and
-    # start uploading with duration=0/width=0/height=0. The upload sends
-    # bytes over MTProto while ffprobe runs — no more 15-45s dead time.
-    #
-    # If metadata arrives before upload finishes: great, Telegram shows
-    # duration/dimensions. If not: file still uploads correctly, just
-    # without the progress bar in Telegram's player (cosmetic only).
+    # ── Parallel metadata probe ────────────────────────────────────────────
     meta_task: asyncio.Task | None = None
 
     if ext in _VIDEO_EXTS and method in ("video", "document"):
-        # Show "Analyzing…" state while ffprobe runs
         if task_record is not None:
             task_record.update(state="🔍 Analyzing…", fname=fname)
         try:
@@ -184,7 +177,6 @@ async def upload_file(
         except Exception:
             pass
 
-        # Launch metadata probe as background task
         async def _probe_meta():
             try:
                 from services.ffmpeg import video_meta
@@ -195,17 +187,15 @@ async def upload_file(
 
         meta_task = asyncio.create_task(_probe_meta())
 
-        # Give ffprobe a brief head start (2s) — if it's fast (already cached
-        # or small file), we get metadata. If not, we proceed without it.
+        # PATCH: reduced head-start 2.0s → 0.3s — MTProto connections open
+        # immediately; ffprobe keeps running in parallel behind the scenes.
         try:
-            vid_meta = await asyncio.wait_for(asyncio.shield(meta_task), timeout=2.0)
-            meta_task = None  # already resolved
+            vid_meta = await asyncio.wait_for(asyncio.shield(meta_task), timeout=0.3)
+            meta_task = None
         except asyncio.TimeoutError:
-            # ffprobe still running — proceed with upload using zero metadata
-            log.info("video_meta still probing after 2s — uploading with placeholder metadata")
+            log.info("video_meta still probing after 0.3s — uploading with placeholder metadata")
 
         if not thumb:
-            # Check if we got a thumb from the quick probe
             t = vid_meta.get("thumb")
             if t and os.path.isfile(t):
                 thumb = t
@@ -219,7 +209,7 @@ async def upload_file(
             "yes" if thumb else "pending",
         )
 
-    # ── TaskRecord ─────────────────────────────────────────────
+    # ── TaskRecord ────────────────────────────────────────────────────────
     from services.task_runner import tracker, TaskRecord, runner
 
     if task_record is None:
@@ -237,9 +227,19 @@ async def upload_file(
 
     start      = time.time()
     last_panel = [start]
-    _PROGRESS_INTERVAL = 1.0
+
+    # PATCH: raised from 1.0s → 3.0s — fewer msg.edit() calls means fewer
+    # Telegram API round-trips competing with MTProto upload streams.
+    # A FloodWait triggered during upload pauses the *entire* session.
+    _PROGRESS_INTERVAL = 3.0
+
+    # PATCH: files under 50 MB finish in < 5s — progress callbacks add
+    # pure overhead with zero visible benefit for the user.
+    _SMALL_FILE = 50 * 1024 * 1024  # 50 MB
 
     async def _progress(current: int, total: int) -> None:
+        if file_size < _SMALL_FILE:
+            return  # skip entirely — file done before first edit anyway
         now = time.time()
         if now - last_panel[0] < _PROGRESS_INTERVAL:
             return
@@ -257,11 +257,8 @@ async def upload_file(
     _sent_msg = [None]
 
     async def _send() -> None:
-        # If meta_task is still running and we're about to send a video,
-        # check if it finished by now (it's been running during upload setup)
         nonlocal vid_meta, thumb, auto_thumb
         if meta_task is not None and not meta_task.done():
-            # Give it one more second
             try:
                 vid_meta = await asyncio.wait_for(asyncio.shield(meta_task), timeout=1.0)
             except asyncio.TimeoutError:
@@ -272,7 +269,6 @@ async def upload_file(
             except Exception:
                 pass
 
-        # Pick up auto-thumb if we got it late
         if not thumb and vid_meta.get("thumb") and os.path.isfile(vid_meta["thumb"]):
             thumb = vid_meta["thumb"]
             auto_thumb = vid_meta["thumb"]
@@ -325,7 +321,6 @@ async def upload_file(
         _runner_ul._wake_panel(chat_id, immediate=True)
         await _send()
 
-        # ── FIX #4: Auto-forward as fire-and-forget (non-blocking) ───────────
         sent = _sent_msg[0]
         if sent:
             try:
@@ -337,12 +332,10 @@ async def upload_file(
 
                 if _channels:
                     if _auto:
-                        # Fire-and-forget — don't block the next upload
                         asyncio.create_task(
                             _fire_and_forget_forward(sent, chat_id, _channels, fname)
                         )
                     else:
-                        # Auto-forward OFF → ask with inline keyboard
                         rows = []
                         for ch in _channels:
                             cid   = ch["id"]
@@ -369,7 +362,7 @@ async def upload_file(
                         )
             except Exception as _fwe:
                 log.warning("Forward prompt failed: %s", _fwe)
-        # ─────────────────────────────────────────────────────────────────────
+
     except FloodWait as fw:
         if fw.value <= 60:
             log.warning("FloodWait %ds — waiting", fw.value)
@@ -388,7 +381,6 @@ async def upload_file(
                 parse_mode=enums.ParseMode.HTML)
         raise
     finally:
-        # Cancel meta_task if still running
         if meta_task is not None and not meta_task.done():
             meta_task.cancel()
         if auto_thumb and os.path.isfile(auto_thumb):
@@ -396,4 +388,3 @@ async def upload_file(
                 os.remove(auto_thumb)
             except OSError:
                 pass
-        # Don't clean user_thumb — it's in _thumb_cache for reuse
