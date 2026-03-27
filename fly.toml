@@ -1,0 +1,42 @@
+app = "zilong-multiusage"
+primary_region = "jnb"  # Johannesburg — closest to Zambia
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  DOWNLOAD_DIR = "/app/downloads"
+  # Do NOT put secrets here — use: fly secrets set KEY=value
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false   # Keep bot alive 24/7
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[[mounts]]
+  source = "zilong_downloads"
+  destination = "/app/downloads"
+  initial_size = "3gb"
+
+[checks]
+  [checks.alive]
+    grace_period = "30s"
+    interval = "60s"
+    method = "GET"
+    path = "/health"
+    port = 8080
+    timeout = "10s"
+    type = "http"
