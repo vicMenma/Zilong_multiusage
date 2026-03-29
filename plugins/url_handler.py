@@ -769,8 +769,11 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
 
     except Exception as exc:
         log.error("[Convert] Failed: %s", exc, exc_info=True)
-        # FIX: clean up tmp dir on error
-        if tmp_conv and not video_path:
+        # FIX: always clean up tmp_conv on error — the previous condition
+        # `not video_path` skipped cleanup when the error occurred after
+        # video_path was assigned (e.g. during job submission), leaking the
+        # tmp directory. Clean up unconditionally now.
+        if tmp_conv:
             cleanup(tmp_conv)
         await safe_edit(cb.message,
             f"❌ <b>Convert failed</b>\n\n<code>{str(exc)[:200]}</code>",
