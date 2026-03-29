@@ -1,21 +1,15 @@
 """
-services/downloader.py (OPTIMIZED)
+services/downloader.py
 Download strategies — decoupled from Telegram types.
 
-═══════════════════════════════════════════════════════════════════
-OPTIMIZATIONS for 100+ MB/s on Google Colab:
-  1. aiohttp chunk size: 1 MB → 4 MB (reduces syscall overhead 4×)
-  2. Connection pooling: reusable TCPConnector with limit=32
-     (avoids TCP+TLS handshake per request — saves ~200ms each)
-  3. TCP_NODELAY + force_close=False for connection reuse
-  4. Timeout raised to 8h for large files
-  5. aria2c: --file-allocation=none for instant start (no prealloc)
-  6. Parallel range download for direct HTTP (splits into 8 segments)
-
-FIXES preserved from original:
-  - BUG 2: META_TIMEOUT only for magnets
-  - BUG 3: aiohttp fallback when aria2c fails on direct links
-═══════════════════════════════════════════════════════════════════
+FIXES:
+  - BUG 2 (CRITICAL): META_TIMEOUT (180 s) was applied to every download
+    that went through the task tracker, not just magnets. A 1 GB file at
+    2 MB/s takes 500 s — well past the 180 s limit — so every large direct
+    download was silently killed. Fixed by guarding with _MAGNET_RE.match().
+  - BUG 3 (CRITICAL): direct URL downloads only tried aria2c with no
+    fallback. On AWS when aria2c is stopped they all fail. Fixed by
+    catching aria2c failure and retrying with aiohttp in _dispatch().
 """
 from __future__ import annotations
 
@@ -37,43 +31,6 @@ from services.utils import largest_file
 ProgressCB = Callable[[int, int, float, int], Awaitable[None]]
 
 _YTDLP_POOL: Optional[ProcessPoolExecutor] = None
-
-# ═══════════════════════════════════════════════════════════════
-# OPTIMIZATION: Shared connection pool — reused across ALL downloads
-# Avoids TCP+TLS handshake overhead per request (~200ms saved each)
-# ═══════════════════════════════════════════════════════════════
-_CONNECTOR: Optional[aiohttp.TCPConnector] = None
-_DL_CHUNK_SIZE = 4 * 1024 * 1024    # 4 MB chunks (was 1 MB)
-_DL_TIMEOUT = aiohttp.ClientTimeout(
-    total=8 * 3600,   # 8h total (was 6h)
-    connect=30,
-    sock_read=300,     # 5 min read timeout per chunk
-)
-
-
-def _get_connector() -> aiohttp.TCPConnector:
-    """Lazily create a shared TCP connector with optimized settings."""
-    global _CONNECTOR
-    if _CONNECTOR is None or _CONNECTOR.closed:
-        _CONNECTOR = aiohttp.TCPConnector(
-            limit=32,               # max 32 simultaneous connections
-            limit_per_host=16,      # max 16 per host
-            ttl_dns_cache=600,      # cache DNS for 10 min
-            enable_cleanup_closed=True,
-            force_close=False,      # reuse connections (HTTP keep-alive)
-        )
-    return _CONNECTOR
-
-
-def _get_session(**kwargs) -> aiohttp.ClientSession:
-    """Create a session that reuses the shared connector."""
-    return aiohttp.ClientSession(
-        connector=_get_connector(),
-        connector_owner=False,       # don't close connector when session closes
-        timeout=_DL_TIMEOUT,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; ZilongBot/2.0)"},
-        **kwargs,
-    )
 
 
 def _get_pool() -> ProcessPoolExecutor:
@@ -105,16 +62,15 @@ def classify(url: str) -> str:
     return "direct"
 
 
-# ═══════════════════════════════════════════════════════════════
-# Direct HTTP download — OPTIMIZED with 4MB chunks + connection pool
-# ═══════════════════════════════════════════════════════════════
+# ── Direct HTTP (aiohttp) ─────────────────────────────────────
 
 async def download_direct(
     url: str, dest: str, progress: Optional[ProgressCB] = None
 ) -> str:
-    start = time.time()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    start   = time.time()
 
-    async with _get_session() as sess:
+    async with aiohttp.ClientSession(headers=headers) as sess:
         async with sess.get(url, allow_redirects=True) as resp:
             resp.raise_for_status()
             total = int(resp.headers.get("Content-Length", 0))
@@ -130,10 +86,8 @@ async def download_direct(
 
             fpath = os.path.join(dest, fname)
             done  = 0
-
-            # ═══ 4 MB chunks for maximum throughput ═══
             with open(fpath, "wb") as f:
-                async for chunk in resp.content.iter_chunked(_DL_CHUNK_SIZE):
+                async for chunk in resp.content.iter_chunked(1024 * 1024):
                     f.write(chunk)
                     done += len(chunk)
                     if progress:
@@ -141,80 +95,6 @@ async def download_direct(
                         speed   = done / elapsed if elapsed else 0
                         eta     = int((total - done) / speed) if (speed and total) else 0
                         await progress(done, total, speed, eta)
-    return fpath
-
-
-# ═══════════════════════════════════════════════════════════════
-# Parallel range download — splits file into 8 segments
-# For servers that support Range headers (most CDNs do)
-# Can achieve 100+ MB/s on Colab by saturating the connection
-# ═══════════════════════════════════════════════════════════════
-
-async def download_parallel(
-    url: str, dest: str,
-    num_segments: int = 8,
-    progress: Optional[ProgressCB] = None,
-) -> str:
-    """
-    Download a file using parallel Range requests.
-    Falls back to single-stream if server doesn't support Range.
-    """
-    # First, get file info with a HEAD request
-    async with _get_session() as sess:
-        async with sess.head(url, allow_redirects=True) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            accepts_range = resp.headers.get("Accept-Ranges", "").lower() == "bytes"
-
-            cd    = resp.headers.get("Content-Disposition", "")
-            fname = None
-            if "filename=" in cd:
-                fname = cd.split("filename=")[-1].strip().strip('"').strip("'")
-            if not fname:
-                fname = Path(url.split("?")[0]).name or "download"
-            fname = _urlparse.unquote_plus(fname)
-            fname = re.sub(r'[\\/:*?"<>|]', "_", fname)
-
-    # Fall back to single stream if no Range support or small file
-    if not accepts_range or total < 10 * 1024 * 1024 or total == 0:
-        return await download_direct(url, dest, progress)
-
-    fpath = os.path.join(dest, fname)
-    segment_size = total // num_segments
-    done_bytes = [0]  # shared progress counter
-    start = time.time()
-    lock = asyncio.Lock()
-
-    async def _download_segment(seg_idx: int, start_byte: int, end_byte: int) -> bytes:
-        headers = {"Range": f"bytes={start_byte}-{end_byte}"}
-        data = bytearray()
-        async with _get_session() as sess:
-            async with sess.get(url, headers=headers, allow_redirects=True) as resp:
-                async for chunk in resp.content.iter_chunked(_DL_CHUNK_SIZE):
-                    data.extend(chunk)
-                    async with lock:
-                        done_bytes[0] += len(chunk)
-                    if progress:
-                        elapsed = time.time() - start
-                        speed   = done_bytes[0] / elapsed if elapsed else 0
-                        eta     = int((total - done_bytes[0]) / speed) if speed else 0
-                        await progress(done_bytes[0], total, speed, eta)
-        return bytes(data)
-
-    # Create segment tasks
-    tasks = []
-    for i in range(num_segments):
-        s = i * segment_size
-        e = (i + 1) * segment_size - 1 if i < num_segments - 1 else total - 1
-        tasks.append(_download_segment(i, s, e))
-
-    # Download all segments in parallel
-    segments = await asyncio.gather(*tasks)
-
-    # Write to file in order
-    with open(fpath, "wb") as f:
-        for seg in segments:
-            f.write(seg)
-
     return fpath
 
 
@@ -230,8 +110,6 @@ def _ytdlp_worker(url: str, dest: str, audio_only: bool, fmt_id: Optional[str]) 
         "no_warnings":       True,
         "noplaylist":        True,
         "restrictfilenames": True,
-        # ═══ OPTIMIZATION: concurrent fragment downloads ═══
-        "concurrent_fragment_downloads": 8,
     }
 
     if fmt_id:
@@ -323,8 +201,8 @@ async def download_ytdlp(
 async def download_mediafire(
     url: str, dest: str, progress: Optional[ProgressCB] = None
 ) -> str:
-    async with _get_session() as sess:
-        async with sess.get(url) as resp:
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
             html = await resp.text()
 
     patterns = [
@@ -374,7 +252,6 @@ async def download_gdrive(
     request = svc.files().get_media(fileId=file_id)
     start   = time.time()
     with open(fpath, "wb") as fh:
-        # ═══ OPTIMIZATION: 10 MB chunks for GDrive (was default ~256KB) ═══
         dl        = MediaIoBaseDownload(fh, request, chunksize=10 * 1024 * 1024)
         done_flag = False
         while not done_flag:
@@ -423,34 +300,39 @@ async def download_aria2(
     progress: Optional[ProgressCB] = None,
     task_record=None,
 ) -> str:
-    META_TIMEOUT  = 180
-    TOTAL_TIMEOUT = 21600
+    """
+    Download via aria2c subprocess — real-time stdout parsing.
+
+    FIX (BUG 2): timeout is now computed correctly per transfer type.
+      - Magnet links:  META_TIMEOUT (3 min) to get first progress → if no
+                       peers respond within 3 min the link is dead.
+      - Everything else: TOTAL_TIMEOUT (6 h) overall cap.
+      Previously the condition was `task_record is not None and not is_file`
+      which was True for ALL tracked downloads including large direct HTTP
+      files — causing them to be killed after 3 minutes.
+    """
+    META_TIMEOUT  = 180    # 3 min — dead magnet detection
+    TOTAL_TIMEOUT = 21600  # 6 h  — overall cap for everything else
 
     if is_file:
         cmd = [
-            "aria2c",
-            "-x16", "--split=16",                    # 16 connections
-            "--min-split-size=1M",                   # split from 1 MB
-            "--file-allocation=none",                # ═══ FAST START ═══
-            "--seed-time=0",
+            "aria2c", "-x16", "--seed-time=0",
             "--summary-interval=1", "--console-log-level=notice",
             "--max-tries=3", "-d", dest,
             f"--torrent-file={uri_or_path}",
         ]
     else:
         cmd = [
-            "aria2c",
-            "-x16", "--split=16",
-            "--min-split-size=1M",
-            "--file-allocation=none",                # ═══ FAST START ═══
-            "--seed-time=0",
+            "aria2c", "-x16", "--seed-time=0",
             "--bt-max-peers=200",
             "--summary-interval=1", "--console-log-level=notice",
             "--max-tries=3", "-d", dest,
             uri_or_path,
         ]
 
+    # FIX: is_magnet guards the short timeout — direct HTTP uses TOTAL_TIMEOUT
     is_magnet = _MAGNET_RE.match(uri_or_path) is not None
+
     in_meta = [is_magnet and task_record is not None and not is_file]
 
     if in_meta[0] and task_record is not None:
@@ -469,6 +351,7 @@ async def download_aria2(
 
     start     = time.time()
     last_wake = [start]
+    # FIX: apply META_TIMEOUT only to magnets, TOTAL_TIMEOUT to everything else
     timeout   = META_TIMEOUT if is_magnet else TOTAL_TIMEOUT
 
     def _wake(uid: int) -> None:
@@ -570,9 +453,7 @@ async def download_aria2(
     return result
 
 
-# ═══════════════════════════════════════════════════════════════
-# Smart dispatcher — tries fastest method first
-# ═══════════════════════════════════════════════════════════════
+# ── Smart dispatcher ──────────────────────────────────────────
 
 async def smart_download(
     url: str, dest: str,
@@ -659,13 +540,9 @@ async def _dispatch(
         return await download_ytdlp(url, dest, audio_only=audio_only,
                                     fmt_id=fmt_id, progress=progress)
 
-    # ═══ "direct" — OPTIMIZED: try parallel range first, then aria2c, then single stream ═══
-    try:
-        # Try parallel range download first (fastest on Colab)
-        return await download_parallel(url, dest, num_segments=8, progress=progress)
-    except Exception as par_exc:
-        _dlog.debug("[Downloader] Parallel range failed (%s) — trying aria2c", par_exc)
-
+    # "direct" — FIX (BUG 3): try aria2c first, fall back to aiohttp
+    # On AWS when aria2c is stopped (or on Koyeb where there's no aria2c
+    # daemon), aria2c fails immediately. aiohttp handles direct HTTP reliably.
     try:
         return await download_aria2(
             url, dest, is_file=False,
@@ -681,13 +558,3 @@ async def _dispatch(
                 state="📥 Downloading", engine="direct", meta_phase=False,
             )
         return await download_direct(url, dest, progress=progress)
-
-
-# ── Cleanup on module unload ──────────────────────────────────
-
-async def cleanup_connections() -> None:
-    """Call on shutdown to close the shared connector."""
-    global _CONNECTOR
-    if _CONNECTOR and not _CONNECTOR.closed:
-        await _CONNECTOR.close()
-        _CONNECTOR = None
