@@ -8,7 +8,6 @@ FIXES:
 - Magnet/torrent hardsub download runs as asyncio.create_task() so the
   callback handler returns immediately and doesn't block for the full download.
 - ccv_resolution_cb now cleans up tmp on error for magnet/torrent paths.
-- Upload semaphore removed — uploads go straight through (telegram.py style).
 """
 from __future__ import annotations
 
@@ -76,6 +75,7 @@ def _fmt_dur(s) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+# FIX: evict stale magnet probe sessions (older than 30 min) and clean their tmp dirs
 def _evict_magnet_probes() -> None:
     now  = time.time()
     dead = [k for k, v in list(_magnet_probe.items())
@@ -201,7 +201,13 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
         except Exception:
             pass
         return
-    asyncio.create_task(_upload_and_cleanup(client, uid, result, tmp))
+    from types import SimpleNamespace
+    _up_dummy = SimpleNamespace(
+        edit=lambda *a, **kw: asyncio.sleep(0),
+        delete=lambda: asyncio.sleep(0),
+        chat=SimpleNamespace(id=uid),
+    )
+    asyncio.create_task(_upload_and_cleanup(client, _up_dummy, result, tmp))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -418,6 +424,7 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
 
 # ─────────────────────────────────────────────────────────────
 # Background magnet download for hardsub flow
+# FIX: runs as asyncio.create_task() so callback returns immediately
 # ─────────────────────────────────────────────────────────────
 
 async def _hardsub_magnet_dl(st, url: str, uid: int, tmp: str, fname: str) -> None:
@@ -521,11 +528,12 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         fname = probe.get("fname", os.path.basename(path))
 
         sess_tok = hashlib.md5(path.encode()).hexdigest()[:10]
+        # FIX: include creation timestamp for eviction
         _magnet_probe[sess_tok] = {
             "path": path, "tmp": tmp, "streams": sd,
             "fname": fname, "created": time.time(),
         }
-        _evict_magnet_probes()
+        _evict_magnet_probes()  # evict any stale sessions
 
         await _show_magnet_streams(client, st, sess_tok, sd, dur, fname, uid)
         return
@@ -564,6 +572,8 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             "_res_idx": 0,
         }
 
+        # FIX: magnet/torrent must be downloaded first — run as background task
+        # so the callback returns immediately without blocking for the full download
         if kind_h in ("magnet", "torrent"):
             _STATE[uid]["videos"][0]["url"] = None
             _STATE[uid]["step"] = "_downloading_for_hardsub"
@@ -659,7 +669,8 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Convert resolution picker
+# Convert resolution picker  ccv|<h>|<token>
+# FIX: tmp is now cleaned up on error for magnet/torrent paths
 # ─────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^ccv\|"))
@@ -702,8 +713,8 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
         parse_mode=enums.ParseMode.HTML,
     )
 
-    api_key  = os.environ.get("CC_API_KEY", "").strip()
-    tmp_conv = None
+    api_key    = os.environ.get("CC_API_KEY", "").strip()
+    tmp_conv   = None   # FIX: track tmp so we can clean it on error
     video_path = None
 
     try:
@@ -718,6 +729,7 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
         video_url = url if kind == "direct" else None
 
         if kind in ("magnet", "torrent"):
+            # FIX: track tmp for cleanup
             tmp_conv = make_tmp(cfg.download_dir, uid)
             await safe_edit(cb.message,
                 f"⬇️ Downloading video via {kind}…",
@@ -757,7 +769,8 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
 
     except Exception as exc:
         log.error("[Convert] Failed: %s", exc, exc_info=True)
-        if tmp_conv:
+        # FIX: clean up tmp dir on error
+        if tmp_conv and not video_path:
             cleanup(tmp_conv)
         await safe_edit(cb.message,
             f"❌ <b>Convert failed</b>\n\n<code>{str(exc)[:200]}</code>",
@@ -899,6 +912,7 @@ async def mse_cb(client: Client, cb: CallbackQuery):
     base  = os.path.splitext(fname)[0]
 
     from services import ffmpeg as FF
+    from services.uploader import upload_file as _upload
 
     st = await cb.message.edit("📤 Extracting stream…")
 
@@ -966,7 +980,7 @@ async def mse_cb(client: Client, cb: CallbackQuery):
 
             await safe_edit(st, f"📤 Extracting stream #{idx_str}…")
             await FF.stream_op(path, out, ["-map", f"0:{idx_str}", "-c", "copy"])
-            await upload_file(client, st, out, caption=caption, force_document=force_doc)
+            await _upload(client, st, out, caption=caption, force_document=force_doc)
 
     except Exception as exc:
         log.error("mse extraction failed: %s", exc, exc_info=True)
@@ -1058,26 +1072,19 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
 
 
 # ─────────────────────────────────────────────────────────────
-# Upload helper — no semaphore, straight through
+# Upload helper
 # ─────────────────────────────────────────────────────────────
 
-async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
-    from pyrogram import enums as _enums
-    st = await client.send_message(
-        uid,
-        f"📤 <b>Uploading…</b>\n<code>{os.path.basename(path)}</code>",
-        parse_mode=_enums.ParseMode.HTML,
-    )
-    try:
-        await upload_file(client, st, path)
-    except Exception as exc:
-        log.error("Upload failed for %s: %s", path, exc)
+async def _upload_and_cleanup(client, msg, path: str, tmp: str) -> None:
+    from services.task_runner import runner as _r
+    sem = _r._get_upload_sem()
+    async with sem:
         try:
-            await st.delete()
-        except Exception:
-            pass
-    finally:
-        cleanup(tmp)
+            await upload_file(client, msg, path)
+        except Exception as exc:
+            log.error("Upload failed for %s: %s", path, exc)
+        finally:
+            cleanup(tmp)
 
 
 async def _safe_delete(msg) -> None:
@@ -1168,6 +1175,13 @@ async def _launch_download(
             pass
         return
 
+    from types import SimpleNamespace
+    _up_dummy = SimpleNamespace(
+        edit=lambda *a, **kw: asyncio.sleep(0),
+        delete=lambda: asyncio.sleep(0),
+        chat=SimpleNamespace(id=uid),
+    )
+
     from core.session import settings as _settings
     from services.utils import smart_clean_filename
     s = await _settings.get(uid)
@@ -1188,7 +1202,7 @@ async def _launch_download(
         except OSError as _re:
             log.warning("Rename failed: %s", _re)
 
-    asyncio.create_task(_upload_and_cleanup(client, uid, path, tmp))
+    asyncio.create_task(_upload_and_cleanup(client, _up_dummy, path, tmp))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1243,7 +1257,6 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
     try:
         from services.ffmpeg import probe_streams, probe_duration, get_mediainfo
         headers = {"User-Agent":"Mozilla/5.0","Range":"bytes=0-5242880"}
-        import tempfile as _tempfile
         async with aiohttp.ClientSession() as sess:
             async with sess.get(url, headers=headers, allow_redirects=True) as resp:
                 cd = resp.headers.get("Content-Disposition","")
@@ -1257,7 +1270,7 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
                 total = int(cr) if cr.isdigit() else int(resp.headers.get("Content-Length",0))
                 chunk = await resp.content.read(5*1024*1024)
 
-        with _tempfile.NamedTemporaryFile(
+        with tempfile.NamedTemporaryFile(
             suffix=os.path.splitext(fn)[1] or ".tmp", delete=False,
         ) as tf:
             tf.write(chunk)

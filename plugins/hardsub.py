@@ -101,8 +101,6 @@ async def _submit_one_job(
     uid: int,
 ) -> tuple[str, str, bool]:
     from services.cloudconvert_api import submit_hardsub
-    # FIX: import the job store so we can register the job for the poller
-    from services.cc_job_store import cc_job_store, CCJob
 
     video_fname = video.get("fname", "video.mkv")
     name_base   = os.path.splitext(video_fname)[0]
@@ -117,21 +115,6 @@ async def _submit_one_job(
             output_name=output_name,
             scale_height=0,  # Always use original resolution
         )
-
-        # FIX (CRITICAL): register the job in cc_job_store so that:
-        #   1. ccstatus poller picks it up via active_jobs() and polls CC API
-        #   2. /ccstatus command shows the job to the user
-        #   3. _deliver_job() is called when the job finishes
-        await cc_job_store.add(CCJob(
-            job_id=job_id,
-            uid=uid,
-            fname=video_fname,
-            sub_fname=sub_fname,
-            output_name=output_name,
-            status="processing",
-        ))
-        log.info("[Hardsub] Registered job %s in cc_job_store for uid=%d", job_id, uid)
-
         return video_fname, job_id, True
     except Exception as exc:
         log.error("[Hardsub] Job failed for %s: %s", video_fname, exc)
