@@ -66,7 +66,6 @@ print("⚡ Zilong Bot — Colab Launcher")
 print("─" * 50)
 _log("STEP", "Resolving credentials…")
 
-# Secrets take priority; form params are the fallback
 API_ID            = _secret_int("API_ID")    or API_ID
 API_HASH          = _secret("API_HASH")      or API_HASH
 BOT_TOKEN         = _secret("BOT_TOKEN")     or BOT_TOKEN
@@ -161,17 +160,12 @@ env_lines = [
     f"NGROK_TOKEN={NGROK_TOKEN}",
     f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
     f"CC_API_KEY={CC_API_KEY}",
-    # ── Upload tuning ──────────────────────────────────────────────────────
-    # UPLOAD_CONCURRENCY: how many files can upload simultaneously.
-    "UPLOAD_CONCURRENCY=5",
     # BOT_WORKERS: Pyrogram async dispatch pool.
     "BOT_WORKERS=16",
     # UPLOAD_PARTS_PARALLEL: parallel MTProto chunk streams per upload.
     # 8 is the sweet spot for Colab — above ~12 Telegram starts throttling.
-    # (Previous value was 25 which caused server-side pushback.)
     "UPLOAD_PARTS_PARALLEL=8",
-    # SLEEP_THRESHOLD: auto-sleep on FloodWait ≤ this many seconds;
-    # raise FloodWait immediately if above (avoids silent stalls on long waits).
+    # SLEEP_THRESHOLD: auto-sleep on FloodWait ≤ this many seconds.
     "SLEEP_THRESHOLD=60",
 ]
 for optional in ("ADMINS", "GDRIVE_SA_JSON"):
@@ -231,12 +225,12 @@ try:
             os.kill(_old_pid, signal.SIGTERM)
             time.sleep(2)
             try:
-                os.kill(_old_pid, signal.SIGKILL)   # force if still alive
+                os.kill(_old_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             _log("WARN", f"Killed stale bot process (PID {_old_pid})")
         except ProcessLookupError:
-            pass   # already dead
+            pass
         os.remove(_PID_FILE)
 except Exception as _ke:
     _log("WARN", f"Could not clean up stale PID: {_ke}")
@@ -249,19 +243,18 @@ restart_count = 0
 
 _bot_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
 for line in env_lines:
-    if "=" in line:
+    if "=" in line and not line.startswith("#"):
         k, _, v = line.partition("=")
         _bot_env[k] = v
 
 import re as _re
 _FLOOD_RE = _re.compile(
-    r"(?:FLOOD_WAIT_SECONDS=(\d+)"          # explicit tag printed by main.py
-    r"|A wait of (\d+) seconds is required"  # Pyrogram error message fallback
+    r"(?:FLOOD_WAIT_SECONDS=(\d+)"
+    r"|A wait of (\d+) seconds is required"
     r")"
 )
 
 def _parse_flood_wait(output_lines: list) -> int:
-    """Return the FloodWait duration (seconds) found in captured output, or 0."""
     for ln in reversed(output_lines):
         m = _FLOOD_RE.search(ln)
         if m:
@@ -285,7 +278,6 @@ while restart_count < MAX_RESTARTS:
         captured_lines.append(line)
     proc.wait()
 
-    # Ensure process is fully dead before restarting (prevents duplicate instances)
     try:
         proc.kill()
     except Exception:
@@ -297,7 +289,7 @@ while restart_count < MAX_RESTARTS:
         break
 
     if elapsed > 300:
-        restart_count = 0   # long-running session → reset crash counter
+        restart_count = 0
 
     restart_count += 1
     _log("WARN", f"Crashed (exit={proc.returncode}) after {elapsed}s  [{restart_count}/{MAX_RESTARTS}]")
@@ -305,13 +297,10 @@ while restart_count < MAX_RESTARTS:
         _log("ERR", "Too many restarts — stopping.")
         break
 
-    # ── FloodWait guard ────────────────────────────────────────────────────
-    # If Telegram told us to wait N seconds, honour that *before* restarting.
-    # Restarting immediately just re-triggers the exact same flood ban.
     flood_wait = _parse_flood_wait(captured_lines)
     if flood_wait > 0:
         _log("WARN", f"FloodWait detected — waiting {flood_wait + 5}s before restart…")
-        time.sleep(flood_wait + 5)       # +5 s safety buffer
+        time.sleep(flood_wait + 5)
     else:
         wait = min(5 * restart_count, 30)
         _log("WARN", f"Restarting in {wait}s…")
