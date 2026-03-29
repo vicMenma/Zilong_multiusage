@@ -37,8 +37,7 @@ from services.utils import cleanup, human_size, lang_flag, lang_name, make_tmp, 
 
 log = logging.getLogger(__name__)
 
-# Convenience aliases for the compact call-site style used throughout this file
-_flag  = lang_flag
+_flag      = lang_flag
 _lang_name = lang_name
 
 
@@ -244,11 +243,6 @@ async def se_file_cb(client: Client, cb: CallbackQuery):
 # ─────────────────────────────────────────────────────────────
 
 async def _ffprobe_url(url: str) -> dict | None:
-    """
-    Run ffprobe directly on an HTTP URL.
-    Returns parsed JSON or None if it fails / finds no streams.
-    Works on seedr.cc, DDL .mkv, any direct media link.
-    """
     cmd = [
         "ffprobe", "-v", "quiet",
         "-allowed_extensions", "ALL",
@@ -268,7 +262,6 @@ async def _ffprobe_url(url: str) -> dict | None:
         if proc.returncode != 0 or not out.strip():
             return None
         data = json.loads(out.decode(errors="replace"))
-        # Only return if actual media streams found
         streams = data.get("streams", [])
         if any(s.get("codec_type") in ("video", "audio", "subtitle") for s in streams):
             return data
@@ -279,19 +272,10 @@ async def _ffprobe_url(url: str) -> dict | None:
 
 
 def _build_session_from_ffprobe(data: dict, url: str) -> dict:
-    """
-    Convert raw ffprobe JSON into the same session format used by yt-dlp path.
-    Returns {url, title, video:[], audio:[], subtitle:[]} groups for _show_url_streams.
-    """
-
     streams  = data.get("streams", [])
     fmt      = data.get("format", {})
     duration = float(fmt.get("duration") or 0)
     title    = (fmt.get("tags") or {}).get("title") or url.split("/")[-1].split("?")[0][:60]
-
-    # Build a fake yt-dlp info dict with one "format" per stream
-    # so the existing _parse_yt_formats / _show_url_streams pipeline works.
-    # Easier: build the groups dict directly.
 
     videos, audios, subs_out = [], [], []
 
@@ -378,8 +362,6 @@ async def extract_url_streams(
 
     kind = classify(url)
 
-    # ── Strategy 1: ffprobe on direct / seedr / DDL links ────
-    # yt-dlp knows nothing about raw HTTP media files; ffprobe reads them natively.
     if kind == "direct":
         await safe_edit(st, "📡 Probing streams via ffprobe…")
         raw = await _ffprobe_url(url)
@@ -388,9 +370,7 @@ async def extract_url_streams(
             if session["video"] or session["audio"] or session["subs"]:
                 await _show_ffprobe_streams(client, st, session, uid)
                 return
-        # ffprobe found nothing — fall through to yt-dlp as last resort
 
-    # ── Strategy 2: yt-dlp for platforms ─────────────────────
     try:
         ydl_opts = {
             "quiet":       True,
@@ -419,10 +399,6 @@ async def extract_url_streams(
 
 
 async def _show_ffprobe_streams(client, st, session: dict, uid: int) -> None:
-    """
-    Display stream list from a direct ffprobe session.
-    Shows video / audio / subtitle tracks with extraction buttons.
-    """
     title    = session["title"]
     duration = session.get("duration", 0)
     videos   = session["video"]
@@ -448,7 +424,6 @@ async def _show_ffprobe_streams(client, st, session: dict, uid: int) -> None:
         lines.append("⚠️ <i>No streams detected.</i>")
     lines += ["──────────────────────", "<i>Tap a stream to extract it:</i>"]
 
-    # Store session for download callbacks
     sess_tok = _tok(session["url"])
     _cache[f"ffprobe_session|{sess_tok}"] = session
 
@@ -477,10 +452,6 @@ async def _show_ffprobe_streams(client, st, session: dict, uid: int) -> None:
 
 @Client.on_callback_query(filters.regex(r"^se_fp\|"))
 async def se_fp_cb(client: Client, cb: CallbackQuery):
-    """
-    Handle stream extraction from a direct ffprobe session.
-    callback_data = se_fp|<v/a/s>|<sess_tok>|<stream_idx>|<uid>
-    """
     parts = cb.data.split("|")
     if len(parts) < 5:
         return await cb.answer("Invalid data.", show_alert=True)
@@ -497,18 +468,14 @@ async def se_fp_cb(client: Client, cb: CallbackQuery):
 
     try:
         idx   = int(idx_str)
-        # Find the stream record
         all_s = session["video"] + session["audio"] + session["subs"]
         rec   = next((s for s in all_s if s.get("stream_idx") == idx), None)
         if not rec:
             return await safe_edit(st, f"❌ Stream #{idx} not found in session.")
 
         ext = rec.get("ext", "mkv")
-        fname_base = session["title"].replace("/", "_").replace(" ", "_")[:40]
-        lang   = rec.get("lang", "und")
-        # stype is already "v" / "a" / "s" from the callback data
         _stype = {"v": "video", "a": "audio", "s": "subtitle"}.get(stype, "video")
-        out    = _stream_fname(tmp, _stype, lang, idx, f".{ext}")
+        out    = _stream_fname(tmp, _stype, rec.get("lang", "und"), idx, f".{ext}")
 
         await safe_edit(st, f"⬇️ Downloading & extracting stream #{idx} via ffmpeg…")
 
@@ -518,6 +485,7 @@ async def se_fp_cb(client: Client, cb: CallbackQuery):
         ])
 
         caption_type = {"v": "video", "a": "audio", "s": "subtitle"}.get(stype, "stream")
+        lang = rec.get("lang", "und")
         caption = (
             f"{'🎬' if stype=='v' else '🎵' if stype=='a' else '💬'} "
             f"<b>{caption_type.capitalize()} #{idx}</b>"
@@ -538,12 +506,11 @@ async def se_fp_cb(client: Client, cb: CallbackQuery):
 async def _show_playlist(
     client: Client, st, url: str, info: dict, entries: list, uid: int,
 ) -> None:
-    """Display a yt-dlp playlist and let the user pick a video or download all."""
     title   = info.get("title", "Playlist")[:50]
     channel = info.get("uploader", "")
     total   = len(entries)
     pl_tok  = _tok(f"playlist|{url}")
-    _cache[f"pl_entries|{pl_tok}"] = entries  # type: ignore
+    _cache[f"pl_entries|{pl_tok}"] = entries
 
     lines = [
         f"📋 <b>Playlist: {title}</b>",
@@ -611,7 +578,7 @@ async def _show_url_streams(client, st, url, info, uid):
     lines.append("<i>Choose quality:</i>")
 
     url_tok = _tok(url)
-    _cache[f"info|{url_tok}"] = info  # type: ignore
+    _cache[f"info|{url_tok}"] = info
 
     rows: list = []
     for bucket in _QUALITY_ORDER:
@@ -755,7 +722,7 @@ async def _show_magnet_files(client, st, magnet, name, files, uid):
         "<i>Select file(s) to download:</i>",
     ]
     mg_tok = _tok(magnet)
-    _cache[f"mag_files|{mg_tok}"] = files  # type: ignore
+    _cache[f"mag_files|{mg_tok}"] = files
 
     rows: list = []
     for f in files[:20]:
@@ -942,7 +909,6 @@ def _describe_sub_stream(s: dict) -> str:
 @Client.on_callback_query(filters.regex(r"^se_fext\|"))
 async def se_fext_cb(client: Client, cb: CallbackQuery):
     parts = cb.data.split("|")
-    # Format: se_fext|key|idx|type|uid
     if len(parts) < 5:
         return await cb.answer("Invalid data.", show_alert=True)
     _, key, idx_str, stream_type, uid_str = parts[:5]
@@ -1004,12 +970,9 @@ async def _extract_single_stream(
 
     await FF.stream_op(path, out, ["-map", f"0:{idx_str}", "-c", "copy"])
 
-    from services.task_runner import tracker, TaskRecord
-    tid = tracker.new_tid()
-    rec = TaskRecord(tid=tid, user_id=user_id, label=f"Extract stream #{idx_str}",
-                     mode="proc", engine="ffmpeg",
-                     fname=os.path.basename(out), state="✅ Done")
-    await tracker.register(rec)
+    # NOTE: TaskRecord creation removed — upload_file no longer updates any
+    # tracker record, so registering a "✅ Done" record here was dead weight
+    # that triggered an auto_panel open/close cycle for nothing.
 
     caption = _stream_caption(target, stype, codec)
     await upload_file(client, st, out, caption=caption, force_document=True)
@@ -1056,15 +1019,7 @@ async def _extract_all_streams(
     await st.delete()
 
 
-
 def _stream_fname(tmp: str, stype: str, lang: str, idx, ext: str) -> str:
-    """Build a clean, human-readable filename for an extracted stream.
-
-    Examples:
-        subtitle / fre  → sub_fre.ass
-        audio    / jpn  → audio_jpn.mka
-        video    / 0    → video_0.mkv
-    """
     lang = (lang or "und").strip().lower()
     if stype == "subtitle":
         prefix = f"sub_{lang}"
@@ -1074,8 +1029,6 @@ def _stream_fname(tmp: str, stype: str, lang: str, idx, ext: str) -> str:
         prefix = f"video_{idx}"
 
     base_name = os.path.join(tmp, f"{prefix}{ext}")
-
-    # Avoid clobbering an existing file (e.g. two audio tracks with same lang)
     if not os.path.exists(base_name):
         return base_name
     counter = 2
@@ -1376,7 +1329,6 @@ async def se_mag_cb(client: Client, cb: CallbackQuery):
         files    = _cache.get(f"mag_files|{tok}", [])
         selected = next((f for f in files if str(f.get("index")) == str(file_idx)), None)
         fname    = selected["path"] if selected else f"file_{file_idx}"
-        fsize    = selected["size"] if selected else 0
 
         st  = await cb.message.edit(
             f"🧲 Downloading <code>{fname[:50]}</code>…",
