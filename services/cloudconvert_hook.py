@@ -112,14 +112,14 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             except OSError:
                 pass
 
-        # Upload straight through — no semaphore
-        from types import SimpleNamespace
-        dummy_msg = SimpleNamespace(
-            edit=lambda *a, **kw: asyncio.sleep(0),
-            delete=lambda: asyncio.sleep(0),
-            chat=SimpleNamespace(id=owner_id),
+        # Upload straight through — real status message so progress is visible
+        from pyrogram import enums as _enums
+        st = await client.send_message(
+            owner_id,
+            f"📤 <b>Uploading…</b>\n<code>{os.path.basename(path)}</code>",
+            parse_mode=_enums.ParseMode.HTML,
         )
-        await upload_file(client, dummy_msg, path)
+        await upload_file(client, st, path)
 
     except Exception as exc:
         log.error("[CC-Hook] Pipeline failed for %s: %s", filename, exc)
