@@ -1,5 +1,5 @@
 """
-plugins/ccstatus.py
+services/ccstatus.py
 /ccstatus — live panel showing CloudConvert hardsub/convert jobs.
 
 Adaptive polling: 5 s when any job is processing, 60 s when idle.
@@ -155,7 +155,6 @@ async def _deliver_job(job: CCJob) -> None:
     from core.session import get_client
     from services.utils import make_tmp, cleanup
     from services.uploader import upload_file
-    from types import SimpleNamespace
 
     client = get_client()
     tmp    = make_tmp(cfg.download_dir, job.uid)
@@ -174,12 +173,13 @@ async def _deliver_job(job: CCJob) -> None:
 
         await _download_export(job.export_url, dest)
 
-        dummy = SimpleNamespace(
-            edit=lambda *a, **kw: asyncio.sleep(0),
-            delete=lambda: asyncio.sleep(0),
-            chat=SimpleNamespace(id=job.uid),
+        # Send a real status message so upload progress is visible
+        st = await client.send_message(
+            job.uid,
+            f"📤 <b>Uploading…</b>\n<code>{fname[:50]}</code>",
+            parse_mode="html",
         )
-        await upload_file(client, dummy, dest)
+        await upload_file(client, st, dest)
         await cc_job_store.mark_notified(job.job_id)
         log.info("[CCStatus] Delivered job %s to uid=%d", job.job_id, job.uid)
 
@@ -225,14 +225,12 @@ async def _poll_loop() -> None:
         active   = cc_job_store.active_jobs()
         interval = 5 if active else 60
 
-        # ── Poll each active job ──────────────────────────────
         for job in active:
             try:
                 data   = await check_job_status(api_key, job.job_id)
                 status = data.get("status", "")
                 tasks  = data.get("tasks", [])
 
-                # Collect in-progress task messages for display
                 msgs = []
                 for t in tasks:
                     if t.get("status") not in ("finished", "waiting", "pending"):
@@ -253,9 +251,8 @@ async def _poll_loop() -> None:
 
                     if export_url:
                         await cc_job_store.finish(job.job_id, export_url=export_url)
-                        # fire and forget delivery
                         asyncio.create_task(_deliver_job(
-                            cc_job_store.get(job.job_id) or job  # re-fetch with url
+                            cc_job_store.get(job.job_id) or job
                         ))
                     else:
                         await cc_job_store.finish(
@@ -268,13 +265,11 @@ async def _poll_loop() -> None:
                     await cc_job_store.finish(job.job_id, error_msg=err)
 
                 else:
-                    # Still processing — update message
                     await cc_job_store.update(job.job_id, task_message=task_msg)
 
             except Exception as exc:
                 log.warning("[CCStatus] Poll error job %s: %s", job.job_id, exc)
 
-        # ── Edit open panels ──────────────────────────────────
         for uid, panel_msg in list(_open_panels.items()):
             try:
                 text = _render_panel(uid)
@@ -292,7 +287,6 @@ async def _poll_loop() -> None:
                 else:
                     log.debug("[CCStatus] Panel edit uid=%d: %s", uid, err)
 
-        # ── Stop when nothing left to do ──────────────────────
         if not cc_job_store.active_jobs() and not _open_panels:
             consecutive_idle += 1
             if consecutive_idle >= 3:
