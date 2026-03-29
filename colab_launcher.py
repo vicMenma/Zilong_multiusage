@@ -160,13 +160,6 @@ env_lines = [
     f"NGROK_TOKEN={NGROK_TOKEN}",
     f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
     f"CC_API_KEY={CC_API_KEY}",
-    # BOT_WORKERS: Pyrogram async dispatch pool.
-    "BOT_WORKERS=16",
-    # UPLOAD_PARTS_PARALLEL: parallel MTProto chunk streams per upload.
-    # 8 is the sweet spot for Colab — above ~12 Telegram starts throttling.
-    "UPLOAD_PARTS_PARALLEL=8",
-    # SLEEP_THRESHOLD: auto-sleep on FloodWait ≤ this many seconds.
-    "SLEEP_THRESHOLD=60",
 ]
 for optional in ("ADMINS", "GDRIVE_SA_JSON"):
     val = _secret(optional)

@@ -1,19 +1,6 @@
 """
-Zilong Bot — main.py (OPTIMIZED)
+Zilong Bot — main.py
 Entry point. Loads config, builds client, registers plugins, starts.
-
-═══════════════════════════════════════════════════════════════════
-OPTIMIZATIONS vs original:
-  • workers=24 (was 16) — more async dispatch threads for Colab
-  • max_concurrent_transmissions=12 (was 8) — 12 parallel MTProto
-    chunk streams per upload. This is THE key setting for upload speed.
-    8 was conservative; 12 is the sweet spot on Colab (>50 MB/s).
-    Above ~14 Telegram starts throttling.
-  • sleep_threshold=120 (was 60) — auto-sleep on FloodWait ≤120s
-    instead of raising immediately. Prevents crash-restart loops.
-  • Bot name prompt identical to zilong-leech: asked at first run,
-    appears in /start header and all panels.
-═══════════════════════════════════════════════════════════════════
 """
 import asyncio
 import logging
@@ -70,9 +57,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 if _UVLOOP:
-    log.info("⚡ uvloop active — high-performance event loop enabled")
+    log.info("⚡ uvloop active")
 else:
-    log.warning("⚠️  uvloop not installed — using default asyncio event loop (slower)")
+    log.warning("⚠️  uvloop not installed — using default asyncio event loop")
 
 for _f in glob.glob("*.session") + glob.glob("*.session-journal"):
     try:
@@ -86,17 +73,9 @@ from core.config import cfg
 from core.bot_name import get_bot_name, set_bot_name, is_name_configured
 from services.task_runner import runner, MAX_CONCURRENT
 
-# ═══════════════════════════════════════════════════════════════
-# OPTIMIZATION: Higher defaults for Colab throughput
-# ═══════════════════════════════════════════════════════════════
-_WORKERS = int(os.environ.get("BOT_WORKERS", "24"))              # was 16
-_UPLOAD_STREAMS = int(os.environ.get("UPLOAD_PARTS_PARALLEL", "12"))  # was 8
-_SLEEP_THRESH = int(os.environ.get("SLEEP_THRESHOLD", "120"))    # was 60
-
 
 def build_client() -> Client:
-    import inspect
-    kwargs: dict = dict(
+    return Client(
         name="ZilongBot",
         api_id=cfg.api_id,
         api_hash=cfg.api_hash,
@@ -104,31 +83,9 @@ def build_client() -> Client:
         plugins={"root": "plugins"},
         workdir="/tmp",
     )
-    sig = inspect.signature(Client.__init__)
-
-    if "workers" in sig.parameters:
-        kwargs["workers"] = _WORKERS
-        log.info("⚙️  workers=%d (async dispatch pool)", _WORKERS)
-
-    if "max_concurrent_transmissions" in sig.parameters:
-        # ═══ KEY UPLOAD SPEED SETTING ═══
-        # 12 parallel MTProto streams = ~50-80 MB/s on Colab
-        # 8 was ~25-35 MB/s. Above 14 Telegram throttles.
-        kwargs["max_concurrent_transmissions"] = _UPLOAD_STREAMS
-        log.info("⚡ max_concurrent_transmissions=%d (parallel upload streams)", _UPLOAD_STREAMS)
-
-    if "sleep_threshold" in sig.parameters:
-        kwargs["sleep_threshold"] = _SLEEP_THRESH
-        log.info("⏱  sleep_threshold=%ds", _SLEEP_THRESH)
-
-    return Client(**kwargs)
 
 
 async def _ask_bot_name(client) -> None:
-    """
-    First-run bot name prompt — identical workflow to zilong-leech.
-    The name persists to data/bot_name.txt and appears in /start + panels.
-    """
     loop = asyncio.get_running_loop()
     fut  = loop.create_future()
 
@@ -169,7 +126,6 @@ async def _ask_bot_name(client) -> None:
 
     set_bot_name(name)
 
-    # Delete prompt, show confirmation briefly
     try:
         await prompt_msg.delete()
     except Exception:
@@ -186,7 +142,6 @@ async def _ask_bot_name(client) -> None:
         parse_mode=enums.ParseMode.HTML,
     )
 
-    # Auto-delete confirmation after 15s
     async def _del():
         await asyncio.sleep(15)
         try:
@@ -210,7 +165,6 @@ async def main() -> None:
     import core.session as _cs
     _cs._client = client
 
-    # ── FloodWait-aware startup retry ─────────────────────────────────────
     from pyrogram.errors import FloodWait as _FloodWait
     _MAX_AUTH_RETRIES = 5
     for _attempt in range(1, _MAX_AUTH_RETRIES + 1):
@@ -220,8 +174,7 @@ async def main() -> None:
         except _FloodWait as _fw:
             _wait_sec = _fw.value
             log.warning(
-                "🚦 Telegram FloodWait on auth — must wait %ds "
-                "(attempt %d/%d). Sleeping now…",
+                "🚦 FloodWait on auth — waiting %ds (attempt %d/%d)",
                 _wait_sec, _attempt, _MAX_AUTH_RETRIES,
             )
             print(f"FLOOD_WAIT_SECONDS={_wait_sec}", flush=True)
@@ -235,14 +188,6 @@ async def main() -> None:
 
     runner.start()
     log.info("🚀 Task runner started (max %d concurrent)", MAX_CONCURRENT)
-
-    # Log the optimized settings
-    log.info(
-        "═══ PERFORMANCE SETTINGS ═══\n"
-        "  workers=%d  upload_streams=%d  sleep_threshold=%ds\n"
-        "  Colab target: Upload ≥50 MB/s  Download ≥100 MB/s",
-        _WORKERS, _UPLOAD_STREAMS, _SLEEP_THRESH,
-    )
 
     # ── Webhook server (optional) ────────────────────────────
     webhook_url = ""
@@ -274,7 +219,7 @@ async def main() -> None:
         except Exception as exc:
             log.warning("ccstatus poller startup failed: %s", exc)
 
-    # ── Bot name first-run prompt (same as zilong-leech) ──────
+    # ── Bot name first-run prompt ──────────────────────────────
     if not is_name_configured():
         await _ask_bot_name(client)
 
