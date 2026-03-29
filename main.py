@@ -17,6 +17,41 @@ import asyncio
 import logging
 import os
 import glob
+import sys
+
+# ── Single-instance guard ─────────────────────────────────────────────────────
+# Prevents multiple bot processes from answering the same Telegram updates.
+# If a stale PID file exists from a crash, it is overwritten silently.
+_PID_FILE = "/tmp/zilong_bot.pid"
+
+def _acquire_pid_lock() -> None:
+    if os.path.exists(_PID_FILE):
+        try:
+            old_pid = int(open(_PID_FILE).read().strip())
+            os.kill(old_pid, 0)          # signal 0 = just check existence
+            print(
+                f"❌ Another bot instance is already running (PID {old_pid}).\n"
+                f"   Kill it first:  kill {old_pid}\n"
+                f"   Or delete:      rm {_PID_FILE}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass   # stale file — process is gone, safe to overwrite
+
+    with open(_PID_FILE, "w") as _pf:
+        _pf.write(str(os.getpid()))
+
+def _release_pid_lock() -> None:
+    try:
+        os.remove(_PID_FILE)
+    except OSError:
+        pass
+
+_acquire_pid_lock()
+import atexit
+atexit.register(_release_pid_lock)
+# ─────────────────────────────────────────────────────────────────────────────
 
 try:
     import uvloop

@@ -220,6 +220,27 @@ def _heartbeat() -> None:
 threading.Thread(target=_heartbeat, daemon=True).start()
 _log("OK", "Heartbeat thread started (every 5 min)")
 
+# ── Kill any stale bot instances before starting ──────────────────────────
+_log("STEP", "Checking for stale bot instances…")
+_PID_FILE = "/tmp/zilong_bot.pid"
+try:
+    if os.path.exists(_PID_FILE):
+        _old_pid = int(open(_PID_FILE).read().strip())
+        try:
+            import signal
+            os.kill(_old_pid, signal.SIGTERM)
+            time.sleep(2)
+            try:
+                os.kill(_old_pid, signal.SIGKILL)   # force if still alive
+            except ProcessLookupError:
+                pass
+            _log("WARN", f"Killed stale bot process (PID {_old_pid})")
+        except ProcessLookupError:
+            pass   # already dead
+        os.remove(_PID_FILE)
+except Exception as _ke:
+    _log("WARN", f"Could not clean up stale PID: {_ke}")
+
 # ── Bot restart loop ──────────────────────────────────────────────────────
 _log("OK", "Starting bot…\n" + "─" * 50)
 
@@ -244,6 +265,12 @@ while restart_count < MAX_RESTARTS:
     for line in proc.stdout:
         print(line, end="", flush=True)
     proc.wait()
+
+    # Ensure process is fully dead before restarting (prevents duplicate instances)
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
     elapsed = (datetime.now() - t_start).seconds
     if proc.returncode == 0:
