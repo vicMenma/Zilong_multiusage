@@ -1,32 +1,18 @@
 """
-services/uploader.py (OPTIMIZED)
+services/uploader.py (REWRITTEN)
 Upload a local file to Telegram.
 
 ═══════════════════════════════════════════════════════════════════
-OPTIMIZATIONS for 50+ MB/s upload on Google Colab:
+Style: Matches zilong-leech's colab_leecher/uploader/telegram.py
+  • Simple progress_bar() callback — no task_runner integration
+  • Direct client.send_video / send_audio / send_document
+  • FloodWait retry with recursive call (same pattern as leech bot)
+  • Thumbnail extraction via ffmpeg → moviepy fallback
+  • Actual upload speed logged after each file
 
-  The REAL upload speed is controlled by TWO settings in Client():
-    1. max_concurrent_transmissions=12  (in main.py build_client)
-       → 12 parallel MTProto chunk streams
-    2. workers=24                       (in main.py build_client)
-       → 24 async dispatch threads
-
-  What THIS file optimizes:
-    • Progress callback frequency: only update tracker every 0.3s
-      (was 0.5s). Less latency in speed reporting.
-    • Reduced overhead: no inline message editing during upload.
-      All progress goes through the panel system (1.5s edit cycle).
-    • FloodWait: auto-retry up to 120s (was 60s), matching
-      sleep_threshold in client config.
-    • Thumbnail extraction: ffmpeg-first (faster), moviepy fallback.
-    • Video metadata: single ffprobe call (was sometimes 2).
-
-  Why Pyrogram upload speed depends on max_concurrent_transmissions:
-    Telegram's MTProto protocol uploads files in 512KB chunks.
-    With 1 stream:  1 chunk at a time → ~2-5 MB/s
-    With 8 streams:  8 chunks at a time → ~25-35 MB/s
-    With 12 streams: 12 chunks at a time → ~50-80 MB/s
-    With 16 streams: starts getting throttled by Telegram
+The REAL speed comes from main.py's build_client():
+  max_concurrent_transmissions=12 → 50-80 MB/s on Colab
+This file just sends the file and tracks progress cleanly.
 ═══════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -42,14 +28,14 @@ from pyrogram import Client, enums
 from pyrogram.errors import FloodWait
 
 from core.config import cfg
-from services.utils import human_size, progress_panel, safe_edit
+from services.utils import human_size, safe_edit
 
 log = logging.getLogger(__name__)
 
-_AUDIO_EXTS = {".mp3",".aac",".flac",".ogg",".m4a",".opus",".wav",".wma",".ac3",".mka"}
+_AUDIO_EXTS = {".mp3", ".aac", ".flac", ".ogg", ".m4a", ".opus", ".wav", ".wma", ".ac3", ".mka"}
 _VIDEO_EXTS = {
-    ".mp4",".mov",".webm",".m4v",".mkv",".avi",".flv",
-    ".ts",".m2ts",".wmv",".3gp",".rmvb",".mpg",".mpeg",
+    ".mp4", ".mov", ".webm", ".m4v", ".mkv", ".avi", ".flv",
+    ".ts", ".m2ts", ".wmv", ".3gp", ".rmvb", ".mpg", ".mpeg",
 }
 
 
@@ -67,9 +53,12 @@ def _chat_id(msg) -> int:
     return 0
 
 
-# ── Thumbnail helpers ──────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Thumbnail extraction (same as zilong-leech's thumbMaintainer)
+# ─────────────────────────────────────────────────────────────
 
-async def _extract_thumb_ffmpeg(path: str, out_path: str) -> bool:
+async def _extract_thumb(path: str, out_path: str) -> bool:
+    """Extract thumbnail via ffmpeg. Returns True on success."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "quiet",
@@ -79,6 +68,7 @@ async def _extract_thumb_ffmpeg(path: str, out_path: str) -> bool:
         )
         out_b, _ = await proc.communicate()
         data = json.loads(out_b.decode(errors="replace") or "{}")
+
         duration = 0
         for s in data.get("streams", []):
             if s.get("codec_type") == "video":
@@ -87,7 +77,7 @@ async def _extract_thumb_ffmpeg(path: str, out_path: str) -> bool:
                 except Exception:
                     pass
                 if not duration:
-                    for k in ("DURATION", "duration", "DURATION-eng", "DURATION-jpn"):
+                    for k in ("DURATION", "duration", "DURATION-eng"):
                         v = (s.get("tags") or {}).get(k, "")
                         if v and ":" in str(v):
                             try:
@@ -100,11 +90,13 @@ async def _extract_thumb_ffmpeg(path: str, out_path: str) -> bool:
                         if duration:
                             break
                 break
+
         if not duration:
             try:
                 duration = int(float(data.get("format", {}).get("duration") or 0))
             except Exception:
                 pass
+
         ts = max(1, int(duration * 0.2)) if duration > 5 else 1
 
         proc2 = await asyncio.create_subprocess_exec(
@@ -121,42 +113,28 @@ async def _extract_thumb_ffmpeg(path: str, out_path: str) -> bool:
 
 
 async def _extract_thumb_moviepy(path: str, out_path: str) -> bool:
+    """Fallback thumbnail via moviepy."""
     try:
         loop = asyncio.get_event_loop()
+
         def _do():
             from moviepy.video.io.VideoFileClip import VideoFileClip
             with VideoFileClip(path) as clip:
                 t = max(1, math.floor(clip.duration * 0.2)) if clip.duration > 5 else 1
                 clip.save_frame(out_path, t=t)
             return os.path.exists(out_path) and os.path.getsize(out_path) > 500
+
         return await loop.run_in_executor(None, _do)
     except Exception as exc:
         log.debug("moviepy thumb failed: %s", exc)
         return False
 
 
-async def _wait_file_stable(path: str, timeout: int = 30) -> bool:
-    aria_file = path + ".aria2"
-    prev_size = -1
-    for _ in range(timeout):
-        if os.path.exists(aria_file):
-            await asyncio.sleep(1)
-            continue
-        try:
-            curr_size = os.path.getsize(path)
-        except OSError:
-            await asyncio.sleep(1)
-            continue
-        if curr_size == prev_size and curr_size > 0:
-            return True
-        prev_size = curr_size
-        await asyncio.sleep(1)
-    return False
-
+# ─────────────────────────────────────────────────────────────
+# Video metadata (duration, width, height) — single ffprobe call
+# ─────────────────────────────────────────────────────────────
 
 async def _get_video_meta(path: str) -> dict:
-    """Single ffprobe call for all video metadata."""
-    await _wait_file_stable(path)
     meta = {"duration": 0, "width": 0, "height": 0}
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -167,6 +145,7 @@ async def _get_video_meta(path: str) -> dict:
         )
         out_b, _ = await proc.communicate()
         data = json.loads(out_b.decode(errors="replace") or "{}")
+
         for s in data.get("streams", []):
             if s.get("codec_type") == "video":
                 meta["width"]  = int(s.get("width", 0) or 0)
@@ -189,6 +168,7 @@ async def _get_video_meta(path: str) -> dict:
                         if meta["duration"]:
                             break
                 break
+
         if not meta["duration"]:
             fmt_dur = data.get("format", {}).get("duration")
             if fmt_dur:
@@ -199,9 +179,11 @@ async def _get_video_meta(path: str) -> dict:
     except Exception as exc:
         log.debug("ffprobe meta failed: %s", exc)
 
+    # Fallback to moviepy if ffprobe missed something
     if not meta["duration"] or not meta["width"]:
         try:
             loop = asyncio.get_event_loop()
+
             def _mv():
                 from moviepy.video.io.VideoFileClip import VideoFileClip
                 with VideoFileClip(path) as clip:
@@ -210,6 +192,7 @@ async def _get_video_meta(path: str) -> dict:
                         "width":    int(clip.size[0]) if clip.size else 0,
                         "height":   int(clip.size[1]) if clip.size else 0,
                     }
+
             mv = await loop.run_in_executor(None, _mv)
             if not meta["duration"]: meta["duration"] = mv["duration"]
             if not meta["width"]:    meta["width"]    = mv["width"]
@@ -220,8 +203,37 @@ async def _get_video_meta(path: str) -> dict:
     return meta
 
 
+# ─────────────────────────────────────────────────────────────
+# Simple progress bar — same style as zilong-leech
+# ─────────────────────────────────────────────────────────────
+
+def _make_progress_bar(file_size: int, start_time: float):
+    """
+    Returns a simple progress callback matching zilong-leech's style.
+    Logs speed — no task_runner, no panel editing overhead.
+    """
+    last = [start_time]
+
+    async def progress_bar(current: int, total: int) -> None:
+        now = time.time()
+        if now - last[0] < 0.3:
+            return
+        last[0] = now
+        elapsed = now - start_time
+        if current > 0 and elapsed > 0:
+            speed = current / elapsed
+            eta   = (total - current) / speed if speed else 0
+            log.debug(
+                "📤 %s/%s  %s/s  ETA %ds",
+                human_size(current), human_size(total),
+                human_size(speed), int(eta),
+            )
+
+    return progress_bar
+
+
 # ═══════════════════════════════════════════════════════════════
-# Main upload function — OPTIMIZED progress tracking
+# Main upload function — SIMPLE, DIRECT (zilong-leech style)
 # ═══════════════════════════════════════════════════════════════
 
 async def upload_file(
@@ -231,8 +243,18 @@ async def upload_file(
     caption:        str  = "",
     thumb:          str | None = None,
     force_document: bool = False,
-    task_record     = None,
+    task_record     = None,   # kept for API compat, not used
 ) -> None:
+    """
+    Upload one file to the chat.
+
+    Simple and direct — matches zilong-leech's upload_file() pattern:
+      1. Detect file type (video / audio / document)
+      2. Extract thumbnail if video
+      3. Send with progress callback
+      4. Delete status message
+      5. FloodWait retry
+    """
     if not os.path.isfile(path):
         await safe_edit(msg,
             f"❌ File not found: <code>{os.path.basename(path)}</code>",
@@ -251,6 +273,7 @@ async def upload_file(
     if not caption:
         caption = f"<code>{fname}</code>"
 
+    # ── Determine send method ─────────────────────────────────
     if force_document:
         method = "document"
     elif ext in _AUDIO_EXTS:
@@ -260,7 +283,8 @@ async def upload_file(
     else:
         method = "document"
 
-    vid_meta: dict = {"duration": 0, "width": 0, "height": 0}
+    # ── Video metadata + thumbnail ────────────────────────────
+    vid_meta:   dict       = {"duration": 0, "width": 0, "height": 0}
     auto_thumb: str | None = None
 
     if ext in _VIDEO_EXTS and method in ("video", "document"):
@@ -268,98 +292,70 @@ async def upload_file(
 
         if not thumb:
             thumb_path = path + "_thumb.jpg"
-            ok = await _extract_thumb_ffmpeg(path, thumb_path)
+            ok = await _extract_thumb(path, thumb_path)
             if not ok:
                 ok = await _extract_thumb_moviepy(path, thumb_path)
             if ok:
                 auto_thumb = thumb_path
                 thumb      = auto_thumb
 
-        log.info(
-            "Video meta: duration=%ds  %dx%d  thumb=%s  size=%s",
-            vid_meta["duration"], vid_meta["width"], vid_meta["height"],
-            "yes" if thumb else "no", human_size(file_size),
-        )
+    # ── Progress callback ─────────────────────────────────────
+    start_time   = time.time()
+    progress_bar = _make_progress_bar(file_size, start_time)
 
-    # ── Create / reuse TaskRecord ──────────────────────────────
-    from services.task_runner import tracker, TaskRecord, runner
-
-    if task_record is None:
-        tid    = tracker.new_tid()
-        record = TaskRecord(
-            tid=tid, user_id=chat_id,
-            label=f"Upload {fname}", mode="ul", engine="telegram",
-            fname=fname, total=file_size,
-            state="📤 Uploading",
-        )
-        await tracker.register(record)
-    else:
-        record = task_record
-        record.update(mode="ul", engine="telegram", total=file_size, fname=fname)
-
-    start = time.time()
-    last  = [start]
-
-    # ═══ OPTIMIZATION: Update tracker every 0.3s (was 0.5s) ═══
-    # This gives more responsive speed readings without flooding
-    # the panel edit loop (which runs at 1.5s intervals anyway)
-    async def _progress(current: int, total: int) -> None:
-        now = time.time()
-        if now - last[0] < 0.3:       # was 0.5
-            return
-        last[0]  = now
-        elapsed  = now - start
-        speed    = current / elapsed if elapsed else 0
-        eta      = int((total - current) / speed) if speed else 0
-        record.update(
-            done=current, total=total,
-            speed=speed, eta=eta, elapsed=elapsed,
-            state="📤 Uploading",
-        )
-        runner._wake_panel(chat_id)
-
-    async def _send() -> None:
-        common = dict(
-            caption=caption,
-            thumb=thumb,
-            parse_mode=enums.ParseMode.HTML,
-            progress=_progress,
-        )
-
+    # ── Send ──────────────────────────────────────────────────
+    try:
         if method == "video":
             sent = await client.send_video(
-                chat_id, path,
-                duration=vid_meta["duration"],
+                chat_id=chat_id,
+                video=path,
+                supports_streaming=True,
                 width=vid_meta["width"],
                 height=vid_meta["height"],
-                supports_streaming=True,
-                **common,
-            )
-        elif method == "audio":
-            sent = await client.send_audio(chat_id, path, **common)
-        else:
-            sent = await client.send_document(
-                chat_id, path,
-                force_document=True,
-                **common,
+                caption=caption,
+                thumb=thumb,
+                duration=vid_meta["duration"],
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress_bar,
             )
 
+        elif method == "audio":
+            sent = await client.send_audio(
+                chat_id=chat_id,
+                audio=path,
+                caption=caption,
+                thumb=thumb,
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress_bar,
+            )
+
+        else:  # document
+            sent = await client.send_document(
+                chat_id=chat_id,
+                document=path,
+                caption=caption,
+                thumb=thumb,
+                force_document=True,
+                parse_mode=enums.ParseMode.HTML,
+                progress=progress_bar,
+            )
+
+        # ── Post-upload ───────────────────────────────────────
+        # Delete the status/progress message
         try:
             await msg.delete()
         except Exception:
             pass
 
+        # Forward to log channel if configured
         if cfg.log_channel and sent:
             try:
                 await sent.forward(cfg.log_channel)
             except Exception:
                 pass
 
-        record.update(state="✅ Done", done=file_size, total=file_size)
-        runner._wake_panel(chat_id)
-
-        # ═══ Log actual upload speed ═══
-        elapsed = time.time() - start
+        # ── Log actual speed ──────────────────────────────────
+        elapsed = time.time() - start_time
         if elapsed > 0:
             actual_speed = file_size / elapsed
             log.info(
@@ -368,27 +364,22 @@ async def upload_file(
                 human_size(actual_speed), elapsed,
             )
 
-    try:
-        await _send()
-    except FloodWait as fw:
-        # ═══ OPTIMIZATION: wait up to 120s (was 60s) ═══
-        if fw.value <= 120:
-            log.warning("FloodWait %ds — waiting", fw.value)
-            record.update(state=f"⏳ FloodWait {fw.value}s")
-            await asyncio.sleep(fw.value)
-            await _send()
-        else:
-            raise
-    except Exception as exc:
-        err = str(exc)
+    except FloodWait as e:
+        # Same retry pattern as zilong-leech
+        logging.warning(f"FloodWait {e.value}s")
+        await asyncio.sleep(e.value)
+        await upload_file(client, msg, path, caption, thumb, force_document, task_record)
+
+    except Exception as e:
+        err = str(e)
         if "MESSAGE_NOT_MODIFIED" not in err:
-            record.update(state=f"❌ {str(exc)[:60]}")
-            runner._wake_panel(chat_id)
+            logging.error(f"Upload error: {e}")
             await safe_edit(msg,
-                f"❌ Upload failed: <code>{exc}</code>",
+                f"❌ Upload failed: <code>{e}</code>",
                 parse_mode=enums.ParseMode.HTML)
-        raise
+
     finally:
+        # Clean up auto-generated thumbnail
         if auto_thumb and os.path.isfile(auto_thumb):
             try:
                 os.remove(auto_thumb)
