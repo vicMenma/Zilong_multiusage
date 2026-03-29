@@ -25,7 +25,7 @@ GITHUB_TOKEN = ""  # @param {type:"string"}
 import os, sys, subprocess, shutil, time, glob
 from datetime import datetime
 
-REPO_NAME = "Zilong_v2"
+REPO_NAME = "Zilong_multiusage"
 BASE_DIR  = f"/content/zilong"
 
 
