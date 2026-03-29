@@ -173,7 +173,33 @@ async def main() -> None:
     import core.session as _cs
     _cs._client = client
 
-    await client.start()
+    # ── FloodWait-aware startup retry ─────────────────────────────────────
+    # Telegram rate-limits bot token authorization (auth.ImportBotAuthorization).
+    # If we crash and immediately restart we hit the same FloodWait again and
+    # again.  Catch it here, sleep the required time (+5 s buffer), and retry
+    # up to _MAX_AUTH_RETRIES times before giving up.
+    from pyrogram.errors import FloodWait as _FloodWait
+    _MAX_AUTH_RETRIES = 5
+    for _attempt in range(1, _MAX_AUTH_RETRIES + 1):
+        try:
+            await client.start()
+            break
+        except _FloodWait as _fw:
+            _wait_sec = _fw.value
+            log.warning(
+                "🚦 Telegram FloodWait on auth — must wait %ds "
+                "(attempt %d/%d). Sleeping now…",
+                _wait_sec, _attempt, _MAX_AUTH_RETRIES,
+            )
+            print(
+                f"FLOOD_WAIT_SECONDS={_wait_sec}",   # parsed by colab_launcher
+                flush=True,
+            )
+            if _attempt >= _MAX_AUTH_RETRIES:
+                log.error("❌ Giving up after %d FloodWait retries.", _MAX_AUTH_RETRIES)
+                raise
+            await asyncio.sleep(_wait_sec + 5)
+    # ─────────────────────────────────────────────────────────────────────
     me = await client.get_me()
     log.info("✅ @%s (id=%d) started", me.username or me.first_name, me.id)
 

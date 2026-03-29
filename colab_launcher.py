@@ -253,6 +253,22 @@ for line in env_lines:
         k, _, v = line.partition("=")
         _bot_env[k] = v
 
+import re as _re
+_FLOOD_RE = _re.compile(
+    r"(?:FLOOD_WAIT_SECONDS=(\d+)"          # explicit tag printed by main.py
+    r"|A wait of (\d+) seconds is required"  # Pyrogram error message fallback
+    r")"
+)
+
+def _parse_flood_wait(output_lines: list) -> int:
+    """Return the FloodWait duration (seconds) found in captured output, or 0."""
+    for ln in reversed(output_lines):
+        m = _FLOOD_RE.search(ln)
+        if m:
+            return int(m.group(1) or m.group(2))
+    return 0
+
+
 while restart_count < MAX_RESTARTS:
     t_start = datetime.now()
     proc = subprocess.Popen(
@@ -262,8 +278,11 @@ while restart_count < MAX_RESTARTS:
         text=True, bufsize=1,
         env=_bot_env,
     )
+
+    captured_lines: list = []
     for line in proc.stdout:
         print(line, end="", flush=True)
+        captured_lines.append(line)
     proc.wait()
 
     # Ensure process is fully dead before restarting (prevents duplicate instances)
@@ -285,6 +304,15 @@ while restart_count < MAX_RESTARTS:
     if restart_count >= MAX_RESTARTS:
         _log("ERR", "Too many restarts — stopping.")
         break
-    wait = min(5 * restart_count, 30)
-    _log("WARN", f"Restarting in {wait}s…")
-    time.sleep(wait)
+
+    # ── FloodWait guard ────────────────────────────────────────────────────
+    # If Telegram told us to wait N seconds, honour that *before* restarting.
+    # Restarting immediately just re-triggers the exact same flood ban.
+    flood_wait = _parse_flood_wait(captured_lines)
+    if flood_wait > 0:
+        _log("WARN", f"FloodWait detected — waiting {flood_wait + 5}s before restart…")
+        time.sleep(flood_wait + 5)       # +5 s safety buffer
+    else:
+        wait = min(5 * restart_count, 30)
+        _log("WARN", f"Restarting in {wait}s…")
+        time.sleep(wait)
