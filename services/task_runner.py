@@ -2,14 +2,9 @@
 services/task_runner.py
 Global task registry + unified live progress panel.
 
-FIXES:
-- render_panel no longer calls system_stats() directly — that blocked the
-  event loop for 250ms per call. Stats now come from a background cache
-  updated every 5 seconds by _stats_updater().
-- TaskRecord._dirty removed — it was created but never awaited (dead code).
-- auto_panel now checks for an existing live panel before spawning a new one,
-  preventing the race when two tasks finish simultaneously for the same user.
-- UPLOAD_CONCURRENCY read lazily in start() after dotenv loads (pre-existing fix kept).
+Upload concurrency gates removed — uploads now go straight through
+(mirrors telegram.py style).  Download / processing slot limiting
+(MAX_CONCURRENT) is kept so CPU-heavy FFmpeg jobs don't stack up.
 """
 from __future__ import annotations
 
@@ -31,8 +26,6 @@ TASK_LINGER    = 15
 _task_semaphore: Optional[asyncio.Semaphore] = None
 
 # ── Background stats cache ────────────────────────────────────
-# Updated every 5 s by _stats_updater() — render_panel reads this dict
-# synchronously instead of sleeping 250 ms per call for net sampling.
 _stats_cache: dict = {
     "cpu": 0.0, "ram_pct": 0.0, "ram_used": 0,
     "disk_free": 0, "dl_speed": 0.0, "ul_speed": 0.0,
@@ -40,7 +33,6 @@ _stats_cache: dict = {
 
 
 async def _stats_updater() -> None:
-    """Background coroutine — samples system stats every 5 s."""
     from services.utils import system_stats
     while True:
         try:
@@ -59,7 +51,7 @@ def _get_semaphore() -> asyncio.Semaphore:
 
 
 # ─────────────────────────────────────────────────────────────
-# TaskRecord  (_dirty field removed — was never awaited)
+# TaskRecord
 # ─────────────────────────────────────────────────────────────
 
 _ENGINE_ICON: dict[str, str] = {
@@ -153,7 +145,6 @@ class GlobalTracker:
             self._seq += 1
             record.seq = self._seq
             self._tasks[record.tid] = record
-        # FIX: only spawn auto_panel if no panel is already live for this user
         existing = runner._panels.get(record.user_id)
         if not existing or existing._stopped:
             asyncio.create_task(runner.auto_panel(record.user_id))
@@ -200,7 +191,7 @@ tracker = GlobalTracker()
 
 
 # ─────────────────────────────────────────────────────────────
-# Panel renderer  (FIX: reads cached stats — no sleep)
+# Panel renderer
 # ─────────────────────────────────────────────────────────────
 
 def _prog_bar(pct: float, cells: int = 10) -> str:
@@ -235,7 +226,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     active_lbl = f"{len(active)} active" if active else "idle"
 
     lines: list[str] = [
-        f"⚡ <b>{bot_name} BOT</b>   <code>● {active_lbl}</code>",
+        f"⚡ <b>{bot_name} MULTIUSAGE BOT</b>   <code>● {active_lbl}</code>",
         _SEP,
     ]
 
@@ -289,7 +280,6 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         if t.seeds:
             lines.append(f"🌱 <b>Seeds</b>    <code>{t.seeds}</code>")
 
-    # FIX: read from cache — no asyncio.sleep()
     stats   = _stats_cache
     cpu     = stats.get("cpu", 0.0)
     rp      = stats.get("ram_pct", 0.0)
@@ -399,21 +389,14 @@ class LivePanel:
 
 
 # ─────────────────────────────────────────────────────────────
-# TaskRunner
+# TaskRunner  (upload semaphore fully removed)
 # ─────────────────────────────────────────────────────────────
 
 class TaskRunner:
     def __init__(self) -> None:
-        self._panels:             dict[int, LivePanel] = {}
-        self._panel_locks:        dict[int, asyncio.Lock] = {}
-        self._running             = False
-        self._upload_sem:         asyncio.Semaphore | None = None
-        self._upload_concurrency: int = 3
-
-    def _get_upload_sem(self) -> asyncio.Semaphore:
-        if self._upload_sem is None:
-            self._upload_sem = asyncio.Semaphore(self._upload_concurrency)
-        return self._upload_sem
+        self._panels:      dict[int, LivePanel] = {}
+        self._panel_locks: dict[int, asyncio.Lock] = {}
+        self._running      = False
 
     def _panel_lock(self, uid: int) -> asyncio.Lock:
         if uid not in self._panel_locks:
@@ -425,13 +408,8 @@ class TaskRunner:
         global _task_semaphore
         _task_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-        self._upload_concurrency = int(os.environ.get("UPLOAD_CONCURRENCY", "3"))
-        self._upload_sem = asyncio.Semaphore(self._upload_concurrency)
-        log.info("⚡ Upload concurrency: %d simultaneous uploads", self._upload_concurrency)
-
-        # Start background stats updater
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             loop.create_task(_stats_updater())
             log.info("📊 Background stats updater started (every 5s)")
         except Exception as e:
@@ -479,12 +457,10 @@ class TaskRunner:
         async with self._panel_lock(uid):
             existing = self._panels.get(uid)
 
-            # FIX: if a live (non-stopped) panel already exists, just wake it
             if existing and not existing._stopped:
                 existing.wake()
                 return
 
-            # Stop and clean up any dead panel
             if existing:
                 existing.stop()
                 try:
