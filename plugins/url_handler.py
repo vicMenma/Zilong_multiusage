@@ -201,13 +201,7 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
         except Exception:
             pass
         return
-    from types import SimpleNamespace
-    _up_dummy = SimpleNamespace(
-        edit=lambda *a, **kw: asyncio.sleep(0),
-        delete=lambda: asyncio.sleep(0),
-        chat=SimpleNamespace(id=uid),
-    )
-    asyncio.create_task(_upload_and_cleanup(client, _up_dummy, result, tmp))
+    asyncio.create_task(_upload_and_cleanup(client, uid, result, tmp))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1067,11 +1061,21 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
 # Upload helper — no semaphore, straight through
 # ─────────────────────────────────────────────────────────────
 
-async def _upload_and_cleanup(client, msg, path: str, tmp: str) -> None:
+async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
+    from pyrogram import enums as _enums
+    st = await client.send_message(
+        uid,
+        f"📤 <b>Uploading…</b>\n<code>{os.path.basename(path)}</code>",
+        parse_mode=_enums.ParseMode.HTML,
+    )
     try:
-        await upload_file(client, msg, path)
+        await upload_file(client, st, path)
     except Exception as exc:
         log.error("Upload failed for %s: %s", path, exc)
+        try:
+            await st.delete()
+        except Exception:
+            pass
     finally:
         cleanup(tmp)
 
@@ -1164,13 +1168,6 @@ async def _launch_download(
             pass
         return
 
-    from types import SimpleNamespace
-    _up_dummy = SimpleNamespace(
-        edit=lambda *a, **kw: asyncio.sleep(0),
-        delete=lambda: asyncio.sleep(0),
-        chat=SimpleNamespace(id=uid),
-    )
-
     from core.session import settings as _settings
     from services.utils import smart_clean_filename
     s = await _settings.get(uid)
@@ -1191,7 +1188,7 @@ async def _launch_download(
         except OSError as _re:
             log.warning("Rename failed: %s", _re)
 
-    asyncio.create_task(_upload_and_cleanup(client, _up_dummy, path, tmp))
+    asyncio.create_task(_upload_and_cleanup(client, uid, path, tmp))
 
 
 # ─────────────────────────────────────────────────────────────
