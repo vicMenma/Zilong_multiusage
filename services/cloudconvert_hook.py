@@ -3,26 +3,7 @@ services/cloudconvert_hook.py
 Receives CloudConvert webhooks and auto-downloads + uploads
 finished files through the existing Zilong pipeline.
 
-AWS FIX — why webhook works on Colab but not AWS:
-  On Colab: ngrok creates a public tunnel → CC can reach port 8765 → webhooks arrive.
-  On AWS:   public IP exists but port 8765 is closed in Security Group AND the
-            old code only registered a URL when NGROK_TOKEN was set — so CC
-            never knew where to send callbacks.
-
-HOW TO FIX ON AWS:
-  Step 1 — Open port 8765 in EC2 Security Group (inbound TCP from 0.0.0.0/0)
-  Step 2 — Add to .env:
-              WEBHOOK_BASE_URL=http://3.121.160.242:8765
-           (replace with your actual EC2 public IP)
-  Step 3 — Restart the bot: sudo systemctl restart zilongbot
-  The bot will auto-register the webhook with CloudConvert and DM you the URL.
-
-URL priority order:
-  1. WEBHOOK_BASE_URL env var  →  AWS / any VPS with static public IP
-  2. NGROK_TOKEN env var       →  Colab / dynamic IP via ngrok tunnel
-  3. (nothing)                 →  ccstatus poller handles delivery as fallback
-
-The ccstatus poller always runs as a backup regardless of webhook status.
+Upload semaphore removed — uploads go straight through (telegram.py style).
 """
 from __future__ import annotations
 
@@ -46,9 +27,6 @@ LISTEN_PORT = 8765
 def _verify_signature(payload: bytes, signature: str) -> bool:
     if not WEBHOOK_SECRET:
         return True
-    # FIX: CloudConvert sends the signature as "sha256=<hexhash>".
-    # Strip the prefix before comparing — without this the HMAC digest
-    # never matches and every valid webhook is rejected with 403.
     if signature.startswith("sha256="):
         signature = signature[7:]
     expected = hmac.new(
@@ -82,7 +60,6 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
     from core.session import get_client, settings as _settings
     from services.downloader import smart_download
     from services.uploader import upload_file
-    from services.task_runner import runner as _runner
     from services.utils import cleanup, make_tmp, smart_clean_filename, largest_file, human_size
 
     client = get_client()
@@ -135,15 +112,14 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             except OSError:
                 pass
 
-        sem = _runner._get_upload_sem()
-        async with sem:
-            from types import SimpleNamespace
-            dummy_msg = SimpleNamespace(
-                edit=lambda *a, **kw: asyncio.sleep(0),
-                delete=lambda: asyncio.sleep(0),
-                chat=SimpleNamespace(id=owner_id),
-            )
-            await upload_file(client, dummy_msg, path)
+        # Upload straight through — no semaphore
+        from types import SimpleNamespace
+        dummy_msg = SimpleNamespace(
+            edit=lambda *a, **kw: asyncio.sleep(0),
+            delete=lambda: asyncio.sleep(0),
+            chat=SimpleNamespace(id=owner_id),
+        )
+        await upload_file(client, dummy_msg, path)
 
     except Exception as exc:
         log.error("[CC-Hook] Pipeline failed for %s: %s", filename, exc)
@@ -224,12 +200,7 @@ def _build_app() -> web.Application:
     return app
 
 
-# ─────────────────────────────────────────────────────────────
-# CC API auto-registration
-# ─────────────────────────────────────────────────────────────
-
 async def _register_cc_webhook(base_url: str, api_key: str) -> None:
-    """Delete existing CC webhooks, register the new one, DM owner."""
     from core.config import cfg
     import aiohttp as _aio
 
@@ -241,7 +212,6 @@ async def _register_cc_webhook(base_url: str, api_key: str) -> None:
 
     try:
         async with _aio.ClientSession() as sess:
-            # delete old webhooks
             async with sess.get(
                 "https://api.cloudconvert.com/v2/webhooks", headers=headers
             ) as resp:
@@ -257,7 +227,6 @@ async def _register_cc_webhook(base_url: str, api_key: str) -> None:
                                 if dr.status in (200, 204):
                                     log.info("[CC-Hook] Deleted old webhook %s", wh_id)
 
-            # register new webhook
             payload: dict = {
                 "url":    webhook_url,
                 "events": ["job.finished", "job.failed"],
@@ -279,7 +248,6 @@ async def _register_cc_webhook(base_url: str, api_key: str) -> None:
     except Exception as exc:
         log.error("[CC-Hook] Registration error: %s", exc)
 
-    # DM owner
     try:
         from core.session import get_client
         client = get_client()
@@ -297,22 +265,10 @@ async def _register_cc_webhook(base_url: str, api_key: str) -> None:
         log.warning("[CC-Hook] Could not DM owner: %s", exc)
 
 
-# ─────────────────────────────────────────────────────────────
-# Server lifecycle
-# ─────────────────────────────────────────────────────────────
-
 async def start_webhook_server(
     port: int = LISTEN_PORT,
     ngrok_token: str = "",
 ) -> str:
-    """
-    Start the webhook HTTP server and return the public webhook URL.
-
-    URL priority:
-      1. WEBHOOK_BASE_URL env var (AWS EC2 / static public IP) — no ngrok needed
-      2. ngrok_token              (Colab / dynamic IP)
-      3. empty string             (local only — poller handles delivery)
-    """
     global _runner, _site
 
     app     = _build_app()
@@ -330,7 +286,6 @@ async def start_webhook_server(
     from core.config import cfg
     api_key = cfg.cc_api_key
 
-    # ── Priority 1: static public URL (AWS / VPS) ─────────────────────────
     base_url = os.environ.get("WEBHOOK_BASE_URL", "").strip().rstrip("/")
     if base_url:
         webhook_url = f"{base_url}/webhook/cloudconvert"
@@ -344,7 +299,6 @@ async def start_webhook_server(
             )
         return webhook_url
 
-    # ── Priority 2: ngrok (Colab / dynamic IP) ────────────────────────────
     if ngrok_token:
         try:
             from pyngrok import ngrok, conf
@@ -361,7 +315,6 @@ async def start_webhook_server(
         except Exception as exc:
             log.error("[CC-Hook] ngrok error: %s", exc)
 
-    # ── Priority 3: no public URL ─────────────────────────────────────────
     log.info(
         "[CC-Hook] No WEBHOOK_BASE_URL or NGROK_TOKEN set. "
         "Webhook server running locally only. "

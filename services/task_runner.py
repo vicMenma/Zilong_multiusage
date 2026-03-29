@@ -2,14 +2,9 @@
 services/task_runner.py
 Global task registry + unified live progress panel.
 
-OPTIMIZED: render_panel() now uses dynamic bot name from get_bot_name()
-           and shows "{NAME} MULTIUSAGE BOT" in all panels.
-
-FIXES preserved:
-- render_panel no longer calls system_stats() directly — reads cached stats
-- TaskRecord._dirty removed (dead code)
-- auto_panel checks for existing panel before spawning new one
-- UPLOAD_CONCURRENCY read lazily after dotenv loads
+Upload concurrency gates removed — uploads now go straight through
+(mirrors telegram.py style).  Download / processing slot limiting
+(MAX_CONCURRENT) is kept so CPU-heavy FFmpeg jobs don't stack up.
 """
 from __future__ import annotations
 
@@ -38,7 +33,6 @@ _stats_cache: dict = {
 
 
 async def _stats_updater() -> None:
-    """Background coroutine — samples system stats every 5 s."""
     from services.utils import system_stats
     while True:
         try:
@@ -197,7 +191,7 @@ tracker = GlobalTracker()
 
 
 # ─────────────────────────────────────────────────────────────
-# Panel renderer (OPTIMIZED — dynamic bot name)
+# Panel renderer
 # ─────────────────────────────────────────────────────────────
 
 def _prog_bar(pct: float, cells: int = 10) -> str:
@@ -217,7 +211,6 @@ _MODE_HEADER = {
 
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
-    # ═══ OPTIMIZED: dynamic bot name from get_bot_name() ═══
     from core.bot_name import get_bot_name
     from services.utils import human_size, human_dur
 
@@ -229,7 +222,6 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
         if t.mode in ("dl", "proc", "magnet") and not t.state.startswith("⏳")
     )
 
-    # ═══ DYNAMIC BOT NAME — shows "{NAME} MULTIUSAGE BOT" ═══
     bot_name   = get_bot_name().upper()
     active_lbl = f"{len(active)} active" if active else "idle"
 
@@ -397,21 +389,14 @@ class LivePanel:
 
 
 # ─────────────────────────────────────────────────────────────
-# TaskRunner
+# TaskRunner  (upload semaphore fully removed)
 # ─────────────────────────────────────────────────────────────
 
 class TaskRunner:
     def __init__(self) -> None:
-        self._panels:             dict[int, LivePanel] = {}
-        self._panel_locks:        dict[int, asyncio.Lock] = {}
-        self._running             = False
-        self._upload_sem:         asyncio.Semaphore | None = None
-        self._upload_concurrency: int = 3
-
-    def _get_upload_sem(self) -> asyncio.Semaphore:
-        if self._upload_sem is None:
-            self._upload_sem = asyncio.Semaphore(self._upload_concurrency)
-        return self._upload_sem
+        self._panels:      dict[int, LivePanel] = {}
+        self._panel_locks: dict[int, asyncio.Lock] = {}
+        self._running      = False
 
     def _panel_lock(self, uid: int) -> asyncio.Lock:
         if uid not in self._panel_locks:
@@ -422,10 +407,6 @@ class TaskRunner:
         self._running = True
         global _task_semaphore
         _task_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
-        self._upload_concurrency = int(os.environ.get("UPLOAD_CONCURRENCY", "3"))
-        self._upload_sem = asyncio.Semaphore(self._upload_concurrency)
-        log.info("⚡ Upload concurrency: %d simultaneous uploads", self._upload_concurrency)
 
         try:
             loop = asyncio.get_running_loop()
