@@ -429,9 +429,11 @@ class TaskRunner:
         self._upload_sem = asyncio.Semaphore(self._upload_concurrency)
         log.info("⚡ Upload concurrency: %d simultaneous uploads", self._upload_concurrency)
 
-        # Start background stats updater
+        # FIX: use get_running_loop() — get_event_loop() is deprecated in
+        # Python 3.10+ when called from inside a running coroutine context,
+        # which is always the case here since start() is called from main().
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             loop.create_task(_stats_updater())
             log.info("📊 Background stats updater started (every 5s)")
         except Exception as e:

@@ -46,6 +46,11 @@ LISTEN_PORT = 8765
 def _verify_signature(payload: bytes, signature: str) -> bool:
     if not WEBHOOK_SECRET:
         return True
+    # FIX: CloudConvert sends the signature as "sha256=<hexhash>".
+    # Strip the prefix before comparing — without this the HMAC digest
+    # never matches and every valid webhook is rejected with 403.
+    if signature.startswith("sha256="):
+        signature = signature[7:]
     expected = hmac.new(
         WEBHOOK_SECRET.encode(), payload, hashlib.sha256
     ).hexdigest()
