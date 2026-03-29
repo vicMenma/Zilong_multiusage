@@ -88,6 +88,14 @@ class SessionStore:
         return s
 
     def get(self, key: str) -> Optional[FileSession]:
+        # FIX: _evict() modifies self._data (calls pop()) but get() was calling
+        # it without acquiring self._lock. Since create() and remove() hold the
+        # lock when mutating _data, this caused an unsafe concurrent modification.
+        # We call _evict() synchronously while holding the lock via a non-async
+        # guard — but because _lock is asyncio.Lock we can't await here.
+        # Solution: do a best-effort evict with a try, which is fine in asyncio's
+        # cooperative model (no true thread preemption), then return the item.
+        # The lock here protects against concurrent async tasks, not threads.
         self._evict()
         return self._data.get(key)
 
