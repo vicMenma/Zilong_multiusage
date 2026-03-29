@@ -1,8 +1,19 @@
 # @title ⚡ Zilong Bot — Colab Launcher
 # @markdown ## Credentials
 # @markdown
-# @markdown **Recommended:** Add secrets via the 🔑 icon in the left panel:
-# @markdown - `API_ID`, `API_HASH`, `BOT_TOKEN`, `OWNER_ID`, `GITHUB_TOKEN`
+# @markdown **Recommended:** Store credentials in the 🔑 Secrets panel (left sidebar)
+# @markdown and toggle **"Notebook access"** ON for each one.
+# @markdown The form fields below are a fallback — Secrets always win.
+# @markdown
+# @markdown | Secret | Required | Example |
+# @markdown |---|---|---|
+# @markdown | `API_ID` | ✅ | `12345678` |
+# @markdown | `API_HASH` | ✅ | `abcdef…` |
+# @markdown | `BOT_TOKEN` | ✅ | `123456:ABC…` |
+# @markdown | `OWNER_ID` | ✅ | `987654321` |
+# @markdown | `GITHUB_TOKEN` | private repo | PAT with `repo` scope |
+# @markdown | `CC_API_KEY` | hardsub | CloudConvert key |
+# @markdown | `NGROK_TOKEN` | webhook | ngrok authtoken |
 
 API_ID    = 0      # @param {type:"integer"}
 API_HASH  = ""     # @param {type:"string"}
@@ -12,30 +23,27 @@ OWNER_ID  = 0      # @param {type:"integer"}
 FILE_LIMIT_MB = 2048   # @param {type:"integer"}
 LOG_CHANNEL   = 0      # @param {type:"integer"}
 
-# CloudConvert auto-upload (optional)
 NGROK_TOKEN       = ""  # @param {type:"string"}
 CC_WEBHOOK_SECRET = ""  # @param {type:"string"}
+CC_API_KEY        = ""  # @param {type:"string"}
+GITHUB_TOKEN      = ""  # @param {type:"string"}
 
-# CloudConvert hardsub API key (for /hardsub command)
-CC_API_KEY = ""  # @param {type:"string"}
-
-# GitHub personal access token — required for private repo clone
-GITHUB_TOKEN = ""  # @param {type:"string"}
-
-import os, sys, subprocess, shutil, time, glob
+# ─────────────────────────────────────────────────────────────────────────────
+import os, sys, subprocess, shutil, time, glob, threading
 from datetime import datetime
 
 REPO_NAME = "Zilong_multiusage"
-BASE_DIR  = f"/content/zilong"
+BASE_DIR  = "/content/zilong"
 
 
-def _log(level: str, msg: str):
+def _log(level: str, msg: str) -> None:
     icons = {"INFO": "ℹ️", "OK": "✅", "WARN": "⚠️", "ERR": "❌", "STEP": "🔧"}
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {icons.get(level, '')} {msg}", flush=True)
 
 
 def _secret(name: str) -> str:
+    """Colab Secrets → env var fallback."""
     try:
         from google.colab import userdata
         val = userdata.get(name)
@@ -46,29 +54,29 @@ def _secret(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
+def _secret_int(name: str, default: int = 0) -> int:
+    try:
+        return int(_secret(name) or default)
+    except (ValueError, TypeError):
+        return default
+
+
+# ── Resolve credentials — Secrets always win over form params ─────────────
 print("⚡ Zilong Bot — Colab Launcher")
 print("─" * 50)
 _log("STEP", "Resolving credentials…")
 
-if not API_ID:
-    try: API_ID = int(_secret("API_ID"))
-    except: API_ID = 0
-if not API_HASH:  API_HASH  = _secret("API_HASH")
-if not BOT_TOKEN: BOT_TOKEN = _secret("BOT_TOKEN")
-if not OWNER_ID:
-    try: OWNER_ID = int(_secret("OWNER_ID"))
-    except: OWNER_ID = 0
-if not FILE_LIMIT_MB:
-    try: FILE_LIMIT_MB = int(_secret("FILE_LIMIT_MB") or 2048)
-    except: FILE_LIMIT_MB = 2048
-if not LOG_CHANNEL:
-    try: LOG_CHANNEL = int(_secret("LOG_CHANNEL") or 0)
-    except: LOG_CHANNEL = 0
-if not NGROK_TOKEN:
-    NGROK_TOKEN = _secret("NGROK_TOKEN") or _secret("NGROK_AUTHTOKEN")
-if not CC_WEBHOOK_SECRET: CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET")
-if not CC_API_KEY:        CC_API_KEY        = _secret("CC_API_KEY")
-if not GITHUB_TOKEN:      GITHUB_TOKEN      = _secret("GITHUB_TOKEN")
+# Secrets take priority; form params are the fallback
+API_ID            = _secret_int("API_ID")    or API_ID
+API_HASH          = _secret("API_HASH")      or API_HASH
+BOT_TOKEN         = _secret("BOT_TOKEN")     or BOT_TOKEN
+OWNER_ID          = _secret_int("OWNER_ID")  or OWNER_ID
+FILE_LIMIT_MB     = _secret_int("FILE_LIMIT_MB") or FILE_LIMIT_MB or 2048
+LOG_CHANNEL       = _secret_int("LOG_CHANNEL")   or LOG_CHANNEL
+NGROK_TOKEN       = _secret("NGROK_TOKEN") or _secret("NGROK_AUTHTOKEN") or NGROK_TOKEN
+CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET") or CC_WEBHOOK_SECRET
+CC_API_KEY        = _secret("CC_API_KEY")        or CC_API_KEY
+GITHUB_TOKEN      = _secret("GITHUB_TOKEN")      or GITHUB_TOKEN
 
 errors = []
 if not API_ID:    errors.append("API_ID is required")
@@ -77,15 +85,18 @@ if not BOT_TOKEN: errors.append("BOT_TOKEN is required")
 if not OWNER_ID:  errors.append("OWNER_ID is required")
 if errors:
     print()
-    for e in errors: print(f"  ❌ {e}")
+    for e in errors:
+        print(f"  ❌ {e}")
     print()
-    raise SystemExit("Fill in credentials and run again.")
+    print("👆 Add missing secrets via the 🔑 panel (left sidebar).")
+    raise SystemExit("Missing required credentials.")
 
-_log("OK", f"Credentials loaded  (API_ID={API_ID}, OWNER_ID={OWNER_ID})")
+_log("OK", f"API_ID={API_ID}  OWNER_ID={OWNER_ID}")
 if NGROK_TOKEN:  _log("OK", "CloudConvert webhook enabled (NGROK_TOKEN set)")
 if CC_API_KEY:   _log("OK", "CloudConvert hardsub enabled (CC_API_KEY set)")
 if GITHUB_TOKEN: _log("OK", "GitHub token set — will clone private repo")
 
+# ── System packages ───────────────────────────────────────────────────────
 _log("STEP", "Installing system packages…")
 subprocess.run(
     "apt-get update -qq && "
@@ -94,34 +105,38 @@ subprocess.run(
 )
 _log("OK", "System packages ready")
 
+# ── Clone ─────────────────────────────────────────────────────────────────
 _log("STEP", "Cloning repository…")
 if os.path.exists(BASE_DIR):
     shutil.rmtree(BASE_DIR)
 
-if GITHUB_TOKEN:
-    REPO_URL = f"https://{GITHUB_TOKEN}@github.com/vicMenma/{REPO_NAME}.git"
-else:
-    REPO_URL = f"https://github.com/vicMenma/{REPO_NAME}.git"
-
-r = subprocess.run(["git", "clone", "--depth=1", REPO_URL, BASE_DIR],
-                   capture_output=True, text=True)
+REPO_URL = (
+    f"https://{GITHUB_TOKEN}@github.com/vicMenma/{REPO_NAME}.git"
+    if GITHUB_TOKEN
+    else f"https://github.com/vicMenma/{REPO_NAME}.git"
+)
+r = subprocess.run(
+    ["git", "clone", "--depth=1", REPO_URL, BASE_DIR],
+    capture_output=True, text=True,
+)
 if r.returncode != 0:
     err_clean = r.stderr.replace(GITHUB_TOKEN, "***") if GITHUB_TOKEN else r.stderr
     raise SystemExit(f"❌ Clone failed:\n{err_clean[:300]}")
-_log("OK", f"Cloned {REPO_NAME} to {BASE_DIR}")
+_log("OK", f"Cloned {REPO_NAME} → {BASE_DIR}")
 
+# ── Python packages ───────────────────────────────────────────────────────
 _log("STEP", "Installing Python packages…")
 subprocess.run(
     [sys.executable, "-m", "pip", "uninstall", "-q", "-y", "pyrogram"],
     capture_output=True,
 )
 subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q",
-     "-r", f"{BASE_DIR}/requirements.txt"],
+    [sys.executable, "-m", "pip", "install", "-q", "-r", f"{BASE_DIR}/requirements.txt"],
     check=True,
 )
 _log("OK", "Python packages installed")
 
+# ── aria2c daemon ─────────────────────────────────────────────────────────
 _log("STEP", "Starting aria2c daemon…")
 subprocess.Popen(
     "aria2c --enable-rpc --rpc-listen-all=true --rpc-allow-origin-all "
@@ -131,6 +146,7 @@ subprocess.Popen(
 time.sleep(2)
 _log("OK", "aria2c started")
 
+# ── Write .env ────────────────────────────────────────────────────────────
 env_lines = [
     f"API_ID={API_ID}",
     f"API_HASH={API_HASH}",
@@ -145,14 +161,20 @@ env_lines = [
     f"NGROK_TOKEN={NGROK_TOKEN}",
     f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
     f"CC_API_KEY={CC_API_KEY}",
-    # PATCH: raised from 3 → 5 (more concurrent file uploads)
+    # ── Upload tuning ──────────────────────────────────────────────────────
+    # UPLOAD_CONCURRENCY: how many files can upload simultaneously.
     "UPLOAD_CONCURRENCY=5",
+    # BOT_WORKERS: Pyrogram async dispatch pool.
     "BOT_WORKERS=16",
-    # PATCH: raised from 16 → 25 (more parallel MTProto streams per upload)
-    # Colab's ~100 Mbps uplink was under-saturated at 16 streams.
-    "UPLOAD_PARTS_PARALLEL=25",
+    # UPLOAD_PARTS_PARALLEL: parallel MTProto chunk streams per upload.
+    # 8 is the sweet spot for Colab — above ~12 Telegram starts throttling.
+    # (Previous value was 25 which caused server-side pushback.)
+    "UPLOAD_PARTS_PARALLEL=8",
+    # SLEEP_THRESHOLD: auto-sleep on FloodWait ≤ this many seconds;
+    # raise FloodWait immediately if above (avoids silent stalls on long waits).
+    "SLEEP_THRESHOLD=60",
 ]
-for optional in ("ADMINS", "GDRIVE_SA_JSON", "ARIA2_SECRET"):
+for optional in ("ADMINS", "GDRIVE_SA_JSON"):
     val = _secret(optional)
     if val:
         env_lines.append(f"{optional}={val}")
@@ -161,63 +183,20 @@ with open(f"{BASE_DIR}/.env", "w") as f:
     f.write("\n".join(env_lines))
 
 for sf in glob.glob(os.path.join(BASE_DIR, "*.session*")):
-    try: os.remove(sf)
-    except OSError: pass
+    try:
+        os.remove(sf)
+    except OSError:
+        pass
 
 _log("OK", "Environment configured (.env written)")
 
-_log("STEP", "Applying thumbnail duration fix to uploader.py…")
-try:
-    import re as _re
-    _up = os.path.join(BASE_DIR, "services", "uploader.py")
-    _src = open(_up).read()
-    _c = 0
-    for _old, _new in [
-        ('"-v", "error",',                        '"-v", "quiet",'),
-        ('"-show_entries", "format=duration",',    '"-show_streams", "-show_format",'),
-        ('"-of", "default=noprint_wrappers=1:nokey=1",', '"-of", "json",'),
-    ]:
-        if _old in _src:
-            _src = _src.replace(_old, _new, 1); _c += 1
-    _OLD_DUR = 'duration = float(out_b.decode().strip() or "0")'
-    _NEW_DUR = (
-        "import json as _jj\n"
-        "        _jdata = _jj.loads(out_b.decode(errors='replace') or '{}')\n"
-        "        duration = 0\n"
-        "        for _jst in _jdata.get('streams', []):\n"
-        "            if _jst.get('codec_type') == 'video':\n"
-        "                try: duration = int(float(_jst.get('duration', 0) or 0))\n"
-        "                except: pass\n"
-        "                for _jk in ('DURATION', 'DURATION-eng', 'DURATION-jpn'):\n"
-        "                    _jv = (_jst.get('tags') or {}).get(_jk, '')\n"
-        "                    if not duration and _jv and ':' in str(_jv):\n"
-        "                        try:\n"
-        "                            _jp = str(_jv).split(':')\n"
-        "                            duration = int(float(_jp[0]))*3600+int(float(_jp[1]))*60+int(float(_jp[2].split('.')[0]))\n"
-        "                        except: pass\n"
-        "                    if duration: break\n"
-        "                break\n"
-        "        if not duration:\n"
-        "            try: duration = int(float(_jdata.get('format', {}).get('duration') or 0))\n"
-        "            except: pass"
-    )
-    if _OLD_DUR in _src:
-        _src = _src.replace(_OLD_DUR, _NEW_DUR, 1); _c += 1
-    if _c:
-        open(_up, "w").write(_src)
-        _log("OK", f"Thumbnail fix applied ({_c} replacements)")
-    else:
-        _log("OK", "Thumbnail fix already present")
-except Exception as _e:
-    _log("WARN", f"Patch failed: {_e}")
-
 os.chdir(BASE_DIR)
 
-# ── Keep Colab alive ──────────────────────────────────────────
+# ── Colab keep-alive ──────────────────────────────────────────────────────
 _log("STEP", "Activating Colab keep-alive…")
 try:
     from IPython.display import display, Javascript
-    display(Javascript('''
+    display(Javascript("""
     function ColabKeepAlive() {
         document.querySelector("#top-toolbar .colab-connect-button")?.click();
         document.querySelector("colab-connect-button")?.shadowRoot
@@ -226,26 +205,25 @@ try:
     }
     setInterval(ColabKeepAlive, 60000);
     console.log("Colab keep-alive: clicking connect every 60s");
-    '''))
+    """))
     _log("OK", "JS keep-alive injected (clicks connect every 60s)")
 except Exception:
     _log("WARN", "Not in Colab notebook — JS keep-alive skipped")
 
-import threading
 
-def _heartbeat():
+def _heartbeat() -> None:
     while True:
         time.sleep(300)
-        ts = datetime.now().strftime("%H:%M")
-        print(f"[{ts}] 💓", end="", flush=True)
+        print(f"\r[{datetime.now().strftime('%H:%M')}] 💓", end="", flush=True)
 
-_hb = threading.Thread(target=_heartbeat, daemon=True)
-_hb.start()
+
+threading.Thread(target=_heartbeat, daemon=True).start()
 _log("OK", "Heartbeat thread started (every 5 min)")
 
+# ── Bot restart loop ──────────────────────────────────────────────────────
 _log("OK", "Starting bot…\n" + "─" * 50)
 
-MAX_RESTARTS = 50
+MAX_RESTARTS  = 50
 restart_count = 0
 
 _bot_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
@@ -273,7 +251,7 @@ while restart_count < MAX_RESTARTS:
         break
 
     if elapsed > 300:
-        restart_count = 0
+        restart_count = 0   # long-running session → reset crash counter
 
     restart_count += 1
     _log("WARN", f"Crashed (exit={proc.returncode}) after {elapsed}s  [{restart_count}/{MAX_RESTARTS}]")

@@ -70,10 +70,17 @@ def build_client() -> Client:
         kwargs["workers"] = _WORKERS
         log.info("⚙️  workers=%d (async dispatch pool)", _WORKERS)
     if "max_concurrent_transmissions" in sig.parameters:
-        # PATCH: raised default from 8 → 25 to saturate Colab's uplink
-        ct = int(os.environ.get("UPLOAD_PARTS_PARALLEL", "25"))
+        # 8 parallel MTProto streams — sweet spot for Colab without triggering
+        # server-side throttle. Set UPLOAD_PARTS_PARALLEL in .env to override.
+        ct = int(os.environ.get("UPLOAD_PARTS_PARALLEL", "8"))
         kwargs["max_concurrent_transmissions"] = ct
         log.info("⚡ max_concurrent_transmissions=%d (parallel upload streams)", ct)
+    if "sleep_threshold" in sig.parameters:
+        # Auto-sleep on FloodWait ≤ threshold seconds; raise immediately above it.
+        # Avoids silent multi-minute stalls on unexpected long waits.
+        st = int(os.environ.get("SLEEP_THRESHOLD", "60"))
+        kwargs["sleep_threshold"] = st
+        log.info("⏱  sleep_threshold=%ds", st)
     return Client(**kwargs)
 
 
