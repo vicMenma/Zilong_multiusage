@@ -158,23 +158,38 @@ async def _video_meta(path: str) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
-    """Returns (thumb_path, is_temp). Caller deletes if is_temp."""
+    """
+    Returns (thumb_path, is_temp). Caller deletes if is_temp.
+
+    Quality improvements:
+      - scale up to 1280 px wide (was 320 — 4x sharper)
+      - -q:v 1  (best JPEG quality, was 2)
+      - tries 20% / 30% / 10% seek to avoid dark/black frames
+    """
     out = path + "_zt.jpg"
-    ts  = max(1, int(duration * 0.2)) if duration > 5 else 1
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y",
-            "-ss", str(ts), "-i", path,
-            "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "2",
-            out,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.communicate()
-        if os.path.exists(out) and os.path.getsize(out) > 500:
-            return out, True
-    except Exception as exc:
-        log.debug("_make_thumb: %s", exc)
+    candidates = (
+        [max(1, int(duration * 0.20)),
+         max(1, int(duration * 0.30)),
+         max(1, int(duration * 0.10))]
+        if duration > 5 else [1]
+    )
+    for ts in candidates:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y",
+                "-ss", str(ts), "-i", path,
+                "-frames:v", "1",
+                "-vf", "scale='min(1280,iw)':-2",
+                "-q:v", "1",
+                out,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+            if os.path.exists(out) and os.path.getsize(out) > 1000:
+                return out, True
+        except Exception as exc:
+            log.debug("_make_thumb ts=%d: %s", ts, exc)
     return None, False
 
 
