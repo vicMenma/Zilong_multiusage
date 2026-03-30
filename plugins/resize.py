@@ -1,14 +1,17 @@
 """
 plugins/resize.py
-Resize and compress video — integrated directly into existing menus.
+Resize and compress video — integrated into existing menus.
 
-Entry points (no state machine needed):
-  • Video menu   → 📐 Resize  /  🗜️ Compress  buttons on uploaded video
-  • URL menu     → 📐 Resize  button on direct links
-  • /resize      → prompts to send file or URL
-  • /compress    → prompts to send file or URL or reply to video
-
-All processing progress goes through the unified task panel.
+FIXES:
+  - vid_resize_cb NOW calls cb.stop_propagation() — previously video_cb in
+    video.py also fired on the same callback, executing "unknown action: resize"
+    and sending an error over the actual resolution picker.
+  - vid_compress_ask_cb NOW calls cb.stop_propagation() — same root cause was
+    making the compress button silently fail (video_cb tried "compress_ask" as
+    unknown action while resize.py was trying to set up the waiting state).
+  - /resize with no args now enters interactive mode (user sends video or URL)
+  - compress_mb_receiver and compress_url_mb_receiver merged into one clean handler
+  - All early-return paths call msg.stop_propagation() to avoid bleed into other handlers
 """
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ import asyncio
 import logging
 import os
 import re
-import tempfile
+import time
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
@@ -35,7 +38,6 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 
 def resize_resolution_kb(source_token: str) -> InlineKeyboardMarkup:
-    """Resolution picker. source_token is opaque — passed straight to callback."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔵 1080p", callback_data=f"rsz|1080|{source_token}"),
          InlineKeyboardButton("🟢 720p",  callback_data=f"rsz|720|{source_token}")],
@@ -46,23 +48,23 @@ def resize_resolution_kb(source_token: str) -> InlineKeyboardMarkup:
 
 
 # ─────────────────────────────────────────────────────────────
-# Token store  (session_key or url → stored info)
+# Token store
 # ─────────────────────────────────────────────────────────────
 
-import hashlib, time as _time
-_token_store: dict[str, dict] = {}   # token → {"kind": "session"|"url", ...}
-_TOKEN_TTL = 1800                     # 30 min
+import hashlib
+_token_store: dict[str, dict] = {}
+_TOKEN_TTL = 1800
 
 
 def _store_session(session_key: str) -> str:
     tok = session_key
-    _token_store[tok] = {"kind": "session", "key": session_key, "ts": _time.time()}
+    _token_store[tok] = {"kind": "session", "key": session_key, "ts": time.time()}
     return tok
 
 
 def _store_url(url: str, fname: str) -> str:
     tok = hashlib.md5(url.encode()).hexdigest()[:12]
-    _token_store[tok] = {"kind": "url", "url": url, "fname": fname, "ts": _time.time()}
+    _token_store[tok] = {"kind": "url", "url": url, "fname": fname, "ts": time.time()}
     return tok
 
 
@@ -70,14 +72,25 @@ def _get_token(tok: str) -> dict | None:
     entry = _token_store.get(tok)
     if not entry:
         return None
-    if _time.time() - entry["ts"] > _TOKEN_TTL:
+    if time.time() - entry["ts"] > _TOKEN_TTL:
         _token_store.pop(tok, None)
         return None
     return entry
 
 
 # ─────────────────────────────────────────────────────────────
-# /resize command  (entry point for manual use)
+# Interactive state
+# ─────────────────────────────────────────────────────────────
+
+# uid → "resize" or "compress"
+_interactive_mode: dict[int, str] = {}
+
+# uid → {"session_key": str} or {"url": str, "fname": str, "msg": msg}
+_compress_waiting: dict[int, dict] = {}
+
+
+# ─────────────────────────────────────────────────────────────
+# /resize command
 # ─────────────────────────────────────────────────────────────
 
 @Client.on_message(filters.private & filters.command("resize"))
@@ -86,7 +99,8 @@ async def cmd_resize(client: Client, msg: Message):
     await users.register(uid)
 
     args = msg.command[1:]
-    # /resize <url>  — direct URL
+
+    # /resize <url>  — direct URL mode
     if args and args[0].startswith("http"):
         url   = args[0]
         fname = url.split("/")[-1].split("?")[0][:50] or "video.mkv"
@@ -98,14 +112,13 @@ async def cmd_resize(client: Client, msg: Message):
         )
         return
 
-    # /resize with no args — tell user to use the video menu or send a URL
+    # /resize with no args → interactive mode
+    _interactive_mode[uid] = "resize"
+    _compress_waiting.pop(uid, None)
     await msg.reply(
         "📐 <b>Resize Video</b>\n\n"
-        "Two ways to use this:\n\n"
-        "1️⃣  <b>Send a video file</b> → tap <b>📐 Resize</b> in the menu\n\n"
-        "2️⃣  <b>Direct URL:</b>\n"
-        "   <code>/resize https://example.com/video.mkv</code>\n\n"
-        "<i>Resized locally with FFmpeg — no CloudConvert credits.</i>",
+        "Send me a <b>video file</b> or a <b>direct URL</b>.\n\n"
+        "<i>Send /cancel to abort.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
@@ -113,9 +126,6 @@ async def cmd_resize(client: Client, msg: Message):
 # ─────────────────────────────────────────────────────────────
 # /compress command
 # ─────────────────────────────────────────────────────────────
-
-_compress_waiting: dict[int, dict] = {}   # uid → pending compress info
-
 
 @Client.on_message(filters.private & filters.command("compress"))
 async def cmd_compress(client: Client, msg: Message):
@@ -171,22 +181,35 @@ async def cmd_compress(client: Client, msg: Message):
         await _do_compress(client, st, path, os.path.basename(path), tmp, target_mb, uid)
         return
 
-    # No valid args — prompt
+    # No valid args — interactive mode: ask for file first
+    _interactive_mode[uid] = "compress"
+    _compress_waiting.pop(uid, None)
     await msg.reply(
         "🗜️ <b>Compress Video</b>\n\n"
-        "Ways to use:\n\n"
-        "1️⃣  <b>Send a video file</b> → tap <b>🗜️ Compress</b> in the menu\n\n"
-        "2️⃣  <b>URL + target size:</b>\n"
-        "   <code>/compress https://… 85</code>\n\n"
-        "3️⃣  <b>Reply to a video:</b>\n"
-        "   Reply with <code>/compress 200</code>\n\n"
-        "<i>2-pass FFmpeg — no CloudConvert credits.</i>",
+        "Send me a <b>video file</b> or a <b>direct URL</b>.\n\n"
+        "I'll ask for the target size (MB) after.\n\n"
+        "<i>Send /cancel to abort.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
 
 # ─────────────────────────────────────────────────────────────
-# Entry from VIDEO MENU  (vid|resize|key  /  vid|compress_ask|key)
+# /cancel for resize/compress interactive flows
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_message(filters.private & filters.command("cancel"), group=4)
+async def cmd_cancel_resize(client: Client, msg: Message):
+    uid = msg.from_user.id
+    if uid in _interactive_mode or uid in _compress_waiting:
+        _interactive_mode.pop(uid, None)
+        _compress_waiting.pop(uid, None)
+        await msg.reply("❌ Cancelled.")
+        msg.stop_propagation()
+
+
+# ─────────────────────────────────────────────────────────────
+# Entry from VIDEO MENU  (vid|resize|key)
+# FIX: cb.stop_propagation() prevents video_cb from also firing
 # ─────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^vid\|resize\|"))
@@ -199,6 +222,7 @@ async def vid_resize_cb(client: Client, cb: CallbackQuery):
         reply_markup=resize_resolution_kb(tok),
         parse_mode=enums.ParseMode.HTML,
     )
+    cb.stop_propagation()   # ← CRITICAL FIX: prevents video_cb from also running
 
 
 @Client.on_callback_query(filters.regex(r"^vid\|compress_ask\|"))
@@ -207,6 +231,7 @@ async def vid_compress_ask_cb(client: Client, cb: CallbackQuery):
     uid = cb.from_user.id
     await cb.answer()
     _compress_waiting[uid] = {"session_key": session_key, "msg_id": cb.message.id}
+    _interactive_mode.pop(uid, None)
     await cb.message.edit(
         "🗜️ <b>Compress Video</b>\n\n"
         "Send target size in <b>MB</b>:\n"
@@ -214,58 +239,11 @@ async def vid_compress_ask_cb(client: Client, cb: CallbackQuery):
         "<i>2-pass FFmpeg encode — takes ~2× real-time.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
-
-
-# Receive target MB for compress-from-video-menu flow
-@Client.on_message(
-    filters.private & filters.text
-    & ~filters.command(["resize", "compress", "cancel"]),
-    group=1,
-)
-async def compress_mb_receiver(client: Client, msg: Message):
-    uid = msg.from_user.id
-    if uid not in _compress_waiting:
-        return
-    text = msg.text.strip()
-    if not re.match(r"^\d+(\.\d+)?$", text):
-        return
-
-    target_mb   = float(text)
-    info        = _compress_waiting.pop(uid)
-    session_key = info["session_key"]
-
-    from core.session import sessions
-    session = sessions.get(session_key)
-    if not session:
-        await msg.reply("❌ Session expired. Send the video again.")
-        return
-
-    st = await msg.reply(
-        f"🗜️ <b>Compress</b> → <b>{target_mb:.0f} MB</b>\n"
-        f"<code>{session.fname[:40]}</code>\n⬇️ Downloading…",
-        parse_mode=enums.ParseMode.HTML,
-    )
-
-    tmp = make_tmp(cfg.download_dir, uid)
-    try:
-        from plugins.video import _ensure
-        async with session.lock:
-            path = await _ensure(client, session, st)
-        if not path:
-            cleanup(tmp)
-            return
-        await _do_compress(client, st, path, session.fname, tmp, target_mb, uid)
-    except Exception as exc:
-        cleanup(tmp)
-        await safe_edit(st, f"❌ Failed: <code>{exc}</code>",
-                        parse_mode=enums.ParseMode.HTML)
-
-    msg.stop_propagation()
+    cb.stop_propagation()   # ← CRITICAL FIX: prevents video_cb from also running
 
 
 # ─────────────────────────────────────────────────────────────
-# Entry from URL MENU  (dl|resize|token)
-# Called from url_handler.py when user clicks 📐 Resize
+# Entry from URL MENU
 # ─────────────────────────────────────────────────────────────
 
 async def handle_url_resize(client: Client, cb: CallbackQuery, url: str, token: str) -> None:
@@ -283,6 +261,7 @@ async def handle_url_compress(client: Client, cb: CallbackQuery, url: str, uid: 
     """Called by url_handler dl_cb when mode=='compress_url'."""
     fname = url.split("/")[-1].split("?")[0][:50] or "video.mkv"
     _compress_waiting[uid] = {"url": url, "fname": fname, "msg": cb.message}
+    _interactive_mode.pop(uid, None)
     await cb.message.edit(
         f"🗜️ <b>Compress</b>\n<code>{fname[:45]}</code>\n\n"
         "Send target size in <b>MB</b>:\n<code>85</code>",
@@ -290,46 +269,185 @@ async def handle_url_compress(client: Client, cb: CallbackQuery, url: str, uid: 
     )
 
 
-# Receive target MB for compress-from-url flow
+# ─────────────────────────────────────────────────────────────
+# Interactive file/URL receiver for /resize and /compress
+# Handles when user sends a file or URL after /resize or /compress with no args
+# ─────────────────────────────────────────────────────────────
+
 @Client.on_message(
-    filters.private & filters.text
-    & ~filters.command(["resize", "compress", "cancel"]),
+    filters.private & (filters.video | filters.document),
     group=1,
 )
-async def compress_url_mb_receiver(client: Client, msg: Message):
+async def resize_compress_file_receiver(client: Client, msg: Message):
+    """Catch video/doc sent after /resize or /compress (interactive mode)."""
+    uid  = msg.from_user.id
+    mode = _interactive_mode.get(uid)
+    if not mode:
+        return
+
+    media = msg.video or msg.document
+    if not media:
+        return
+
+    fname = getattr(media, "file_name", None) or "video.mkv"
+    ext   = os.path.splitext(fname)[1].lower()
+    video_exts = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".ts", ".m2ts",
+                  ".wmv", ".m4v"}
+    if ext not in video_exts and not msg.video:
+        return
+
+    fsize = getattr(media, "file_size", 0) or 0
+    _interactive_mode.pop(uid, None)
+
+    if mode == "resize":
+        # Show resolution picker — source token references the file_id
+        tok = hashlib.md5(media.file_id.encode()).hexdigest()[:12]
+        _token_store[tok] = {
+            "kind": "tg_file", "file_id": media.file_id,
+            "fname": fname, "fsize": fsize, "ts": time.time(),
+        }
+        await msg.reply(
+            f"📐 <b>Resize</b>\n<code>{fname[:45]}</code>  "
+            f"<code>{human_size(fsize)}</code>\n\nChoose resolution:",
+            reply_markup=resize_resolution_kb(tok),
+            parse_mode=enums.ParseMode.HTML,
+        )
+        msg.stop_propagation()
+
+    elif mode == "compress":
+        # Store file reference, ask for MB
+        tok = hashlib.md5(media.file_id.encode()).hexdigest()[:12]
+        _token_store[tok] = {
+            "kind": "tg_file", "file_id": media.file_id,
+            "fname": fname, "fsize": fsize, "ts": time.time(),
+        }
+        _compress_waiting[uid] = {"tg_tok": tok, "fname": fname}
+        await msg.reply(
+            f"🗜️ <b>Compress</b>  <code>{fname[:40]}</code>\n\n"
+            "Send target size in <b>MB</b>:\n<code>85</code>  or  <code>200</code>\n\n"
+            "<i>Send /cancel to abort.</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        msg.stop_propagation()
+
+
+# ─────────────────────────────────────────────────────────────
+# Unified MB receiver — handles all compress flows
+# (from video menu, from URL menu, from /compress interactive)
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_message(
+    filters.private & filters.text
+    & ~filters.command([
+        "start", "help", "settings", "info", "status", "log", "restart",
+        "broadcast", "admin", "ban_user", "unban_user", "banned_list",
+        "cancel", "show_thumb", "del_thumb", "json_formatter", "bulk_url",
+        "hardsub", "botname", "ccstatus", "convert", "resize", "compress",
+        "usage", "captiontemplate",
+    ]),
+    group=1,
+)
+async def compress_mb_receiver(client: Client, msg: Message):
+    """Receive the MB value after compress is triggered."""
     uid = msg.from_user.id
     if uid not in _compress_waiting:
         return
-    info = _compress_waiting.get(uid)
-    if not info or "url" not in info or "session_key" in info:
-        return
+
     text = msg.text.strip()
     if not re.match(r"^\d+(\.\d+)?$", text):
+        # Not a number — don't consume, but don't block other handlers either
         return
 
     target_mb = float(text)
     info      = _compress_waiting.pop(uid)
-    url       = info["url"]
-    fname     = info["fname"]
-    st_msg    = info.get("msg")
 
-    tmp = make_tmp(cfg.download_dir, uid)
-    st  = await msg.reply(
-        f"🗜️ <b>Compress</b> → <b>{target_mb:.0f} MB</b>\n"
-        f"<code>{fname}</code>\n⬇️ Downloading…",
-        parse_mode=enums.ParseMode.HTML,
-    )
-    try:
-        if st_msg:
-            try: await st_msg.delete()
-            except Exception: pass
-        from services.downloader import download_direct
-        path = await download_direct(url, tmp)
-        await _do_compress(client, st, path, os.path.basename(path), tmp, target_mb, uid)
-    except Exception as exc:
-        cleanup(tmp)
-        await safe_edit(st, f"❌ Failed: <code>{exc}</code>",
-                        parse_mode=enums.ParseMode.HTML)
+    # ── Source: video menu (session_key) ─────────────────────
+    if "session_key" in info:
+        from core.session import sessions
+        session = sessions.get(info["session_key"])
+        if not session:
+            await msg.reply("❌ Session expired. Send the video again.")
+            msg.stop_propagation()
+            return
+
+        st = await msg.reply(
+            f"🗜️ <b>Compress</b> → <b>{target_mb:.0f} MB</b>\n"
+            f"<code>{session.fname[:40]}</code>\n⬇️ Downloading…",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        tmp = make_tmp(cfg.download_dir, uid)
+        try:
+            from plugins.video import _ensure
+            async with session.lock:
+                path = await _ensure(client, session, st)
+            if not path:
+                cleanup(tmp)
+                msg.stop_propagation()
+                return
+            await _do_compress(client, st, path, session.fname, tmp, target_mb, uid)
+        except Exception as exc:
+            cleanup(tmp)
+            await safe_edit(st, f"❌ Failed: <code>{exc}</code>",
+                            parse_mode=enums.ParseMode.HTML)
+        msg.stop_propagation()
+        return
+
+    # ── Source: URL (from url menu) ───────────────────────────
+    if "url" in info:
+        url   = info["url"]
+        fname = info["fname"]
+        st_msg = info.get("msg")
+        tmp   = make_tmp(cfg.download_dir, uid)
+        st    = await msg.reply(
+            f"🗜️ <b>Compress</b> → <b>{target_mb:.0f} MB</b>\n"
+            f"<code>{fname}</code>\n⬇️ Downloading…",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        try:
+            if st_msg:
+                try: await st_msg.delete()
+                except Exception: pass
+            from services.downloader import download_direct
+            path = await download_direct(url, tmp)
+            await _do_compress(client, st, path, os.path.basename(path), tmp, target_mb, uid)
+        except Exception as exc:
+            cleanup(tmp)
+            await safe_edit(st, f"❌ Failed: <code>{exc}</code>",
+                            parse_mode=enums.ParseMode.HTML)
+        msg.stop_propagation()
+        return
+
+    # ── Source: interactive mode (tg_file token) ──────────────
+    if "tg_tok" in info:
+        tok   = info["tg_tok"]
+        fname = info["fname"]
+        entry = _get_token(tok)
+        if not entry:
+            await msg.reply("❌ Session expired. Send the video again.")
+            msg.stop_propagation()
+            return
+
+        tmp = make_tmp(cfg.download_dir, uid)
+        st  = await msg.reply(
+            f"🗜️ <b>Compress</b> → <b>{target_mb:.0f} MB</b>\n"
+            f"<code>{fname[:40]}</code>\n⬇️ Downloading…",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        try:
+            from services.tg_download import tg_download
+            path = await tg_download(
+                client, entry["file_id"],
+                os.path.join(tmp, fname), st,
+                fname=fname, fsize=entry.get("fsize", 0), user_id=uid,
+            )
+            await _do_compress(client, st, path, fname, tmp, target_mb, uid)
+        except Exception as exc:
+            cleanup(tmp)
+            await safe_edit(st, f"❌ Failed: <code>{exc}</code>",
+                            parse_mode=enums.ParseMode.HTML)
+        msg.stop_propagation()
+        return
+
     msg.stop_propagation()
 
 
@@ -374,8 +492,21 @@ async def rsz_cb(client: Client, cb: CallbackQuery):
                 f"📐 <b>Resize → {height}p</b>\n"
                 f"<code>{fname[:40]}</code>\n⬇️ Downloading…",
                 parse_mode=enums.ParseMode.HTML)
-            path = await download_direct(url, tmp)
+            path  = await download_direct(url, tmp)
             fname = os.path.basename(path)
+
+        elif entry["kind"] == "tg_file":
+            fname = entry["fname"]
+            await safe_edit(cb.message,
+                f"📐 <b>Resize → {height}p</b>\n"
+                f"<code>{fname[:40]}</code>\n⬇️ Downloading…",
+                parse_mode=enums.ParseMode.HTML)
+            from services.tg_download import tg_download
+            path = await tg_download(
+                client, entry["file_id"],
+                os.path.join(tmp, fname), cb.message,
+                fname=fname, fsize=entry.get("fsize", 0), user_id=uid,
+            )
 
         else:  # session
             from core.session import sessions
@@ -386,6 +517,10 @@ async def rsz_cb(client: Client, cb: CallbackQuery):
                 cleanup(tmp)
                 return
             fname = session.fname
+            await safe_edit(cb.message,
+                f"📐 <b>Resize → {height}p</b>\n"
+                f"<code>{fname[:40]}</code>\n⬇️ Downloading…",
+                parse_mode=enums.ParseMode.HTML)
             async with session.lock:
                 path = await _ensure(client, session, cb.message)
             if not path:
@@ -403,13 +538,46 @@ async def rsz_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Core processing — routes through unified task panel
+# URL text receiver for interactive /resize (URL pasted after /resize)
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_message(
+    filters.private & filters.text
+    & ~filters.command([
+        "start", "help", "settings", "cancel", "resize", "compress",
+    ]),
+    group=1,
+)
+async def resize_url_receiver(client: Client, msg: Message):
+    """Catch a URL pasted after /resize (interactive mode)."""
+    uid  = msg.from_user.id
+    mode = _interactive_mode.get(uid)
+    if mode != "resize":
+        return
+
+    text = msg.text.strip()
+    if not text.startswith("http"):
+        return
+
+    _interactive_mode.pop(uid, None)
+    url   = text
+    fname = url.split("/")[-1].split("?")[0][:50] or "video.mkv"
+    tok   = _store_url(url, fname)
+    await msg.reply(
+        f"📐 <b>Resize</b>\n<code>{fname[:45]}</code>\n\nChoose resolution:",
+        reply_markup=resize_resolution_kb(tok),
+        parse_mode=enums.ParseMode.HTML,
+    )
+    msg.stop_propagation()
+
+
+# ─────────────────────────────────────────────────────────────
+# Core processing functions
 # ─────────────────────────────────────────────────────────────
 
 async def _do_resize(
     client, msg, path: str, fname: str, tmp: str, height: int, uid: int
 ) -> None:
-    """Run FFmpeg resize and upload — all progress via task panel."""
     from services.task_runner import tracker, TaskRecord, runner
     from services import ffmpeg as FF
     from services.uploader import upload_file
@@ -418,7 +586,6 @@ async def _do_resize(
     out_fname = f"{name_base}_{height}p.mp4"
     out       = os.path.join(tmp, out_fname)
 
-    # Register as a processing task so it shows in the panel
     tid    = tracker.new_tid()
     record = TaskRecord(
         tid=tid, user_id=uid,
@@ -440,13 +607,11 @@ async def _do_resize(
     fsize = os.path.getsize(out)
     log.info("[Resize] Done: %s → %dp  (%s)", fname, height, human_size(fsize))
 
-    # Delete the "resizing…" status message — panel takes over
     try:
         await msg.delete()
     except Exception:
         pass
 
-    # Fresh upload status message
     st = await client.send_message(
         uid,
         f"📐 <b>Resize done!</b>  {height}p\n"
@@ -461,7 +626,6 @@ async def _do_resize(
 async def _do_compress(
     client, msg, path: str, fname: str, tmp: str, target_mb: float, uid: int
 ) -> None:
-    """Run 2-pass FFmpeg compress and upload — all progress via task panel."""
     from services.task_runner import tracker, TaskRecord, runner
     from services import ffmpeg as FF
     from services.uploader import upload_file
@@ -470,7 +634,6 @@ async def _do_compress(
     out_fname = f"{name_base}_{int(target_mb)}MB.mp4"
     out       = os.path.join(tmp, out_fname)
 
-    # Register as a processing task
     tid    = tracker.new_tid()
     record = TaskRecord(
         tid=tid, user_id=uid,
