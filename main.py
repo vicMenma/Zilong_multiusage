@@ -82,6 +82,14 @@ def build_client() -> Client:
         bot_token=cfg.bot_token,
         plugins={"root": "plugins"},
         workdir="/tmp",
+        # Allow up to 4 concurrent uploads AND downloads inside pyrofork.
+        # Default is 1 — a single Semaphore that serialises ALL file transfers
+        # through pyrofork's save_file / get_file internals.  With MAX_CONCURRENT=5
+        # worker slots, leaving this at 1 means every upload/download waits behind
+        # one semaphore regardless of how many tasks are actually running.
+        # 4 is a safe ceiling: beyond ~4-6 simultaneous DC connections Telegram
+        # starts rate-limiting and the gains disappear.
+        max_concurrent_transmissions=4,
     )
 
 
