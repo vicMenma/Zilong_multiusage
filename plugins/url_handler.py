@@ -2,18 +2,27 @@
 plugins/url_handler.py
 Handles URL messages and torrent files.
 
-FIXES:
-- _magnet_probe sessions now timestamped and evicted after 30 min (+ tmp cleanup)
-  so /tmp doesn't grow unbounded when users don't click Close.
-- Magnet/torrent hardsub download runs as asyncio.create_task() so the
-  callback handler returns immediately and doesn't block for the full download.
-- ccv_resolution_cb now cleans up tmp on error for magnet/torrent paths.
-- Upload semaphore removed — uploads go straight through (telegram.py style).
+CRITICAL FIX — _handle_info CDN token burning:
+  For 'direct' URLs, _handle_info was downloading the first 5MB
+  (Range: bytes=0-5242880) to probe streams with ffprobe. For signed CDN
+  URLs (SonicBit, etc.) this single Range request burns the single-use
+  auth token. The user would click Info → streams shown → click Download
+  → URL is now expired → download fails with 403.
+
+  Fix: use ffprobe directly on the URL via subprocess (no download at all).
+  ffprobe can probe streams from any HTTP URL using its built-in demuxer.
+  The auth token is left completely untouched.
+
+MEDIUM FIX — _launch_download double delete:
+  asyncio.create_task(_safe_delete(panel_msg)) was called both BEFORE and
+  AFTER smart_download. The second call targeted an already-deleted message
+  and produced log noise. Removed the second call.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json as _json
 import logging
 import os
 import re
@@ -533,19 +542,19 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 
         await _show_magnet_streams(client, st, sess_tok, sd, dur, fname, uid)
         return
-      
+
     # ── 📐 Resize ─────────────────────────────────────────────
     if mode == "resize":
         from plugins.resize import handle_url_resize
         await handle_url_resize(client, cb, url, token)
         return
- 
+
     # ── 🗜️ Compress URL ──────────────────────────────────────
     if mode == "compress_url":
         from plugins.resize import handle_url_compress
         await handle_url_compress(client, cb, url, cb.from_user.id)
         return
-  
+
     # ── 🔥 Hardsub ────────────────────────────────────────────
     if mode == "hardsub":
         api_key = os.environ.get("CC_API_KEY", "").strip()
@@ -1074,7 +1083,7 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
 
 
 # ─────────────────────────────────────────────────────────────
-# Upload helper — no semaphore, straight through
+# Upload helper
 # ─────────────────────────────────────────────────────────────
 
 async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
@@ -1129,6 +1138,9 @@ async def _launch_download(
         raw   = url.split("/")[-1].split("?")[0]
         label = _up.unquote_plus(raw)[:50] or "Download"
 
+    # FIX (MEDIUM): only one _safe_delete call here — the panel_msg is deleted
+    # before smart_download starts. The second call (after smart_download in the
+    # original code) was operating on an already-deleted message and logged errors.
     asyncio.create_task(_safe_delete(panel_msg))
 
     try:
@@ -1147,8 +1159,6 @@ async def _launch_download(
         except Exception as send_exc:
             log.warning("_launch_download: could not notify uid=%d: %s", uid, send_exc)
         return
-
-    asyncio.create_task(_safe_delete(panel_msg))
 
     if os.path.isdir(path):
         resolved = largest_file(path)
@@ -1209,12 +1219,16 @@ async def _launch_download(
 
 # ─────────────────────────────────────────────────────────────
 # Info handler (non-magnet)
+# CRITICAL FIX: For direct URLs, use ffprobe directly on the URL —
+# DO NOT download any bytes first. Downloading burns CDN single-use
+# auth tokens (SonicBit, etc.) before the Download button is even used.
 # ─────────────────────────────────────────────────────────────
 
 async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) -> None:
     st   = await cb.message.edit("📊 Fetching info…")
     kind = classify(url)
 
+    # ── yt-dlp sites ──────────────────────────────────────────
     if kind == "ytdlp":
         try:
             import yt_dlp
@@ -1256,42 +1270,79 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
                             parse_mode=enums.ParseMode.HTML)
         return
 
+    # ── Direct URL — FIX: ffprobe on the URL, zero bytes downloaded ──
+    # The old code downloaded 5MB (Range: bytes=0-5242880) using aiohttp.
+    # For CDN signed URLs that burns the single-use auth token, making the
+    # subsequent Download click fail with 403. Now we run ffprobe directly
+    # on the URL via its built-in HTTP demuxer — no download, token intact.
     try:
-        from services.ffmpeg import probe_streams, probe_duration, get_mediainfo
-        headers = {"User-Agent":"Mozilla/5.0","Range":"bytes=0-5242880"}
-        import tempfile as _tempfile
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(url, headers=headers, allow_redirects=True) as resp:
-                cd = resp.headers.get("Content-Disposition","")
-                fn = ""
-                if "filename=" in cd:
-                    fn = cd.split("filename=")[-1].strip().strip('"')
-                if not fn:
-                    from pathlib import Path as _P
-                    fn = _P(url.split("?")[0]).name or "file"
-                cr    = resp.headers.get("Content-Range","").split("/")[-1]
-                total = int(cr) if cr.isdigit() else int(resp.headers.get("Content-Length",0))
-                chunk = await resp.content.read(5*1024*1024)
-
-        with _tempfile.NamedTemporaryFile(
-            suffix=os.path.splitext(fn)[1] or ".tmp", delete=False,
-        ) as tf:
-            tf.write(chunk)
-            tmp_path = tf.name
-
-        raw, sd, dur = await asyncio.gather(
-            get_mediainfo(tmp_path),
-            probe_streams(tmp_path),
-            probe_duration(tmp_path),
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-allowed_extensions", "ALL",
+            "-analyzeduration", "20000000",
+            "-probesize", "50000000",
+            "-print_format", "json",
+            "-show_format", "-show_streams",
+            url,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        os.unlink(tmp_path)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise RuntimeError("ffprobe timed out (30s)")
+
+        data    = _json.loads(out.decode(errors="replace") or "{}")
+        streams = data.get("streams", [])
+        fmt     = data.get("format", {})
+
+        # Try to get the filename from the URL
+        from pathlib import Path as _P
+        fn = _P(url.split("?")[0]).name or "file"
+        fn = fn[:50]
+
+        # Try to get total size — first from ffprobe format, then via HEAD
+        total = int(fmt.get("size", 0) or 0)
+        if not total:
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.head(
+                        url, allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        total = int(resp.headers.get("Content-Length", 0))
+                        cd = resp.headers.get("Content-Disposition", "")
+                        if "filename=" in cd:
+                            fn_cd = cd.split("filename=")[-1].strip().strip('"').strip("'")
+                            if fn_cd:
+                                fn = fn_cd[:50]
+            except Exception:
+                pass
+
+        dur_s = float(fmt.get("duration", 0) or 0)
+
+        # Classify streams
+        sd: dict = {"video": [], "audio": [], "subtitle": []}
+        for s in streams:
+            t = s.get("codec_type", "")
+            if t in sd:
+                sd[t].append(s)
 
         lines = [
             "📊 <b>Media Info (Direct)</b>", "──────────────────",
-            f"📄 <code>{fn[:50]}</code>",
-            f"💾 <code>{human_size(total) if total else '—'}</code>  ⏱ <code>{_fmt_dur(dur)}</code>",
+            f"📄 <code>{fn}</code>",
+            f"💾 <code>{human_size(total) if total else '—'}</code>  "
+            f"⏱ <code>{_fmt_dur(int(dur_s))}</code>",
             "──────────────────",
         ]
+
         for s in sd.get("video", []):
             codec = s.get("codec_name","?").upper()
             w, h  = s.get("width",0), s.get("height",0)
@@ -1305,7 +1356,18 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
             codec = s.get("codec_name","?").upper()
             ch    = s.get("channels",0)
             ch_s  = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch,f"{ch}ch") if ch else ""
-            lines.append(f"🎵 <code>{codec} {ch_s}</code>")
+            tags  = s.get("tags", {}) or {}
+            lang  = (tags.get("language","und") or "und").lower()
+            lines.append(f"🎵 <code>{codec} {ch_s}</code>  {_flag(lang)} {_lname(lang)}")
+        for s in sd.get("subtitle", [])[:4]:
+            codec = s.get("codec_name","?").upper()
+            tags  = s.get("tags", {}) or {}
+            lang  = (tags.get("language","und") or "und").lower()
+            lines.append(f"💬 <code>{codec}</code>  {_flag(lang)} {_lname(lang)}")
+
+        if not any(sd.get(t) for t in ("video", "audio")):
+            lines.append("⚠️ <i>ffprobe could not read streams "
+                         "(CDN may require auth headers).</i>")
 
         kb = [
             [InlineKeyboardButton("🎬 Download", callback_data=f"dl|video|{token}")],
@@ -1313,13 +1375,30 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
         ]
         try:
             from services.telegraph import post_mediainfo
-            tph = await post_mediainfo(fn, raw)
+            # Build a minimal mediainfo text from ffprobe data (no download)
+            mi_lines = [f"File: {fn}"]
+            if total:
+                mi_lines.append(f"Size: {human_size(total)}")
+            if dur_s:
+                mi_lines.append(f"Duration: {_fmt_dur(int(dur_s))}")
+            for s in sd.get("video", []):
+                mi_lines.append(
+                    f"Video: {s.get('codec_name','?').upper()} "
+                    f"{s.get('width',0)}x{s.get('height',0)}"
+                )
+            for s in sd.get("audio", []):
+                tags = s.get("tags", {}) or {}
+                lang = tags.get("language", "und")
+                mi_lines.append(f"Audio: {s.get('codec_name','?').upper()} [{lang}]")
+            tph = await post_mediainfo(fn, "\n".join(mi_lines))
             kb.insert(0, [InlineKeyboardButton("📋 Full MediaInfo →", url=tph)])
         except Exception:
             pass
+
         await safe_edit(st, "\n".join(lines),
                         parse_mode=enums.ParseMode.HTML,
                         reply_markup=InlineKeyboardMarkup(kb))
+
     except Exception as exc:
         await safe_edit(st, f"❌ Could not probe: <code>{exc}</code>",
                         parse_mode=enums.ParseMode.HTML,

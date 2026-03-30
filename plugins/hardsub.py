@@ -2,8 +2,16 @@
 plugins/hardsub.py
 CloudConvert-powered hardsubbing — batch multi-video support.
 
-Quality selection REMOVED — always uses CloudConvert default settings
-(scale_height=0 means original resolution is preserved server-side).
+CRITICAL FIX: _submit_one_job was calling cc_job_store.add() to register
+the job but NEVER calling _ensure_poller() afterwards. The ccstatus poller
+stops itself after 3 consecutive idle cycles (by design). If the poller had
+stopped before the user clicked /hardsub, the job would sit in cc_job_store
+forever — the poller never woke up to check it, and the file was never
+delivered. Users would see the job submitted but receive nothing.
+
+Fix: call _ensure_poller() immediately after cc_job_store.add() in
+_submit_one_job. _ensure_poller() is idempotent — if the poller is already
+running it's a no-op, and if it stopped it restarts it.
 """
 from __future__ import annotations
 
@@ -90,7 +98,7 @@ def _more_or_done_kb(uid: int, count: int) -> InlineKeyboardMarkup:
 
 
 # ─────────────────────────────────────────────────────────────
-# Submit one hardsub job (always original resolution)
+# Submit one hardsub job
 # ─────────────────────────────────────────────────────────────
 
 async def _submit_one_job(
@@ -101,7 +109,6 @@ async def _submit_one_job(
     uid: int,
 ) -> tuple[str, str, bool]:
     from services.cloudconvert_api import submit_hardsub
-    # FIX: import the job store so we can register the job for the poller
     from services.cc_job_store import cc_job_store, CCJob
 
     video_fname = video.get("fname", "video.mkv")
@@ -118,10 +125,7 @@ async def _submit_one_job(
             scale_height=0,  # Always use original resolution
         )
 
-        # FIX (CRITICAL): register the job in cc_job_store so that:
-        #   1. ccstatus poller picks it up via active_jobs() and polls CC API
-        #   2. /ccstatus command shows the job to the user
-        #   3. _deliver_job() is called when the job finishes
+        # Register job in cc_job_store so ccstatus poller picks it up
         await cc_job_store.add(CCJob(
             job_id=job_id,
             uid=uid,
@@ -131,6 +135,18 @@ async def _submit_one_job(
             status="processing",
         ))
         log.info("[Hardsub] Registered job %s in cc_job_store for uid=%d", job_id, uid)
+
+        # FIX (CRITICAL): ensure the ccstatus poller is running.
+        # The poller stops after 3 idle cycles. If it had stopped before this
+        # job was submitted, the job would sit in cc_job_store forever and
+        # the user would never receive their file. _ensure_poller() is
+        # idempotent — safe to call even when the poller is already running.
+        try:
+            from plugins.ccstatus import _ensure_poller
+            _ensure_poller()
+            log.info("[Hardsub] ccstatus poller ensured for job %s", job_id)
+        except Exception as _pe:
+            log.warning("[Hardsub] Could not start ccstatus poller: %s", _pe)
 
         return video_fname, job_id, True
     except Exception as exc:
@@ -498,7 +514,6 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
         msg.stop_propagation()
         return
 
-    # Go straight to batch submission — no resolution picker
     await _submit_batch(st, state, uid)
     msg.stop_propagation()
 
@@ -564,5 +579,4 @@ async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) ->
         _clear(uid)
         return
 
-    # Go straight to batch submission — no resolution picker
     await _submit_batch(st, state, uid)
