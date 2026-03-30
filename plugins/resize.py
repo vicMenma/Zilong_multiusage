@@ -216,29 +216,58 @@ async def resize_compress_file_receiver(client: Client, msg: Message):
     msg.stop_propagation()
 
 
-# Receive target MB text for compress flow
+# Receive text input for resize (URL) and compress (URL or target MB)
+# Must be group=1 to run before url_handler (group=5) and media_router (group=3)
 @Client.on_message(
     filters.private & filters.text
     & ~filters.command(["resize", "compress", "cancel"]),
     group=1,
 )
-async def compress_mb_receiver(client: Client, msg: Message):
-    uid   = msg.from_user.id
-    state = _COMPRESS_STATE.get(uid)
-    if not state or not state.get("path") or state.get("target_mb"):
-        return
-
+async def resize_compress_text_receiver(client: Client, msg: Message):
+    uid  = msg.from_user.id
     text = msg.text.strip()
-    if not re.match(r"^\d+(\.\d+)?$", text):
+
+    in_rs = uid in _RESIZE_STATE   and _RESIZE_STATE[uid].get("url")   is None and _RESIZE_STATE[uid].get("path")   is None
+    in_cp = uid in _COMPRESS_STATE and _COMPRESS_STATE[uid].get("path") is None and not _COMPRESS_STATE[uid].get("target_mb")
+
+    # ── Resize: waiting for a URL ─────────────────────────────
+    if in_rs and re.match(r"^https?://\S+$", text, re.I):
+        fname = text.split("/")[-1].split("?")[0][:50] or "video.mkv"
+        tmp   = make_tmp(cfg.download_dir, uid)
+        _RESIZE_STATE[uid].update(url=text, fname=fname, tmp=tmp)
+        await msg.reply(
+            f"✅ <b>URL received</b>\n<code>{fname[:40]}</code>\n\nChoose target resolution:",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=_resize_kb(uid),
+        )
+        msg.stop_propagation()
         return
 
-    state["target_mb"] = float(text)
-    st = await msg.reply(
-        f"🗜️ <b>Compressing to {state['target_mb']:.0f} MB…</b>",
-        parse_mode=enums.ParseMode.HTML,
-    )
-    await _run_compress(client, st, uid)
-    msg.stop_propagation()
+    # ── Compress: waiting for a URL ───────────────────────────
+    if in_cp and re.match(r"^https?://\S+$", text, re.I):
+        fname = text.split("/")[-1].split("?")[0][:50] or "video.mkv"
+        tmp   = make_tmp(cfg.download_dir, uid)
+        _COMPRESS_STATE[uid].update(url=text, fname=fname, tmp=tmp)
+        await msg.reply(
+            f"✅ <b>URL received</b>\n<code>{fname[:40]}</code>\n\nNow reply with the target size in MB:\n<code>50</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        msg.stop_propagation()
+        return
+
+    # ── Compress: waiting for target MB (after file or URL) ───
+    state = _COMPRESS_STATE.get(uid)
+    if state and (state.get("path") or state.get("url")) and not state.get("target_mb"):
+        if not re.match(r"^\d+(\.\d+)?$", text):
+            return
+        state["target_mb"] = float(text)
+        st = await msg.reply(
+            f"🗜️ <b>Compressing to {state['target_mb']:.0f} MB…</b>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        await _run_compress(client, st, uid)
+        msg.stop_propagation()
+        return
 
 
 # ─────────────────────────────────────────────────────────────
