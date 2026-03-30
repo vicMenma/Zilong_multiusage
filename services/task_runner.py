@@ -2,13 +2,18 @@
 services/task_runner.py
 Global task registry + unified live progress panel.
 
-New in this version:
-  - Panel redesigned to match compact table layout (mobile-friendly)
-  - Speed tiers: 🚀 MAX / ⚡ FAST / ✅ OK / 🐢 SLOW
-  - Per-task cancel buttons + Cancel All in panel keyboard
-  - runner.cancel_task(tid) / runner.cancel_all(uid)
-  - _task_handles dict stores asyncio.Task per tid for real cancellation
-  - render_panel_kb() returns inline keyboard with cancel + refresh
+Panel redesigned to match compact terminal style (image 4):
+  ⚡ BOTNAME  ↓ 38.4 MiB/s  ↑ 290 KiB/s
+  ────────────────────────────────
+  ↓  Dungeon Meshi S2...    ⚡ 12.3 MiB/s
+     █████████████░░░░░░░   68%   1m 12s
+
+  ↑  Frieren Beyond...      ⚡ 9.8 MiB/s
+     ████░░░░░░░░░░░░░░░░   21%   4m 33s
+
+  🕐  Shangri-La...      queued
+  ────────────────────────────────
+  💻 87%  🧠 23%  💾 84.8G  📋 3/5
 """
 from __future__ import annotations
 
@@ -181,28 +186,20 @@ tracker = GlobalTracker()
 
 
 # ─────────────────────────────────────────────────────────────
-# Panel renderer — compact table design (mobile-friendly)
+# Panel renderer — compact terminal design matching image 4
 # ─────────────────────────────────────────────────────────────
 
-def _prog_bar(pct: float, cells: int = 12) -> str:
-    filled = round(pct / 100 * cells)
-    return "█" * filled + "░" * (cells - filled)
+def _bar(pct: float, w: int = 20) -> str:
+    filled = round(min(max(pct, 0), 100) / 100 * w)
+    return "█" * filled + "░" * (w - filled)
 
 
-def _speed_tier(bps: float) -> str:
-    """Return speed tier label + emoji matching the screenshot style."""
-    mbs = bps / (1024 * 1024)
-    if mbs >= 5:    return "🚀 MAX"
-    if mbs >= 1:    return "⚡ FAST"
-    if mbs >= 0.3:  return "✅ OK"
-    return "🐢 SLOW"
-
-
-def _net_status(dl: float, ul: float) -> str:
-    mbs = (dl + ul) / (1024 * 1024)
-    if mbs > 2:   return "🌐 STABLE"
-    if mbs > 0.1: return "🌐 OK"
-    return "🌐 IDLE"
+def _compact_disk(n: float) -> str:
+    """Return compact size: '84.8G', '512M', '1.2T'."""
+    for div, sym in ((1024**4, "T"), (1024**3, "G"), (1024**2, "M"), (1024, "K")):
+        if n >= div:
+            return f"{n / div:.1f}{sym}"
+    return f"{int(n)}B"
 
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
@@ -213,88 +210,77 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     active = [t for t in tasks if not t.is_terminal]
     done   = [t for t in tasks if t.is_terminal]
 
-    stats    = _stats_cache
-    cpu      = float(stats.get("cpu", 0.0))
-    ram_pct  = float(stats.get("ram_pct", 0.0))
-    disk_free= int(stats.get("disk_free", 0))
-    dl_speed = float(stats.get("dl_speed", 0.0))
-    ul_speed = float(stats.get("ul_speed", 0.0))
+    stats     = _stats_cache
+    cpu       = float(stats.get("cpu", 0.0))
+    ram_pct   = float(stats.get("ram_pct", 0.0))
+    disk_free = int(stats.get("disk_free", 0))
+    dl_speed  = float(stats.get("dl_speed", 0.0))
+    ul_speed  = float(stats.get("ul_speed", 0.0))
+    bot_name  = get_bot_name().upper()
 
-    bot_name   = get_bot_name().upper()
-    n_active   = len(active)
-    load_label = f"⚙️ {cpu:.0f}% LOAD"
-
-    # ── Header ────────────────────────────────────────────────
+    # ── Header ─────────────────────────────────────────────────
     lines: list[str] = [
         f"⚡ <b>{bot_name}</b>  "
-        f"🌐 ↓{human_size(dl_speed)}/s ↑{human_size(ul_speed)}/s",
-        f"📦 <b>{n_active} ACTIVE</b>  |  {load_label}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"↓ <code>{human_size(dl_speed)}/s</code>  "
+        f"↑ <code>{human_size(ul_speed)}/s</code>",
+        "────────────────────────────────",
+        "",
     ]
 
-    if not active:
+    display = active + done[-3:]   # active + last 3 completed
+
+    if not display:
+        lines.append("<i>No tasks — idle.</i>")
         lines.append("")
-        lines.append("<i>No active tasks — idle.</i>")
     else:
-        for t in active:
-            pct      = t.pct()
-            bar      = _prog_bar(pct)
-            elapsed  = human_dur(int(t.elapsed)) if t.elapsed else "0s"
-            fname    = t.fname or t.label
-            fname_s  = (fname[:32] + "…") if len(fname) > 32 else fname
-            mode_ico = t.mode_icon
+        for t in display:
+            fname   = t.fname or t.label
+            fname_s = (fname[:35] + "…") if len(fname) > 35 else fname
 
-            lines.append("")
-            lines.append(f"<b>#{t.seq}</b>  {fname_s}  {mode_ico}")
+            # Direction arrow
+            arrow = "↑" if t.mode == "ul" else ("⚙" if t.mode == "proc" else "↓")
 
-            if t.state.startswith("⏳"):
-                lines.append(f"   ⏳ Queued — waiting for slot")
-                continue
+            if t.state.startswith("✅"):
+                lines.append(f"{arrow}  <code>{fname_s}</code>  ✅")
+                lines.append(f"   <code>{'█' * 20}</code>  100%")
 
-            if t.meta_phase:
-                lines.append(f"   🔍 Fetching metadata…  <code>{elapsed}</code>")
-                continue
+            elif t.state.startswith("❌"):
+                lines.append(f"{arrow}  <code>{fname_s}</code>  ❌")
+                short_err = t.state[2:].strip()[:35]
+                if short_err:
+                    lines.append(f"   <i>{short_err}</i>")
 
-            spd_s  = human_size(t.speed) + "/s" if t.speed else "—"
-            eta_s  = human_dur(t.eta) if t.eta > 0 else "—"
-            tier   = _speed_tier(t.speed) if t.speed else "⏳ Starting"
+            elif t.state == "⏳ Queued":
+                lines.append(f"🕐  <code>{fname_s}</code>      queued")
 
-            lines.append(
-                f"   {tier}  ·  <code>{spd_s}</code>  ·  ETA <code>{eta_s}</code>"
-            )
-            lines.append(
-                f"   <code>{bar}</code>  <b>{pct:.0f}%</b>"
-            )
-            if t.total:
+            elif t.meta_phase:
+                lines.append(f"{arrow}  <code>{fname_s}</code>")
+                lines.append(f"   🔍 <i>Fetching metadata…</i>")
+
+            else:
+                pct   = t.pct()
+                spd_s = f"{human_size(t.speed)}/s" if t.speed else "…"
+                eta_s = human_dur(t.eta) if t.eta > 0 else ""
+
                 lines.append(
-                    f"   <code>{human_size(t.done)}</code> / "
-                    f"<code>{human_size(t.total)}</code>"
-                    f"  ·  <i>{elapsed}</i>"
+                    f"{arrow}  <code>{fname_s}</code>    ⚡ <code>{spd_s}</code>"
                 )
+                if eta_s:
+                    lines.append(f"   <code>{_bar(pct)}</code>  {pct:.0f}%   {eta_s}")
+                else:
+                    lines.append(f"   <code>{_bar(pct)}</code>  {pct:.0f}%")
 
-    # ── Recently finished (last 3) ────────────────────────────
-    recent = [t for t in done[-3:]]
-    if recent:
-        lines += ["", "─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─"]
-        for t in recent:
-            fname_s = (t.fname or t.label)[:30]
-            dur_s   = human_dur(int(t.elapsed)) if t.elapsed else "—"
-            lines.append(f"{t.state}  <code>{fname_s}</code>  <i>{dur_s}</i>")
+            lines.append("")   # blank line between tasks
 
-    # ── Footer ────────────────────────────────────────────────
-    disk_s    = human_size(disk_free) if disk_free else "—"
-    net_s     = _net_status(dl_speed, ul_speed)
-    slots_free = MAX_CONCURRENT - sum(
-        1 for t in active
-        if t.mode in ("dl", "proc", "magnet") and not t.state.startswith("⏳")
-    )
+    # ── Footer ─────────────────────────────────────────────────
+    slots_used = sum(1 for t in active if not t.state.startswith("⏳"))
+
     lines += [
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"💻 <b>CPU</b> {cpu:.0f}%  "
-        f"🧠 <b>RAM</b> {ram_pct:.0f}%  "
-        f"💾 <code>{disk_s}</code>",
-        f"{net_s}  |  🎰 <b>Slots</b> {slots_free}/{MAX_CONCURRENT}",
+        "────────────────────────────────",
+        f"💻 <code>{cpu:.0f}%</code>  "
+        f"🧠 <code>{ram_pct:.0f}%</code>  "
+        f"💾 <code>{_compact_disk(disk_free)}</code>  "
+        f"📋 <code>{slots_used}/{MAX_CONCURRENT}</code>",
     ]
 
     return "\n".join(lines)
