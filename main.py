@@ -237,10 +237,52 @@ async def main() -> None:
     bot_name = get_bot_name()
     log.info("🤖 Bot name: %s", bot_name.upper())
 
+    # ── Keep-alive health server (replaces JS click hack) ──────
+    # Starts an HTTP server on port 8080 and exposes it via ngrok.
+    # Point UptimeRobot at the printed URL to keep Colab alive 24/7.
+    # Falls back gracefully if no NGROK_TOKEN is set.
+    keepalive_url = ""
+    try:
+        from services.keep_alive import start as _ka_start
+        keepalive_url = await _ka_start(
+            port=8080,
+            ngrok_token=cfg.ngrok_token,
+        )
+        if keepalive_url:
+            log.info("🏥 Keep-alive URL: %s", keepalive_url)
+            try:
+                await client.send_message(
+                    cfg.owner_id,
+                    f"🏥 <b>Keep-Alive Active</b>\n"
+                    f"──────────────────────\n\n"
+                    f"🌐 <b>URL:</b>\n<code>{keepalive_url}/health</code>\n\n"
+                    f"<b>Add to UptimeRobot (free):</b>\n"
+                    f"1. uptimerobot.com → Add New Monitor\n"
+                    f"2. Type: <b>HTTP(s)</b>\n"
+                    f"3. URL: <code>{keepalive_url}/health</code>\n"
+                    f"4. Interval: <b>5 minutes</b>\n"
+                    f"5. Save ✅\n\n"
+                    f"<i>Colab will stay alive as long as UptimeRobot pings.</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+        else:
+            log.info("🏥 Health server on localhost:8080 (no public URL — set NGROK_TOKEN)")
+    except Exception as exc:
+        log.warning("Keep-alive server failed to start: %s", exc)
+
     log.info("📡 Bot is running. Press Ctrl+C to stop.")
     await idle()
 
     log.info("👋 Shutting down…")
+    # Stop keep-alive server
+    try:
+        from services.keep_alive import stop as _ka_stop
+        await _ka_stop()
+    except Exception:
+        pass
     if has_webhook_config or cfg.cc_api_key:
         try:
             from services.cloudconvert_hook import stop_webhook_server
