@@ -247,7 +247,7 @@ async def probe_duration(path: str) -> int:
 
 
 # ─────────────────────────────────────────────────────────────
-# Thumbnail extraction
+# Thumbnail extraction — PATCHED for high quality
 # ─────────────────────────────────────────────────────────────
 
 def _jpeg_brightness(path: str) -> float:
@@ -293,8 +293,8 @@ async def get_thumb(path: str, out_path: str) -> Optional[str]:
                 "ffmpeg", "-y",
                 "-ss", str(ts), "-i", path,
                 "-frames:v", "1",
-                "-vf", "scale=320:-2",
-                "-q:v", "2",
+                "-vf", "scale='min(1280,iw)':-2",   # PATCH: was scale=320:-2
+                "-q:v", "1",                         # PATCH: was -q:v 2 (1=best quality)
                 out_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
@@ -336,7 +336,6 @@ async def video_meta(path: str) -> dict:
     ])
     if data:
         for s in data.get("streams", []):
-            # Skip non-video streams — this is the key fix
             if s.get("codec_type") != "video":
                 continue
             meta["width"]  = int(s.get("width", 0) or 0)
@@ -348,7 +347,7 @@ async def video_meta(path: str) -> dict:
                 meta["duration"] = int(float(s.get("duration", 0) or 0))
             except (ValueError, TypeError):
                 pass
-            break  # only need the first video stream
+            break
         fmt = data.get("format", {})
         if not meta["duration"] and fmt.get("duration"):
             try:
@@ -472,8 +471,6 @@ async def extract_subtitle(inp: str, out: str, stream_index: int = 0) -> None:
     await _run(["ffmpeg","-y","-i",inp,"-map",f"0:s:{stream_index}",out], "ExtractSub")
 
 async def merge_av(video: str, audio: str, out: str) -> None:
-    # Try stream-copy first (fast, lossless). Fall back to AAC transcode if
-    # the muxer rejects the audio codec (e.g. mixing Opus/DTS into MP4).
     try:
         await _run([
             "ffmpeg", "-y", "-i", video, "-i", audio,
@@ -502,7 +499,6 @@ async def burn_subtitle(video: str, sub: str, out: str) -> None:
 
 
 async def trim_video(inp: str, out: str, start: str, end: str) -> None:
-    """Frame-accurate trim — -ss after -i, -to for absolute end."""
     await _run([
         "ffmpeg","-y",
         "-i", inp,
@@ -513,7 +509,6 @@ async def trim_video(inp: str, out: str, start: str, end: str) -> None:
 
 
 async def trim_video_fast(inp: str, out: str, start_sec: float, duration_sec: float) -> None:
-    """Fast keyframe-seek trim — -ss before -i, -t is duration."""
     await _run([
         "ffmpeg","-y",
         "-ss", str(start_sec),
@@ -641,9 +636,6 @@ async def optimize(inp: str, out: str, crf: int = 23) -> None:
 
 
 async def convert_video(inp: str, out: str) -> None:
-    # If the source is already H.264 with AAC audio (common remux case, e.g. MKV→MP4),
-    # try a fast stream-copy first. Fall back to full re-encode if the container
-    # rejects it (e.g. AVI→MP4 with incompatible bitstream).
     try:
         await _run([
             "ffmpeg", "-y", "-i", inp,
