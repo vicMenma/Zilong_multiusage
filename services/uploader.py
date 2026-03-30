@@ -2,15 +2,13 @@
 services/uploader.py
 Upload a local file to Telegram.
 
-Style mirrors telegram.py exactly:
-  - progress() defined inline with %, speed, ETA bar
-  - direct send_video / send_audio / send_photo / send_document call
-  - FloodWait → sleep → recursive retry
-  - no semaphores, no upload concurrency gates, no task tracking
-  - thumbnail: ffprobe duration → ffmpeg seek → jpg
-  - video width / height / duration from one ffprobe pass
-  - file-stability guard (.aria2 sentinel)
-  - cfg.log_channel forward after send
+Progress is now routed through the unified task panel (same as downloads):
+  - Creates a TaskRecord(mode="ul", engine="telegram")
+  - tracker.register() → auto_panel() → render_panel() handles all display
+  - `msg` (the "📤 Uploading…" placeholder) is dismissed at the very start
+    so the panel is the single source of truth for upload status
+  - FloodWait handled with a retry loop (no recursion, no stack growth)
+  - On error a fresh client.send_message() is used (msg is already gone)
 """
 from __future__ import annotations
 
@@ -71,7 +69,7 @@ def _build_caption(fname: str, custom: str, is_last: bool) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# Wait for aria2 to finish writing (aria2 keeps a .aria2 sidecar)
+# Wait for aria2 to finish writing
 # ─────────────────────────────────────────────────────────────
 
 async def _wait_stable(path: str, timeout: int = 30) -> None:
@@ -184,15 +182,21 @@ async def upload_file(
     caption:        str        = "",
     thumb:          str | None = None,
     force_document: bool       = False,
-    task_record                = None,   # accepted but ignored — kept for API compat
+    task_record                = None,   # kept for API compat — not used
     is_last:        bool       = False,
 ) -> None:
     """
-    Upload one file.  Mirrors telegram.py style:
-      - inline progress bar (%, speed, ETA)
-      - direct send_* per type
-      - FloodWait → sleep → retry (recursive)
-      - no semaphores, no concurrency gates
+    Upload one file through the unified progress panel.
+
+    The panel (render_panel) shows upload progress identically to downloads:
+      📤 Uploading  |  Name  |  Progress bar  |  Speed  |  ETA
+
+    Flow:
+      1. Dismiss the placeholder `msg` immediately (panel takes over)
+      2. Register a TaskRecord(mode="ul") → triggers auto_panel()
+      3. Pyrogram progress callback updates the record → panel refreshes
+      4. On FloodWait: retry loop (no recursion)
+      5. On error: send a fresh message to chat_id (msg is already deleted)
     """
     if not os.path.isfile(path):
         await safe_edit(
@@ -210,9 +214,9 @@ async def upload_file(
     ftype     = _file_type(path, force_document)
     cap       = _build_caption(fname, caption, is_last)
 
-    # ── Video: get width / height / duration ───────────────────
+    # ── Video: width / height / duration ──────────────────────
     meta       = {"duration": 0, "width": 0, "height": 0}
-    auto_thumb : str | None = None
+    auto_thumb: str | None = None
 
     if ftype == "video":
         meta = await _video_meta(path)
@@ -225,118 +229,130 @@ async def upload_file(
             if is_temp:
                 auto_thumb = t
 
+    # ── Dismiss placeholder — panel takes over display ─────────
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    # ── Register upload in unified task tracker ────────────────
+    from services.task_runner import tracker, TaskRecord, runner
+
+    tid    = tracker.new_tid()
+    record = TaskRecord(
+        tid=tid, user_id=chat_id,
+        label=fname, mode="ul", engine="telegram",
+        fname=fname, total=file_size,
+        state="📤 Uploading",
+    )
+    await tracker.register(record)
+
+    task_start = time.time()
+
+    async def progress(current: int, total: int) -> None:
+        elapsed = time.time() - task_start
+        speed   = current / elapsed if elapsed > 0 else 0
+        eta     = int((total - current) / speed) if speed > 0 else 0
+        record.update(
+            done=current, total=total or file_size,
+            speed=speed, eta=eta, elapsed=elapsed,
+            state="📤 Uploading",
+        )
+        runner._wake_panel(chat_id)
+
     log.info("⬆ %s  [%s]  %s  dur=%ds  %dx%d",
              fname, ftype, human_size(file_size),
              meta["duration"], meta["width"], meta["height"])
 
-    # ── Progress callback — telegram.py style ─────────────────
-    task_start = time.time()
-    last_edit  = [task_start]
+    # ── Send — retry loop for FloodWait (no recursion) ────────
+    sent  = None
+    error = None
 
-    async def progress(current: int, total: int) -> None:
-        now = time.time()
-        if now - last_edit[0] < 0.5:
-            return
-        last_edit[0] = now
-
-        elapsed = now - task_start
-        speed   = current / elapsed if elapsed > 0 else 0
-        eta     = int((total - current) / speed) if speed > 0 else 0
-        pct     = current / total * 100 if total else 0
-        filled  = int(pct / 10)
-        bar     = "█" * filled + "░" * (10 - filled)
-
-        await safe_edit(
-            msg,
-            f"📤 <b>Uploading…</b>\n"
-            f"<code>[{bar}]</code> <b>{pct:.1f}%</b>\n"
-            f"🔥 <code>{human_size(speed)}/s</code>   "
-            f"⏳ <code>{eta}s</code>\n"
-            f"✅ <code>{human_size(current)}</code> / "
-            f"<code>{human_size(total)}</code>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-
-    # ── Send — one branch per type, mirrors telegram.py ───────
-    try:
-        common = dict(
-            caption    = cap,
-            thumb      = thumb,
-            parse_mode = enums.ParseMode.HTML,
-            progress   = progress,
-        )
-
-        if ftype == "video":
-            sent = await client.send_video(
-                chat_id, path,
-                supports_streaming = True,
-                width              = meta["width"],
-                height             = meta["height"],
-                duration           = meta["duration"],
-                **common,
-            )
-
-        elif ftype == "audio":
-            sent = await client.send_audio(chat_id, path, **common)
-
-        elif ftype == "photo":
-            sent = await client.send_photo(
-                chat_id, path,
+    for attempt in range(4):
+        try:
+            common = dict(
                 caption    = cap,
+                thumb      = thumb,
                 parse_mode = enums.ParseMode.HTML,
                 progress   = progress,
             )
 
-        else:  # document
-            sent = await client.send_document(
-                chat_id, path,
-                force_document = True,
-                **common,
-            )
+            if ftype == "video":
+                sent = await client.send_video(
+                    chat_id, path,
+                    supports_streaming = True,
+                    width              = meta["width"],
+                    height             = meta["height"],
+                    duration           = meta["duration"],
+                    **common,
+                )
+            elif ftype == "audio":
+                sent = await client.send_audio(chat_id, path, **common)
+            elif ftype == "photo":
+                sent = await client.send_photo(
+                    chat_id, path,
+                    caption    = cap,
+                    parse_mode = enums.ParseMode.HTML,
+                    progress   = progress,
+                )
+            else:
+                sent = await client.send_document(
+                    chat_id, path,
+                    force_document = True,
+                    **common,
+                )
 
-        # Delete the progress status message
-        try:
-            await msg.delete()
-        except Exception:
-            pass
+            error = None
+            break  # success
 
-        # Forward to log channel if configured
-        if cfg.log_channel and sent:
+        except FloodWait as fw:
+            wait = min(fw.value + 5, 120)
+            log.warning("FloodWait %ds on upload attempt %d — sleeping", wait, attempt + 1)
+            await asyncio.sleep(wait)
+
+        except Exception as exc:
+            error = exc
+            break
+
+    # ── Post-send bookkeeping ──────────────────────────────────
+    if error is not None:
+        record.update(state="❌ Failed")
+        runner._wake_panel(chat_id, immediate=True)
+        if "MESSAGE_NOT_MODIFIED" not in str(error):
+            log.error("Upload error %s: %s", fname, error)
             try:
-                await sent.forward(cfg.log_channel)
+                await client.send_message(
+                    chat_id,
+                    f"❌ Upload failed: <code>{error}</code>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
             except Exception:
                 pass
-
-        elapsed = time.time() - task_start
-        log.info("✅ Done: %s  %s/s  %.1fs",
-                 fname,
-                 human_size(file_size / elapsed) if elapsed else "—",
-                 elapsed)
-
-    except FloodWait as fw:
-        # Honour Telegram's wait, cap at 120 s — then retry exactly like telegram.py
-        wait = min(fw.value, 120)
-        log.warning("FloodWait %ds — sleeping", wait)
-        await asyncio.sleep(wait)
-        await upload_file(
-            client, msg, path,
-            caption=caption, thumb=thumb,
-            force_document=force_document, is_last=is_last,
-        )
-
-    except Exception as exc:
-        if "MESSAGE_NOT_MODIFIED" not in str(exc):
-            log.error("Upload error %s: %s", fname, exc)
-            await safe_edit(
-                msg,
-                f"❌ Upload failed: <code>{exc}</code>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-        raise
-
-    finally:
         if auto_thumb and os.path.isfile(auto_thumb):
             try:
                 os.remove(auto_thumb)
             except OSError:
                 pass
+        raise error
+
+    record.update(state="✅ Done", done=file_size, total=file_size)
+    runner._wake_panel(chat_id, immediate=True)
+
+    # Forward to log channel if configured
+    if cfg.log_channel and sent:
+        try:
+            await sent.forward(cfg.log_channel)
+        except Exception:
+            pass
+
+    elapsed = time.time() - task_start
+    log.info("✅ Done: %s  %s/s  %.1fs",
+             fname,
+             human_size(file_size / elapsed) if elapsed else "—",
+             elapsed)
+
+    if auto_thumb and os.path.isfile(auto_thumb):
+        try:
+            os.remove(auto_thumb)
+        except OSError:
+            pass

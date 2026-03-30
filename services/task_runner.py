@@ -2,9 +2,17 @@
 services/task_runner.py
 Global task registry + unified live progress panel.
 
-Upload concurrency gates removed — uploads now go straight through
-(mirrors telegram.py style).  Download / processing slot limiting
-(MAX_CONCURRENT) is kept so CPU-heavy FFmpeg jobs don't stack up.
+Changes vs previous version:
+  - tracker.register() ALWAYS calls auto_panel() — every new task
+    (download OR upload) triggers a panel refresh.
+  - auto_panel() now deletes the previous panel message and sends a
+    fresh one at the bottom of the chat on every new task.
+    A 5-second debounce prevents thrashing during batch operations
+    (e.g. archive extraction uploading 20 files at once).
+  - LivePanel gains _created_at for the debounce check.
+  - Upload tasks (mode="ul") render through render_panel() identically
+    to downloads — same progress bar, speed, ETA, engine label.
+  - Upload concurrency gates remain removed (mirrors telegram.py style).
 """
 from __future__ import annotations
 
@@ -138,6 +146,7 @@ class GlobalTracker:
         return uuid.uuid4().hex[:8].upper()
 
     async def register(self, record: TaskRecord) -> None:
+        # Uploads skip the "Queued" state — they start uploading immediately
         if record.mode == "ul" and record.state == "⏳ Queued":
             record.state = "📤 Uploading"
         async with self._lock:
@@ -145,9 +154,10 @@ class GlobalTracker:
             self._seq += 1
             record.seq = self._seq
             self._tasks[record.tid] = record
-        existing = runner._panels.get(record.user_id)
-        if not existing or existing._stopped:
-            asyncio.create_task(runner.auto_panel(record.user_id))
+
+        # Always (re)create the panel when a new task is registered.
+        # auto_panel() handles debouncing to avoid thrashing during batches.
+        asyncio.create_task(runner.auto_panel(record.user_id))
 
     async def update(self, tid: str, **kw) -> None:
         async with self._lock:
@@ -257,8 +267,8 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
             ]
             continue
 
-        spd_s   = (human_size(t.speed) + "/s") if t.speed else "—"
-        eta_s   = human_dur(t.eta) if t.eta > 0 else "—"
+        spd_s    = (human_size(t.speed) + "/s") if t.speed else "—"
+        eta_s    = human_dur(t.eta) if t.eta > 0 else "—"
         mode_lbl = _MODE_HEADER.get(t.mode, t.mode).split(" ", 1)[-1]
 
         lines.append(f"🏷️ <b>Name</b>     <code>{fname_s}</code>")
@@ -281,11 +291,11 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
             lines.append(f"🌱 <b>Seeds</b>    <code>{t.seeds}</code>")
 
     stats   = _stats_cache
-    cpu     = stats.get("cpu", 0.0)
-    rp      = stats.get("ram_pct", 0.0)
-    df      = stats.get("disk_free", 0)
-    dl      = stats.get("dl_speed", 0.0)
-    ul      = stats.get("ul_speed", 0.0)
+    cpu     = float(stats.get("cpu", 0.0))
+    rp      = float(stats.get("ram_pct", 0.0))
+    df      = int(stats.get("disk_free", 0))
+    dl      = float(stats.get("dl_speed", 0.0))
+    ul      = float(stats.get("ul_speed", 0.0))
     slots_s = f"{MAX_CONCURRENT - n_running}/{MAX_CONCURRENT}"
 
     lines += [
@@ -303,6 +313,13 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 # LivePanel
 # ─────────────────────────────────────────────────────────────
 
+# How long (seconds) a panel must have existed before auto_panel()
+# is allowed to delete it and send a fresh one at the bottom.
+# Prevents message spam during rapid batch operations (e.g. 20-file
+# archive extractions each triggering a register() call).
+_PANEL_RECREATE_DEBOUNCE = 5.0
+
+
 class LivePanel:
     def __init__(self, msg, uid: int) -> None:
         self._msg           = msg
@@ -314,6 +331,7 @@ class LivePanel:
         self._wake_ev       = asyncio.Event()
         self._last_edit     = 0.0
         self._last_activity = time.time()
+        self._created_at    = time.time()   # debounce anchor
 
     def wake(self, immediate: bool = False) -> None:
         self._last_activity = time.time()
@@ -384,12 +402,13 @@ class LivePanel:
                 self._stopped = True
                 break
 
+        # Only remove ourselves if we are still the registered panel
         if runner._panels.get(self._uid) is self:
             runner._panels.pop(self._uid, None)
 
 
 # ─────────────────────────────────────────────────────────────
-# TaskRunner  (upload semaphore fully removed)
+# TaskRunner
 # ─────────────────────────────────────────────────────────────
 
 class TaskRunner:
@@ -454,21 +473,39 @@ class TaskRunner:
                 panel.wake()
 
     async def auto_panel(self, uid: int) -> None:
+        """
+        Called every time a new task is registered for `uid`.
+
+        Behaviour:
+          • If no panel exists → create one at the bottom of the chat.
+          • If a panel exists but was created < 5 s ago (batch mode) →
+            just wake it in place (avoids message spam for bulk operations).
+          • If a panel exists and is older than 5 s → delete it and send a
+            fresh one at the bottom so the progress is always most-recent.
+        """
         async with self._panel_lock(uid):
             existing = self._panels.get(uid)
 
             if existing and not existing._stopped:
-                existing.wake()
-                return
-
-            if existing:
+                age = time.time() - existing._created_at
+                if age < _PANEL_RECREATE_DEBOUNCE:
+                    # Batch mode: panel is very new, just wake it
+                    existing.wake()
+                    return
+                # Panel is old enough — delete it and place a fresh one at bottom
+                old_msg = existing._msg
                 existing.stop()
+                self._panels.pop(uid, None)
                 try:
-                    await existing._msg.delete()
+                    await old_msg.delete()
                 except Exception:
                     pass
+
+            elif existing:
+                # Panel exists but is already stopped — clean it up
                 self._panels.pop(uid, None)
 
+            # ── Create new panel at bottom of chat ────────────
             for attempt in range(2):
                 try:
                     from core.session import get_client
