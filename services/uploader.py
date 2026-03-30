@@ -73,20 +73,27 @@ def _build_caption(fname: str, custom: str, is_last: bool) -> str:
 # ─────────────────────────────────────────────────────────────
 
 async def _wait_stable(path: str, timeout: int = 30) -> None:
+    """
+    Wait for aria2 to finish writing before uploading.
+
+    Fast path: if no .aria2 sidecar exists the file is already complete
+    (FFmpeg, yt-dlp, and direct downloads all close the file before we
+    reach upload_file). Skip the stability loop entirely — saves ≥1s
+    per upload call.
+
+    Slow path: .aria2 exists → poll until it disappears (aria2 removes
+    it when the download is complete), then do one size-stability check.
+    """
     aria = path + ".aria2"
-    prev = -1
+    if not os.path.exists(aria):
+        return  # fast path: already complete, no wait needed
+
+    # Slow path: aria2 is still writing
     for _ in range(timeout):
-        if os.path.exists(aria):
+        if not os.path.exists(aria):
+            # sidecar gone → wait one extra second for OS to flush
             await asyncio.sleep(1)
-            continue
-        try:
-            cur = os.path.getsize(path)
-        except OSError:
-            await asyncio.sleep(1)
-            continue
-        if cur == prev and cur > 0:
             return
-        prev = cur
         await asyncio.sleep(1)
 
 
@@ -247,10 +254,16 @@ async def upload_file(
     )
     await tracker.register(record)
 
-    task_start = time.time()
+    task_start  = time.time()
+    _last_prog  = [task_start]          # throttle: update at most every 0.5s
+    _PROG_MIN   = 0.5                   # seconds between progress updates
 
     async def progress(current: int, total: int) -> None:
-        elapsed = time.time() - task_start
+        now = time.time()
+        if now - _last_prog[0] < _PROG_MIN:
+            return
+        _last_prog[0] = now
+        elapsed = now - task_start
         speed   = current / elapsed if elapsed > 0 else 0
         eta     = int((total - current) / speed) if speed > 0 else 0
         record.update(
