@@ -80,14 +80,37 @@ def _build_app():
     return app
 
 
+def _find_free_port(start: int = 8080, end: int = 8199) -> int:
+    """Find the first free TCP port in the given range."""
+    import socket
+    for p in range(start, end):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("0.0.0.0", p))
+                return p
+        except OSError:
+            continue
+    raise RuntimeError(f"No free port found in range {start}-{end}")
+
+
 async def start(port: int = 8080, ngrok_token: str = "") -> str:
     """
     Start the health server. Returns the public URL (empty if no ngrok).
+    Auto-finds a free port if the requested one is busy.
     Call this from main.py after the bot starts.
     """
     global _runner, _site, _public_url
 
     from aiohttp import web
+
+    # Auto-find a free port if the default is busy
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("0.0.0.0", port))
+    except OSError:
+        port = _find_free_port(8081, 8199)
+        log.info("🏥 Port 8080 busy — using port %d instead", port)
 
     app     = _build_app()
     _runner = web.AppRunner(app)
