@@ -194,6 +194,171 @@ async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
 
 
 # ─────────────────────────────────────────────────────────────
+# Auto-split for files > Telegram's 2 GB bot limit
+# ─────────────────────────────────────────────────────────────
+
+# Telegram Bot API hard limit: 2 GB per file.
+# We use 1900 MB as the safe ceiling to leave headroom for
+# container overhead (MKV header, metadata, etc.).
+TG_MAX_BYTES = 1900 * 1024 * 1024   # 1.9 GB
+
+
+async def _split_binary(path: str, tmp_dir: str, chunk_bytes: int) -> list[str]:
+    """
+    Split any file into binary chunks of `chunk_bytes`.
+    Returns list of part paths in order.
+    """
+    fname  = os.path.basename(path)
+    base   = os.path.splitext(fname)[0]
+    ext    = os.path.splitext(fname)[1]
+    parts  = []
+    idx    = 1
+
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(chunk_bytes)
+            if not chunk:
+                break
+            part_path = os.path.join(tmp_dir, f"{base}.part{idx:03d}{ext}")
+            with open(part_path, "wb") as out:
+                out.write(chunk)
+            parts.append(part_path)
+            idx += 1
+
+    return parts
+
+
+async def _split_video_by_size(path: str, tmp_dir: str, chunk_bytes: int) -> list[str]:
+    """
+    Split a video into parts where each part fits within chunk_bytes.
+    Uses FFmpeg segment muxer (fast, stream-copy — no re-encode).
+    Falls back to binary split if FFmpeg fails.
+    """
+    from services import ffmpeg as FF
+
+    try:
+        dur = await FF.probe_duration(path)
+        if not dur:
+            raise ValueError("Unknown duration")
+
+        fsize     = os.path.getsize(path)
+        # Estimate how many seconds fit per chunk
+        secs_per_chunk = int(dur * chunk_bytes / fsize)
+        if secs_per_chunk < 10:
+            secs_per_chunk = 10
+
+        base = os.path.splitext(os.path.basename(path))[0]
+        ext  = os.path.splitext(path)[1] or ".mp4"
+        pattern = os.path.join(tmp_dir, f"{base}.part%03d{ext}")
+
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", path,
+            "-c", "copy",
+            "-f", "segment",
+            "-segment_time", str(secs_per_chunk),
+            "-reset_timestamps", "1",
+            pattern,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            raise RuntimeError(stderr.decode(errors="replace")[-300:])
+
+        parts = sorted(
+            f for f in (
+                os.path.join(tmp_dir, p)
+                for p in os.listdir(tmp_dir)
+                if f"{base}.part" in p
+            )
+            if os.path.isfile(f)
+        )
+        if parts:
+            return parts
+        raise RuntimeError("FFmpeg produced no output files")
+
+    except Exception as exc:
+        log.warning("_split_video_by_size FFmpeg failed (%s) — binary split fallback", exc)
+        return await _split_binary(path, tmp_dir, chunk_bytes)
+
+
+async def _upload_parts(
+    client,
+    msg,
+    parts:          list[str],
+    original_fname: str,
+    force_document: bool,
+    thumb:          str | None,
+) -> None:
+    """
+    Upload a list of part files sequentially.
+    Each part gets a caption showing its index: (Part 1/3), (Part 2/3), …
+    """
+    total_parts = len(parts)
+    chat_id     = _chat_id(msg)
+
+    # Notify about the split
+    try:
+        await client.send_message(
+            chat_id,
+            f"✂️ <b>File split into {total_parts} parts</b>\n"
+            f"<code>{original_fname}</code>\n"
+            f"<i>Each part ≤ 1.9 GB — uploading now…</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    for i, part_path in enumerate(parts, 1):
+        part_fname = os.path.basename(part_path)
+        part_size  = os.path.getsize(part_path)
+        part_cap   = (
+            f"<code>{original_fname}</code>\n"
+            f"📦 <b>Part {i} / {total_parts}</b>  "
+            f"<code>{human_size(part_size)}</code>"
+        )
+
+        # Create a dummy msg-like object since we already deleted the original
+        # send_message gives us a real message to pass into the core upload
+        part_st = await client.send_message(
+            chat_id,
+            f"📤 Uploading Part {i}/{total_parts}…\n"
+            f"<code>{part_fname}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+        try:
+            await _upload_single(
+                client, part_st, part_path,
+                caption=part_cap,
+                thumb=thumb,
+                force_document=force_document,
+            )
+        except Exception as exc:
+            log.error("Part %d/%d upload failed: %s", i, total_parts, exc)
+            try:
+                await client.send_message(
+                    chat_id,
+                    f"❌ Part {i}/{total_parts} failed: <code>{exc}</code>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+    # Final summary
+    try:
+        await client.send_message(
+            chat_id,
+            f"✅ <b>All {total_parts} parts uploaded</b>\n"
+            f"<code>{original_fname}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────
 # upload_file — the one function the rest of the repo calls
 # ─────────────────────────────────────────────────────────────
 
@@ -208,17 +373,9 @@ async def upload_file(
     is_last:        bool       = False,
 ) -> None:
     """
-    Upload one file through the unified progress panel.
-
-    The panel (render_panel) shows upload progress identically to downloads:
-      📤 Uploading  |  Name  |  Progress bar  |  Speed  |  ETA
-
-    Flow:
-      1. Dismiss the placeholder `msg` immediately (panel takes over)
-      2. Register a TaskRecord(mode="ul") → triggers auto_panel()
-      3. Pyrogram progress callback updates the record → panel refreshes
-      4. On FloodWait: retry loop (no recursion)
-      5. On error: send a fresh message to chat_id (msg is already deleted)
+    Public entry point.  Auto-splits files larger than TG_MAX_BYTES (1.9 GB)
+    into parts and uploads each one sequentially with Part N/Total labels.
+    Files within the limit go straight to _upload_single().
     """
     if not os.path.isfile(path):
         await safe_edit(
@@ -230,11 +387,66 @@ async def upload_file(
 
     await _wait_stable(path)
 
+    file_size      = os.path.getsize(path)
+    original_fname = os.path.basename(path)
+
+    if file_size <= TG_MAX_BYTES:
+        # Normal path — single upload
+        await _upload_single(client, msg, path,
+                             caption=caption, thumb=thumb,
+                             force_document=force_document)
+        return
+
+    # ── File exceeds 1.9 GB — split it ────────────────────────
+    log.info(
+        "File %s is %s — exceeds 1.9 GB limit, splitting",
+        original_fname, human_size(file_size),
+    )
+
+    # Dismiss placeholder immediately
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="tg_split_")
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _VIDEO_EXTS and not force_document:
+            parts = await _split_video_by_size(path, tmp_dir, TG_MAX_BYTES)
+        else:
+            parts = await _split_binary(path, tmp_dir, TG_MAX_BYTES)
+
+        await _upload_parts(
+            client, msg, parts,
+            original_fname=original_fname,
+            force_document=force_document,
+            thumb=thumb,
+        )
+    finally:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+async def _upload_single(
+    client:         Client,
+    msg,
+    path:           str,
+    caption:        str        = "",
+    thumb:          str | None = None,
+    force_document: bool       = False,
+) -> None:
+    """
+    Upload one file through the unified progress panel.
+    Called by upload_file() for files within the 1.9 GB limit,
+    and by _upload_parts() for each individual split part.
+    """
     chat_id   = _chat_id(msg)
     fname     = os.path.basename(path)
     file_size = os.path.getsize(path)
     ftype     = _file_type(path, force_document)
-    cap       = _build_caption(fname, caption, is_last)
+    cap       = caption if caption else _build_caption(fname, "", False)
 
     # ── Video: width / height / duration ──────────────────────
     meta       = {"duration": 0, "width": 0, "height": 0}
