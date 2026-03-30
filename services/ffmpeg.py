@@ -689,3 +689,72 @@ def subtitle_ext(codec: str) -> str:
 
 def audio_ext(codec: str) -> str:
     return _AUD_EXT.get(codec.lower(), ".mka")
+
+
+# ─────────────────────────────────────────────────────────────
+# Local resize and compression (no CloudConvert)
+# ─────────────────────────────────────────────────────────────
+
+async def resize_video(inp: str, out: str, height: int, crf: int = 23) -> None:
+    """
+    Downscale video to `height` px (e.g. 1080, 720, 480, 360).
+    Uses scale=-2:height to preserve aspect ratio.
+    Stream-copy audio — no quality loss on audio track.
+    """
+    await _run([
+        "ffmpeg", "-y", "-i", inp,
+        "-vf", f"scale=-2:{height}",
+        "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        out,
+    ], f"Resize({height}p)")
+
+
+async def compress_to_size(inp: str, out: str, target_mb: float) -> None:
+    """
+    2-pass encode to hit a target file size in MB.
+
+    Formula:
+      total_kbps = (target_mb * 8 * 1024) / duration_seconds
+      video_kbps = total_kbps - audio_kbps (128)
+
+    Falls back to single-pass CRF if duration cannot be determined.
+    """
+    dur = await probe_duration(inp)
+
+    if not dur:
+        # Fallback: CRF 28 gives roughly 60-70% size reduction for most videos
+        log.warning("compress_to_size: unknown duration — using CRF 28 fallback")
+        await _run([
+            "ffmpeg", "-y", "-i", inp,
+            "-c:v", "libx264", "-crf", "28", "-preset", "medium",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            out,
+        ], "Compress(crf28-fallback)")
+        return
+
+    audio_kbps = 128
+    total_kbps = int(target_mb * 8 * 1024 / dur)
+    video_kbps = max(100, total_kbps - audio_kbps)
+
+    log.info("compress_to_size: target=%.1f MB  dur=%ds  video_kbps=%d",
+             target_mb, dur, video_kbps)
+
+    # Pass 1 — analysis only, no output file
+    await _run([
+        "ffmpeg", "-y", "-i", inp,
+        "-c:v", "libx264", "-b:v", f"{video_kbps}k", "-preset", "medium",
+        "-pass", "1", "-an", "-f", "null", "/dev/null",
+    ], "Compress(pass1)")
+
+    # Pass 2 — actual encode
+    await _run([
+        "ffmpeg", "-y", "-i", inp,
+        "-c:v", "libx264", "-b:v", f"{video_kbps}k", "-preset", "medium",
+        "-pass", "2",
+        "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+        "-movflags", "+faststart",
+        out,
+    ], "Compress(pass2)")
