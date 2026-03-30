@@ -46,6 +46,14 @@ try:
 except ImportError:
     _UVLOOP = False
 
+# Python 3.12 no longer creates an implicit event loop on the main thread.
+# pyrofork 2.2.11's sync.py calls asyncio.get_event_loop() at import time —
+# without an existing loop this raises RuntimeError under Python 3.12 + uvloop.
+# Creating and setting a loop here (before any pyrogram import) fixes it.
+# This mirrors exactly what zilong-leech's colab_leecher/__init__.py does.
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
