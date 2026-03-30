@@ -1,5 +1,4 @@
-# pyrofork>=2.3.40 — stable modern fork of pyrogram.
-pyrofork>=2.3.40
+pyrofork==2.2.11
 # uvloop: replaces Python's default asyncio with libuv — 2-4x faster I/O for uploads.
 uvloop
 TgCrypto
