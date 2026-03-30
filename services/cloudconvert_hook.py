@@ -3,7 +3,16 @@ services/cloudconvert_hook.py
 Receives CloudConvert webhooks and auto-downloads + uploads
 finished files through the existing Zilong pipeline.
 
-Upload semaphore removed — uploads go straight through (telegram.py style).
+CRITICAL FIX: _process_file previously called smart_download() to retrieve
+CC export URLs. smart_download → _dispatch → download_parallel fires 8
+simultaneous Range requests. CC export URLs are single-use signed tokens —
+the token is consumed on request #1 and requests #2-8 get 403/empty.
+The assembled file is only 1/8 of the actual output. Webhook delivery
+silently produced truncated/corrupt files on every single CC job.
+
+Fix: use download_direct() instead. CC export URLs are plain HTTPS direct
+links — no parallel range splitting needed or wanted. download_direct uses
+a single streaming GET, respects the token, and gets the full file.
 """
 from __future__ import annotations
 
@@ -58,20 +67,21 @@ def _extract_urls(data: dict) -> list[dict]:
 async def _process_file(url: str, filename: str, owner_id: int) -> None:
     from core.config import cfg
     from core.session import get_client, settings as _settings
-    from services.downloader import smart_download
     from services.uploader import upload_file
-    from services.utils import cleanup, make_tmp, smart_clean_filename, largest_file, human_size
+    from services.utils import cleanup, make_tmp, smart_clean_filename, human_size
+
+    # FIX: use download_direct instead of smart_download.
+    # CC export URLs are single-use signed tokens. smart_download → _dispatch
+    # → download_parallel first, which fires 8 simultaneous Range requests and
+    # burns the token on #1, causing all other segments to get 403/empty.
+    # download_direct uses a single streaming GET — the correct approach.
+    from services.downloader import download_direct
 
     client = get_client()
     tmp    = make_tmp(cfg.download_dir, owner_id)
 
     try:
-        path = await smart_download(url, tmp, user_id=owner_id, label=filename)
-
-        if os.path.isdir(path):
-            resolved = largest_file(path)
-            if resolved:
-                path = resolved
+        path = await download_direct(url, tmp)
 
         if not os.path.isfile(path):
             log.error("[CC-Hook] No file after download: %s", filename)
@@ -112,7 +122,6 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             except OSError:
                 pass
 
-        # Upload straight through — real status message so progress is visible
         from pyrogram import enums as _enums
         st = await client.send_message(
             owner_id,

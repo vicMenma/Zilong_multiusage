@@ -1,24 +1,28 @@
 """
-services/downloader.py (OPTIMIZED)
+services/downloader.py
 Download strategies — decoupled from Telegram types.
 
-═══════════════════════════════════════════════════════════════════
-FIXES in this version:
-  - download_aria2 now uses proper TWO-PHASE timeout for magnets:
-      Phase 1: up to 3 min to resolve metadata (no peers → fail fast)
-      Phase 2: once download starts, full 6h allowed
-    Previously, ALL magnets used a single 3-min timeout, meaning a
-    1.4 GB file downloading at 8 MB/s would fail after 3 min with
-    the wrong error message "6 h limit".
-  - Error messages now accurately reflect which phase timed out.
+CRITICAL FIXES:
+  1. download_parallel removed from _dispatch.
+     It was burning CDN single-use auth tokens (SonicBit, etc.) by firing
+     8 simultaneous Range requests. CDN validates token on request #1 and
+     rejects #2-8 → only first segment downloaded (~178MB of 1.4GB file).
+     Fallback to aria2c also failed because token was now expired.
+     Fix: _dispatch uses download_direct first, then aria2c fallback.
 
-OPTIMIZATIONS:
-  1. aiohttp chunk size: 4 MB (reduces syscall overhead)
-  2. Connection pooling: reusable TCPConnector with limit=32
-  3. Parallel range download for direct HTTP (8 segments)
-  4. aria2c: --file-allocation=none for instant start
-  5. yt-dlp: concurrent_fragment_downloads=8
-═══════════════════════════════════════════════════════════════════
+  2. in_meta no longer requires task_record.
+     Was: in_meta = [is_magnet and task_record is not None and not is_file]
+     When called from stream_extractor / se_mag_cb with task_record=None,
+     in_meta[0]=False → Phase-1 loop exited immediately → dead magnets
+     waited 6 hours before timing out instead of 3 minutes.
+     Fix: in_meta = [is_magnet and not is_file]
+
+  3. --bt-max-peers removed from direct HTTP aria2c command.
+     BitTorrent-only flag. Using it on HTTP URLs causes aria2c warnings.
+
+  4. download_direct now validates received bytes vs Content-Length.
+     Silent partial downloads now raise RuntimeError instead of saving
+     a truncated file.
 """
 from __future__ import annotations
 
@@ -135,10 +139,25 @@ async def download_direct(
                         speed   = done / elapsed if elapsed else 0
                         eta     = int((total - done) / speed) if (speed and total) else 0
                         await progress(done, total, speed, eta)
+
+    # Validate: catch silent partial downloads (server FIN without error)
+    if total and done != total:
+        try:
+            os.unlink(fpath)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Download incomplete: received {done:,} of {total:,} bytes "
+            "(connection dropped mid-transfer)."
+        )
+
     return fpath
 
 
-# ── Parallel range download ───────────────────────────────────
+# ── Parallel range download ─────────────────────────────────
+# NOT used in _dispatch by default — see fix note above.
+# Only call this explicitly for servers you have confirmed support
+# parallel Range requests AND do NOT use single-use auth tokens.
 
 async def download_parallel(
     url: str, dest: str,
@@ -169,10 +188,15 @@ async def download_parallel(
     lock         = asyncio.Lock()
 
     async def _download_segment(seg_idx: int, start_byte: int, end_byte: int) -> bytes:
-        headers = {"Range": f"bytes={start_byte}-{end_byte}"}
-        data = bytearray()
+        headers  = {"Range": f"bytes={start_byte}-{end_byte}"}
+        expected = end_byte - start_byte + 1
+        data     = bytearray()
         async with _get_session() as sess:
             async with sess.get(url, headers=headers, allow_redirects=True) as resp:
+                if resp.status == 200:
+                    raise RuntimeError(
+                        "Server returned 200 for Range request — Range not actually supported"
+                    )
                 async for chunk in resp.content.iter_chunked(_DL_CHUNK_SIZE):
                     data.extend(chunk)
                     async with lock:
@@ -182,6 +206,10 @@ async def download_parallel(
                         speed   = done_bytes[0] / elapsed if elapsed else 0
                         eta     = int((total - done_bytes[0]) / speed) if speed else 0
                         await progress(done_bytes[0], total, speed, eta)
+        if len(data) != expected:
+            raise RuntimeError(
+                f"Segment {seg_idx}: got {len(data)} bytes, expected {expected}"
+            )
         return bytes(data)
 
     tasks = []
@@ -376,8 +404,8 @@ _ARIA2_PROG_RE = _re.compile(
     r"(?:.*?DL:([\d.]+\w+))?(?:.*?ETA:([\dhms]+))?"
 )
 
-META_TIMEOUT  = 180      # 3 min — how long to wait for FIRST progress line
-TOTAL_TIMEOUT = 21600    # 6 h   — max time for the full download phase
+META_TIMEOUT  = 180      # 3 min — wait for FIRST progress line
+TOTAL_TIMEOUT = 21600    # 6 h   — download phase
 
 
 def _aria2_bytes(s: str) -> int:
@@ -405,46 +433,38 @@ async def download_aria2(
     progress: Optional[ProgressCB] = None,
     task_record=None,
 ) -> str:
-    """
-    Download via aria2c subprocess.
-
-    TWO-PHASE TIMEOUT FOR MAGNETS (FIX):
-      Phase 1 (metadata): poll every second for up to META_TIMEOUT (3 min).
-                          If aria2c never outputs a progress line (no peers),
-                          we kill it and raise "metadata timeout (3 min)".
-      Phase 2 (download): once first progress arrives, give it TOTAL_TIMEOUT (6h).
-
-    Non-magnets and .torrent files use a single TOTAL_TIMEOUT.
-    This prevents the old bug where large magnet downloads were killed at 3 min
-    with the wrong message "6 h limit".
-    """
     is_magnet = _MAGNET_RE.match(uri_or_path) is not None
 
     if is_file:
         cmd = [
-            "aria2c",
-            "-x16", "--split=16",
-            "--min-split-size=1M",
-            "--file-allocation=none",
-            "--seed-time=0",
+            "aria2c", "-x16", "--split=16", "--min-split-size=1M",
+            "--file-allocation=none", "--seed-time=0",
             "--summary-interval=1", "--console-log-level=notice",
             "--max-tries=3", "-d", dest,
             f"--torrent-file={uri_or_path}",
         ]
-    else:
+    elif is_magnet:
+        # --bt-max-peers is valid for magnet/torrent only
         cmd = [
-            "aria2c",
-            "-x16", "--split=16",
-            "--min-split-size=1M",
-            "--file-allocation=none",
-            "--seed-time=0",
+            "aria2c", "-x16", "--split=16", "--min-split-size=1M",
+            "--file-allocation=none", "--seed-time=0",
             "--bt-max-peers=200",
             "--summary-interval=1", "--console-log-level=notice",
             "--max-tries=3", "-d", dest,
             uri_or_path,
         ]
+    else:
+        # FIX: --bt-max-peers removed from HTTP URI command (BT-only flag)
+        cmd = [
+            "aria2c", "-x16", "--split=16", "--min-split-size=1M",
+            "--file-allocation=none", "--seed-time=0",
+            "--summary-interval=1", "--console-log-level=notice",
+            "--max-tries=3", "-d", dest,
+            uri_or_path,
+        ]
 
-    in_meta = [is_magnet and task_record is not None and not is_file]
+    # FIX: in_meta depends only on is_magnet/is_file, NOT task_record
+    in_meta = [is_magnet and not is_file]
 
     if in_meta[0] and task_record is not None:
         task_record.update(meta_phase=True, state="🔍 Fetching metadata…")
@@ -481,11 +501,9 @@ async def download_aria2(
                 pass
 
     asyncio.ensure_future(_drain_stderr())
-
     assert proc.stdout is not None
 
     async def _read_stdout():
-        """Read aria2c stdout and update progress. Sets in_meta[0]=False on first progress line."""
         async for raw in proc.stdout:
             line = raw.decode(errors="replace").strip()
             if not line:
@@ -500,7 +518,6 @@ async def download_aria2(
                 eta_sec = _aria2_eta(m.group(5) or "") if m.group(5) else 0
 
                 if in_meta[0]:
-                    # First progress line — metadata resolved, now in download phase
                     in_meta[0] = False
                     fname_now = largest_file(dest)
                     fname_s   = os.path.basename(fname_now)[:40] if fname_now else ""
@@ -529,16 +546,13 @@ async def download_aria2(
 
     # ── TWO-PHASE HANDLING FOR MAGNETS ───────────────────────
     if is_magnet and not is_file:
-        # Start the stdout reader as a background task
         read_task = asyncio.create_task(_read_stdout())
 
-        # Phase 1: Poll until metadata resolves (first progress line) or timeout
         meta_deadline = time.time() + META_TIMEOUT
         while in_meta[0]:
             if read_task.done():
                 break
             if time.time() >= meta_deadline:
-                # No peers / dead magnet — kill and fail fast
                 try:
                     proc.kill()
                 except Exception:
@@ -556,7 +570,6 @@ async def download_aria2(
                 )
             await asyncio.sleep(1)
 
-        # Phase 2: Metadata resolved — let download run for the full 6h
         if not read_task.done():
             try:
                 remaining = TOTAL_TIMEOUT - int(time.time() - start)
@@ -571,14 +584,12 @@ async def download_aria2(
                     "The download stalled."
                 )
 
-        # Re-raise any exception from the read task
         if not read_task.cancelled():
             exc = read_task.exception()
             if exc is not None:
                 raise exc
 
     else:
-        # Non-magnet (.torrent file, direct, etc.): single TOTAL_TIMEOUT
         try:
             await asyncio.wait_for(_read_stdout(), timeout=TOTAL_TIMEOUT)
         except asyncio.TimeoutError:
@@ -705,11 +716,19 @@ async def _dispatch(
         return await download_ytdlp(url, dest, audio_only=audio_only,
                                     fmt_id=fmt_id, progress=progress)
 
-    # direct — try parallel, then aria2c, then single stream
+    # ── "direct" — FIXED: download_direct first, aria2c as fallback ──
+    # CRITICAL FIX: download_parallel removed from default path.
+    # It was burning single-use CDN auth tokens by firing 8 simultaneous
+    # Range requests → only first ~1/8 of file downloaded.
+    # aria2c already parallelizes internally (-x16 --split=16) so we
+    # still get parallel connections when needed without the token problem.
     try:
-        return await download_parallel(url, dest, num_segments=8, progress=progress)
-    except Exception as par_exc:
-        _dlog.debug("[Downloader] Parallel range failed (%s) — trying aria2c", par_exc)
+        return await download_direct(url, dest, progress=progress)
+    except Exception as direct_exc:
+        _dlog.warning(
+            "[Downloader] download_direct failed (%s) — falling back to aria2c",
+            direct_exc,
+        )
 
     try:
         return await download_aria2(
@@ -717,15 +736,12 @@ async def _dispatch(
             progress=progress, task_record=task_record,
         )
     except Exception as aria2_exc:
-        _dlog.warning(
-            "[Downloader] aria2c failed for direct URL (%s) — falling back to aiohttp",
-            aria2_exc,
-        )
-        if task_record is not None:
-            task_record.update(
-                state="📥 Downloading", engine="direct", meta_phase=False,
-            )
-        return await download_direct(url, dest, progress=progress)
+        _dlog.error("[Downloader] aria2c also failed: %s", aria2_exc)
+        raise RuntimeError(
+            f"All download methods failed.\n"
+            f"aiohttp: {direct_exc}\n"
+            f"aria2c:  {aria2_exc}"
+        ) from aria2_exc
 
 
 async def cleanup_connections() -> None:

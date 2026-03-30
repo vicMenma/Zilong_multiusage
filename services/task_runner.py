@@ -2,18 +2,13 @@
 services/task_runner.py
 Global task registry + unified live progress panel.
 
-Panel redesigned to match compact terminal style (image 4):
-  ⚡ BOTNAME  ↓ 38.4 MiB/s  ↑ 290 KiB/s
-  ────────────────────────────────
-  ↓  Dungeon Meshi S2...    ⚡ 12.3 MiB/s
-     █████████████░░░░░░░   68%   1m 12s
+FIXES:
+  LOW: TASK_LINGER raised from 15 → 45 seconds. Tasks were disappearing
+       from the panel 15s after completion, causing the panel to flash
+       "idle" between sequential downloads in a multi-file session.
 
-  ↑  Frieren Beyond...      ⚡ 9.8 MiB/s
-     ████░░░░░░░░░░░░░░░░   21%   4m 33s
-
-  🕐  Shangri-La...      queued
-  ────────────────────────────────
-  💻 87%  🧠 23%  💾 84.8G  📋 3/5
+  LOW: render_panel footer now shows "—" instead of "0.00 B/s" when
+       dl_speed / ul_speed from _stats_cache is zero (idle state).
 """
 from __future__ import annotations
 
@@ -30,7 +25,7 @@ log = logging.getLogger(__name__)
 MAX_CONCURRENT          = 5
 EDIT_INTERVAL           = 1.5
 PANEL_TTL               = 600
-TASK_LINGER             = 15
+TASK_LINGER             = 45    # FIX: was 15 — panel now lingers 45s after task completes
 _PANEL_RECREATE_DEBOUNCE = 5.0
 
 _task_semaphore: Optional[asyncio.Semaphore] = None
@@ -186,7 +181,7 @@ tracker = GlobalTracker()
 
 
 # ─────────────────────────────────────────────────────────────
-# Panel renderer — compact terminal design matching image 4
+# Panel renderer
 # ─────────────────────────────────────────────────────────────
 
 def _bar(pct: float, w: int = 20) -> str:
@@ -195,7 +190,6 @@ def _bar(pct: float, w: int = 20) -> str:
 
 
 def _compact_disk(n: float) -> str:
-    """Return compact size: '84.8G', '512M', '1.2T'."""
     for div, sym in ((1024**4, "T"), (1024**3, "G"), (1024**2, "M"), (1024, "K")):
         if n >= div:
             return f"{n / div:.1f}{sym}"
@@ -218,11 +212,15 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     ul_speed  = float(stats.get("ul_speed", 0.0))
     bot_name  = get_bot_name().upper()
 
+    # FIX: show "—" when speed is zero instead of "0.00 B/s"
+    dl_s = f"{human_size(dl_speed)}/s" if dl_speed else "—"
+    ul_s = f"{human_size(ul_speed)}/s" if ul_speed else "—"
+
     # ── Header ─────────────────────────────────────────────────
     lines: list[str] = [
         f"⚡ <b>{bot_name}</b>  "
-        f"↓ <code>{human_size(dl_speed)}/s</code>  "
-        f"↑ <code>{human_size(ul_speed)}/s</code>",
+        f"↓ <code>{dl_s}</code>  "
+        f"↑ <code>{ul_s}</code>",
         "────────────────────────────────",
         "",
     ]
@@ -237,7 +235,6 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
             fname   = t.fname or t.label
             fname_s = (fname[:35] + "…") if len(fname) > 35 else fname
 
-            # Direction arrow
             arrow = "↑" if t.mode == "ul" else ("⚙" if t.mode == "proc" else "↓")
 
             if t.state.startswith("✅"):
@@ -259,7 +256,8 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
             else:
                 pct   = t.pct()
-                spd_s = f"{human_size(t.speed)}/s" if t.speed else "…"
+                # FIX: show "—" for speed when zero
+                spd_s = f"{human_size(t.speed)}/s" if t.speed else "—"
                 eta_s = human_dur(t.eta) if t.eta > 0 else ""
 
                 lines.append(
@@ -270,7 +268,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
                 else:
                     lines.append(f"   <code>{_bar(pct)}</code>  {pct:.0f}%")
 
-            lines.append("")   # blank line between tasks
+            lines.append("")
 
     # ── Footer ─────────────────────────────────────────────────
     slots_used = sum(1 for t in active if not t.state.startswith("⏳"))
@@ -287,11 +285,6 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
 
 def render_panel_kb(uid: int):
-    """
-    Inline keyboard for the live panel:
-      - One cancel button per active task (2 per row)
-      - Cancel All + Refresh on last row
-    """
     from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
     tasks  = tracker.tasks_for_user(uid)
@@ -299,7 +292,6 @@ def render_panel_kb(uid: int):
 
     rows: list = []
 
-    # Cancel buttons — 2 per row
     row: list = []
     for t in active[:8]:
         short = (t.fname or t.label)[:12].strip()
@@ -313,7 +305,6 @@ def render_panel_kb(uid: int):
     if row:
         rows.append(row)
 
-    # Bottom row
     if active:
         rows.append([
             InlineKeyboardButton("❌ Cancel All",  callback_data=f"panel|cancel_all|{uid}"),
@@ -427,7 +418,7 @@ class TaskRunner:
     def __init__(self) -> None:
         self._panels:       dict[int, LivePanel] = {}
         self._panel_locks:  dict[int, asyncio.Lock] = {}
-        self._task_handles: dict[str, asyncio.Task] = {}  # tid → asyncio.Task
+        self._task_handles: dict[str, asyncio.Task] = {}
         self._running = False
 
     def _panel_lock(self, uid: int) -> asyncio.Lock:
@@ -435,10 +426,7 @@ class TaskRunner:
             self._panel_locks[uid] = asyncio.Lock()
         return self._panel_locks[uid]
 
-    # ── Cancel API ────────────────────────────────────────────
-
     async def cancel_task(self, tid: str) -> bool:
-        """Cancel a single task by tid. Returns True if it was running."""
         handle = self._task_handles.get(tid)
         if handle and not handle.done():
             handle.cancel()
@@ -450,7 +438,6 @@ class TaskRunner:
         return False
 
     async def cancel_all(self, uid: int) -> int:
-        """Cancel all active tasks for uid. Returns count cancelled."""
         tasks = tracker.tasks_for_user(uid)
         count = 0
         for t in tasks:
@@ -458,8 +445,6 @@ class TaskRunner:
                 if await self.cancel_task(t.tid):
                     count += 1
         return count
-
-    # ── Lifecycle ─────────────────────────────────────────────
 
     def start(self) -> None:
         self._running = True
@@ -481,8 +466,6 @@ class TaskRunner:
                 _YTDLP_POOL.shutdown(wait=False)
         except Exception:
             pass
-
-    # ── Panel management ──────────────────────────────────────
 
     def open_panel(self, uid: int, msg, target_uid: Optional[int] = None) -> LivePanel:
         old = self._panels.get(uid)
@@ -547,8 +530,6 @@ class TaskRunner:
         p = self._panels.get(uid)
         if p:
             p.wake(immediate=immediate)
-
-    # ── Task submission ───────────────────────────────────────
 
     async def submit(
         self,
