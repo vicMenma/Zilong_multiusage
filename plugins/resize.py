@@ -92,6 +92,7 @@ async def cmd_compress(client: Client, msg: Message):
     args = msg.command[1:]
 
     # Usage: /compress 50  or  /compress https://... 50
+    # Also handles: reply to a video with /compress 50
     url        = None
     target_mb  = None
 
@@ -100,6 +101,35 @@ async def cmd_compress(client: Client, msg: Message):
             url = a
         elif re.match(r"^\d+(\.\d+)?$", a):
             target_mb = float(a)
+
+    # Handle: user replied to a video message with /compress 200
+    reply = msg.reply_to_message
+    if reply and target_mb and not url:
+        media = reply.video or reply.document
+        if media:
+            fname = getattr(media, "file_name", None) or "video.mkv"
+            fsize = getattr(media, "file_size", 0) or 0
+            tmp   = make_tmp(cfg.download_dir, uid)
+            st    = await msg.reply(
+                f"⬇️ Downloading <code>{fname[:40]}</code>…",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            try:
+                from services.tg_download import tg_download
+                path = await tg_download(client, media.file_id,
+                                         os.path.join(tmp, fname), st,
+                                         fname=fname, fsize=fsize, user_id=uid)
+            except Exception as exc:
+                await safe_edit(st, f"❌ Download failed: <code>{exc}</code>",
+                                parse_mode=enums.ParseMode.HTML)
+                cleanup(tmp)
+                return
+            _COMPRESS_STATE[uid] = {
+                "path": path, "url": None, "fname": fname,
+                "tmp": tmp, "target_mb": target_mb,
+            }
+            await _run_compress(client, st, uid)
+            return
 
     if url and target_mb:
         fname = url.split("/")[-1].split("?")[0][:50] or "video.mkv"
@@ -122,7 +152,8 @@ async def cmd_compress(client: Client, msg: Message):
         "🗜️ <b>Compress Video</b>\n\n"
         "Usage:\n"
         "  <code>/compress 50</code>  — send a file then specify size\n"
-        "  <code>/compress https://… 50</code>  — URL + target MB\n\n"
+        "  <code>/compress https://… 50</code>  — URL + target MB\n"
+        "  Reply to a video with <code>/compress 200</code>\n\n"
         "<i>Send a video file to start, then reply with target MB.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
@@ -134,7 +165,7 @@ async def cmd_compress(client: Client, msg: Message):
 
 @Client.on_message(
     filters.private & (filters.video | filters.document),
-    group=11,
+    group=1,
 )
 async def resize_compress_file_receiver(client: Client, msg: Message):
     uid   = msg.from_user.id
@@ -189,7 +220,7 @@ async def resize_compress_file_receiver(client: Client, msg: Message):
 @Client.on_message(
     filters.private & filters.text
     & ~filters.command(["resize", "compress", "cancel"]),
-    group=11,
+    group=1,
 )
 async def compress_mb_receiver(client: Client, msg: Message):
     uid   = msg.from_user.id
