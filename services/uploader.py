@@ -2,13 +2,12 @@
 services/uploader.py
 Upload a local file to Telegram.
 
-Progress is now routed through the unified task panel (same as downloads):
-  - Creates a TaskRecord(mode="ul", engine="telegram")
-  - tracker.register() → auto_panel() → render_panel() handles all display
-  - `msg` (the "📤 Uploading…" placeholder) is dismissed at the very start
-    so the panel is the single source of truth for upload status
-  - FloodWait handled with a retry loop (no recursion, no stack growth)
-  - On error a fresh client.send_message() is used (msg is already gone)
+HIGH FIX: _upload_single was calling _make_thumb for ftype == "document"
+as well as "video". For non-video documents (zip, rar, srt, json, etc.)
+ffmpeg runs, tries 4 timestamps, fails silently every time, and wastes
+1-3 seconds on each document upload.
+
+Fix: only call _make_thumb when ftype == "video".
 """
 from __future__ import annotations
 
@@ -73,25 +72,12 @@ def _build_caption(fname: str, custom: str, is_last: bool) -> str:
 # ─────────────────────────────────────────────────────────────
 
 async def _wait_stable(path: str, timeout: int = 30) -> None:
-    """
-    Wait for aria2 to finish writing before uploading.
-
-    Fast path: if no .aria2 sidecar exists the file is already complete
-    (FFmpeg, yt-dlp, and direct downloads all close the file before we
-    reach upload_file). Skip the stability loop entirely — saves ≥1s
-    per upload call.
-
-    Slow path: .aria2 exists → poll until it disappears (aria2 removes
-    it when the download is complete), then do one size-stability check.
-    """
     aria = path + ".aria2"
     if not os.path.exists(aria):
-        return  # fast path: already complete, no wait needed
+        return  # fast path: already complete
 
-    # Slow path: aria2 is still writing
     for _ in range(timeout):
         if not os.path.exists(aria):
-            # sidecar gone → wait one extra second for OS to flush
             await asyncio.sleep(1)
             return
         await asyncio.sleep(1)
@@ -122,7 +108,6 @@ async def _video_meta(path: str) -> dict:
                 meta["duration"] = int(float(s.get("duration", 0) or 0))
             except Exception:
                 pass
-            # MKV/HEVC keep duration in tags
             if not meta["duration"]:
                 for key in ("DURATION", "duration", "DURATION-eng", "DURATION-jpn"):
                     raw = (s.get("tags") or {}).get(key, "")
@@ -138,7 +123,7 @@ async def _video_meta(path: str) -> dict:
                             pass
                     if meta["duration"]:
                         break
-            break  # only first video stream needed
+            break
 
         if not meta["duration"]:
             try:
@@ -158,14 +143,6 @@ async def _video_meta(path: str) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
-    """
-    Returns (thumb_path, is_temp). Caller deletes if is_temp.
-
-    Quality improvements:
-      - scale up to 1280 px wide (was 320 — 4x sharper)
-      - -q:v 1  (best JPEG quality, was 2)
-      - tries 20% / 30% / 10% seek to avoid dark/black frames
-    """
     out = path + "_zt.jpg"
     candidates = (
         [max(1, int(duration * 0.20)),
@@ -197,17 +174,10 @@ async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
 # Auto-split for files > Telegram's 2 GB bot limit
 # ─────────────────────────────────────────────────────────────
 
-# Telegram Bot API hard limit: 2 GB per file.
-# We use 1900 MB as the safe ceiling to leave headroom for
-# container overhead (MKV header, metadata, etc.).
 TG_MAX_BYTES = 1900 * 1024 * 1024   # 1.9 GB
 
 
 async def _split_binary(path: str, tmp_dir: str, chunk_bytes: int) -> list[str]:
-    """
-    Split any file into binary chunks of `chunk_bytes`.
-    Returns list of part paths in order.
-    """
     fname  = os.path.basename(path)
     base   = os.path.splitext(fname)[0]
     ext    = os.path.splitext(fname)[1]
@@ -229,11 +199,6 @@ async def _split_binary(path: str, tmp_dir: str, chunk_bytes: int) -> list[str]:
 
 
 async def _split_video_by_size(path: str, tmp_dir: str, chunk_bytes: int) -> list[str]:
-    """
-    Split a video into parts where each part fits within chunk_bytes.
-    Uses FFmpeg segment muxer (fast, stream-copy — no re-encode).
-    Falls back to binary split if FFmpeg fails.
-    """
     from services import ffmpeg as FF
 
     try:
@@ -241,14 +206,13 @@ async def _split_video_by_size(path: str, tmp_dir: str, chunk_bytes: int) -> lis
         if not dur:
             raise ValueError("Unknown duration")
 
-        fsize     = os.path.getsize(path)
-        # Estimate how many seconds fit per chunk
+        fsize          = os.path.getsize(path)
         secs_per_chunk = int(dur * chunk_bytes / fsize)
         if secs_per_chunk < 10:
             secs_per_chunk = 10
 
-        base = os.path.splitext(os.path.basename(path))[0]
-        ext  = os.path.splitext(path)[1] or ".mp4"
+        base    = os.path.splitext(os.path.basename(path))[0]
+        ext     = os.path.splitext(path)[1] or ".mp4"
         pattern = os.path.join(tmp_dir, f"{base}.part%03d{ext}")
 
         proc = await asyncio.create_subprocess_exec(
@@ -291,14 +255,9 @@ async def _upload_parts(
     force_document: bool,
     thumb:          str | None,
 ) -> None:
-    """
-    Upload a list of part files sequentially.
-    Each part gets a caption showing its index: (Part 1/3), (Part 2/3), …
-    """
     total_parts = len(parts)
     chat_id     = _chat_id(msg)
 
-    # Notify about the split
     try:
         await client.send_message(
             chat_id,
@@ -319,8 +278,6 @@ async def _upload_parts(
             f"<code>{human_size(part_size)}</code>"
         )
 
-        # Create a dummy msg-like object since we already deleted the original
-        # send_message gives us a real message to pass into the core upload
         part_st = await client.send_message(
             chat_id,
             f"📤 Uploading Part {i}/{total_parts}…\n"
@@ -346,7 +303,6 @@ async def _upload_parts(
             except Exception:
                 pass
 
-    # Final summary
     try:
         await client.send_message(
             chat_id,
@@ -369,14 +325,9 @@ async def upload_file(
     caption:        str        = "",
     thumb:          str | None = None,
     force_document: bool       = False,
-    task_record                = None,   # kept for API compat — not used
+    task_record                = None,
     is_last:        bool       = False,
 ) -> None:
-    """
-    Public entry point.  Auto-splits files larger than TG_MAX_BYTES (1.9 GB)
-    into parts and uploads each one sequentially with Part N/Total labels.
-    Files within the limit go straight to _upload_single().
-    """
     if not os.path.isfile(path):
         await safe_edit(
             msg,
@@ -391,19 +342,16 @@ async def upload_file(
     original_fname = os.path.basename(path)
 
     if file_size <= TG_MAX_BYTES:
-        # Normal path — single upload
         await _upload_single(client, msg, path,
                              caption=caption, thumb=thumb,
                              force_document=force_document)
         return
 
-    # ── File exceeds 1.9 GB — split it ────────────────────────
     log.info(
         "File %s is %s — exceeds 1.9 GB limit, splitting",
         original_fname, human_size(file_size),
     )
 
-    # Dismiss placeholder immediately
     try:
         await msg.delete()
     except Exception:
@@ -437,11 +385,6 @@ async def _upload_single(
     thumb:          str | None = None,
     force_document: bool       = False,
 ) -> None:
-    """
-    Upload one file through the unified progress panel.
-    Called by upload_file() for files within the 1.9 GB limit,
-    and by _upload_parts() for each individual split part.
-    """
     chat_id   = _chat_id(msg)
     fname     = os.path.basename(path)
     file_size = os.path.getsize(path)
@@ -455,8 +398,11 @@ async def _upload_single(
     if ftype == "video":
         meta = await _video_meta(path)
 
-    # ── Thumbnail ──────────────────────────────────────────────
-    if ftype in ("video", "document") and not thumb:
+    # FIX (HIGH): only generate thumbnail for video files.
+    # Previously this also ran for ftype="document" (zip, rar, srt, etc.)
+    # causing ffmpeg to try 4 timestamps and fail silently for each one,
+    # wasting 1-3 seconds per non-video document upload.
+    if ftype == "video" and not thumb:
         t, is_temp = await _make_thumb(path, meta["duration"])
         if t:
             thumb = t
@@ -482,8 +428,8 @@ async def _upload_single(
     await tracker.register(record)
 
     task_start  = time.time()
-    _last_prog  = [task_start]          # throttle: update at most every 0.5s
-    _PROG_MIN   = 0.5                   # seconds between progress updates
+    _last_prog  = [task_start]
+    _PROG_MIN   = 0.5
 
     async def progress(current: int, total: int) -> None:
         now = time.time()
@@ -504,7 +450,6 @@ async def _upload_single(
              fname, ftype, human_size(file_size),
              meta["duration"], meta["width"], meta["height"])
 
-    # ── Send — retry loop for FloodWait (no recursion) ────────
     sent  = None
     error = None
 
@@ -543,7 +488,7 @@ async def _upload_single(
                 )
 
             error = None
-            break  # success
+            break
 
         except FloodWait as fw:
             wait = min(fw.value + 5, 120)
@@ -554,7 +499,6 @@ async def _upload_single(
             error = exc
             break
 
-    # ── Post-send bookkeeping ──────────────────────────────────
     if error is not None:
         record.update(state="❌ Failed")
         runner._wake_panel(chat_id, immediate=True)
@@ -578,7 +522,6 @@ async def _upload_single(
     record.update(state="✅ Done", done=file_size, total=file_size)
     runner._wake_panel(chat_id, immediate=True)
 
-    # Forward to log channel if configured
     if cfg.log_channel and sent:
         try:
             await sent.forward(cfg.log_channel)
