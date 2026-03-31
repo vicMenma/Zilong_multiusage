@@ -183,12 +183,14 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     dl_s = f"{human_size(dl_spd)}/s" if dl_spd else "—"
     ul_s = f"{human_size(ul_spd)}/s" if ul_spd else "—"
 
-    SEP = "────────────────────────────────"
+    SEP  = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    SEP2 = "────────────────────────────────"
 
     lines: list[str] = [
-        f"⚡ <b>{bot_name}</b>",
-        f"↓ <code>{dl_s}</code>  ↑ <code>{ul_s}</code>",
         SEP,
+        f"⚡  <b>{bot_name} MULTIUSAGE BOT</b>",
+        SEP,
+        f"↓ <code>{dl_s}</code>   ↑ <code>{ul_s}</code>",
         "",
     ]
 
@@ -227,7 +229,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
     slots = sum(1 for t in active if not t.state.startswith("⏳"))
     lines += [
-        SEP,
+        SEP2,
         f"🖥 <code>{cpu:.0f}%</code>  "
         f"🧠 <code>{ram_pct:.0f}%</code>  "
         f"💾 <code>{_compact(disk_free)}</code>  "
