@@ -19,7 +19,6 @@ import os
 import time
 
 from pyrogram import Client, enums
-from pyrogram.errors import FloodWait
 
 from core.config import cfg
 from services.utils import human_size, progress_panel, safe_edit
@@ -326,10 +325,6 @@ async def _upload_single(
                 )
             error = None
             break
-        except FloodWait as fw:
-            wait = min(fw.value + 5, 120)
-            log.warning("FloodWait %ds attempt %d", wait, attempt + 1)
-            await asyncio.sleep(wait)
         except Exception as exc:
             error = exc
             break
