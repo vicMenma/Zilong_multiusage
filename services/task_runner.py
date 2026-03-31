@@ -184,7 +184,6 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     ul_s = f"{human_size(ul_spd)}/s" if ul_spd else "—"
 
     SEP  = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    SEP2 = "────────────────────────────────"
 
     lines: list[str] = [
         SEP,
@@ -229,11 +228,13 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
     slots = sum(1 for t in active if not t.state.startswith("⏳"))
     lines += [
-        SEP2,
-        f"🖥 <code>{cpu:.0f}%</code>  "
-        f"🧠 <code>{ram_pct:.0f}%</code>  "
-        f"💾 <code>{_compact(disk_free)}</code>  "
-        f"📋 <code>{slots}/{MAX_CONCURRENT}</code>",
+        SEP,
+        f"🖥  CPU <code>{cpu:.0f}%</code>   "
+        f"🧠 RAM <code>{ram_pct:.0f}%</code>   "
+        f"💾 <code>{_compact(disk_free)}</code> free",
+        f"📋  Slots <code>{slots}/{MAX_CONCURRENT}</code>   "
+        f"↓ <code>{dl_s}</code>   ↑ <code>{ul_s}</code>",
+        SEP,
     ]
     return "\n".join(lines)
 
