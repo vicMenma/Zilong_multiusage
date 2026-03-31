@@ -69,8 +69,6 @@ def video_menu_kb(key: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("🎞️ Sample Clip",       callback_data=f"vid|sample|{key}")],
         [InlineKeyboardButton("🔄 Convert",           callback_data=f"vid|convert|{key}"),
          InlineKeyboardButton("⚡ Optimize",          callback_data=f"vid|optimize|{key}")],
-        [InlineKeyboardButton("📐 Resize",            callback_data=f"vid|resize|{key}"),
-         InlineKeyboardButton("🗜️ Compress",          callback_data=f"vid|compress_ask|{key}")],
         [InlineKeyboardButton("🏷️ Metadata",          callback_data=f"vid|metadata|{key}"),
          InlineKeyboardButton("✏️ Rename",            callback_data=f"vid|rename|{key}")],
         [InlineKeyboardButton("❌ Cancel",            callback_data=f"vid|cancel|{key}")],

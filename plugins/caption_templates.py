@@ -214,12 +214,10 @@ async def build_caption(path: str, channel_id: int) -> str:
 _WAITING: dict[int, int] = {}   # uid → channel_id being edited
 
 
-def _channels_with_templates(uid: int) -> list[dict]:
+async def _channels_with_templates(uid: int) -> list[dict]:
     """Get all channels the user has configured (from settings)."""
-    import asyncio
     try:
-        loop = asyncio.get_event_loop()
-        s    = loop.run_until_complete(settings.get(uid))
+        s = await settings.get(uid)
         return s.get("forward_channels", [])
     except Exception:
         return []
@@ -291,7 +289,7 @@ async def cmd_captiontemplate(client: Client, msg: Message):
     if uid != cfg.owner_id:
         return
 
-    channels = _channels_with_templates(uid)
+    channels = await _channels_with_templates(uid)
     await msg.reply(
         _manage_text(channels),
         reply_markup=_manage_kb(channels),
@@ -315,7 +313,7 @@ async def ctpl_cb(client: Client, cb: CallbackQuery):
 
     if action == "reset":
         delete_template(ch_id)
-        channels = _channels_with_templates(uid)
+        channels = await _channels_with_templates(uid)
         await cb.message.edit(
             _manage_text(channels),
             reply_markup=_manage_kb(channels),

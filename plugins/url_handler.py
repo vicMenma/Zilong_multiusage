@@ -132,11 +132,6 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔥 Hardsub",  callback_data=f"dl|hardsub|{token}"),
             InlineKeyboardButton("🔄 Convert",  callback_data=f"dl|convert|{token}"),
         ])
-        rows.append([
-            InlineKeyboardButton("📐 Resize",   callback_data=f"dl|resize|{token}"),
-            InlineKeyboardButton("🗜️ Compress", callback_data=f"dl|compress_url|{token}"),
-        ])
-
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"dl|cancel|{token}")])
     return InlineKeyboardMarkup(rows)
 
@@ -532,18 +527,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         }
         _evict_magnet_probes()
         await _show_magnet_streams(client, st, sess_tok, sd, dur, fname, uid)
-        return
-
-    # ── Resize ────────────────────────────────────────────────
-    if mode == "resize":
-        from plugins.resize import handle_url_resize
-        await handle_url_resize(client, cb, url, token)
-        return
-
-    # ── Compress URL ──────────────────────────────────────────
-    if mode == "compress_url":
-        from plugins.resize import handle_url_compress
-        await handle_url_compress(client, cb, url, uid)
         return
 
     # ── Hardsub ───────────────────────────────────────────────
