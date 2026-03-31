@@ -2,21 +2,14 @@
 plugins/url_handler.py
 Handles URL messages and torrent files.
 
-CRITICAL FIX — _handle_info CDN token burning:
-  For 'direct' URLs, _handle_info was downloading the first 5MB
-  (Range: bytes=0-5242880) to probe streams with ffprobe. For signed CDN
-  URLs (SonicBit, etc.) this single Range request burns the single-use
-  auth token. The user would click Info → streams shown → click Download
-  → URL is now expired → download fails with 403.
-
-  Fix: use ffprobe directly on the URL via subprocess (no download at all).
-  ffprobe can probe streams from any HTTP URL using its built-in demuxer.
-  The auth token is left completely untouched.
-
-MEDIUM FIX — _launch_download double delete:
-  asyncio.create_task(_safe_delete(panel_msg)) was called both BEFORE and
-  AFTER smart_download. The second call targeted an already-deleted message
-  and produced log noise. Removed the second call.
+FIXES:
+  - _launch_download: now sends a live progress panel BEFORE calling
+    smart_download, and passes msg=st so smart_download edits it with
+    real-time download progress. Previously no panel was shown during
+    the entire download phase — only upload had a panel.
+  - _handle_info (direct URLs): ffprobe on the URL, zero bytes downloaded,
+    preserving CDN single-use auth tokens.
+  - _launch_download double-delete: only one _safe_delete call.
 """
 from __future__ import annotations
 
@@ -26,7 +19,6 @@ import json as _json
 import logging
 import os
 import re
-import tempfile
 import time
 import urllib.parse as _up
 
@@ -42,7 +34,11 @@ from core.session import users
 from services.downloader import classify, smart_download, download_ytdlp
 from services.tg_download import tg_download
 from services.uploader import upload_file
-from services.utils import cleanup, human_size, lang_flag, lang_name, largest_file, make_tmp, safe_edit
+from services.utils import (
+    cleanup, human_size, lang_flag, lang_name,
+    largest_file, make_tmp, progress_panel, safe_edit,
+    smart_clean_filename,
+)
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +50,6 @@ URL_RE = re.compile(r"https?://\S+|magnet:\?\S+", re.I)
 _cache: dict[str, str] = {}
 _CACHE_MAX = 500
 
-# Store magnet probe sessions: tok → {"path", "tmp", "streams", "fname", "created"}
 _magnet_probe: dict[str, dict] = {}
 
 
@@ -160,7 +155,7 @@ async def url_handler(client: Client, msg: Message):
     if not m:
         return
 
-    uid   = msg.from_user.id
+    uid  = msg.from_user.id
     await users.register(uid, msg.from_user.first_name or "")
 
     url   = m.group(0)
@@ -191,8 +186,10 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
         pass
     tmp = make_tmp(cfg.download_dir, uid)
     from types import SimpleNamespace
-    _dummy = SimpleNamespace(edit=lambda *a, **kw: asyncio.sleep(0),
-                             delete=lambda: asyncio.sleep(0))
+    _dummy = SimpleNamespace(
+        edit=lambda *a, **kw: asyncio.sleep(0),
+        delete=lambda: asyncio.sleep(0),
+    )
     try:
         tp = await tg_download(
             client, media.file_id,
@@ -248,11 +245,9 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
         return None, None, {}
 
     meta_opts = {
-        "dir":                        tmp,
-        "seed-time":                  "0",
-        "max-connection-per-server":  "8",
-        "follow-torrent":             "mem",
-        "bt-max-peers":               "100",
+        "dir": tmp, "seed-time": "0",
+        "max-connection-per-server": "8",
+        "follow-torrent": "mem", "bt-max-peers": "100",
     }
 
     try:
@@ -279,7 +274,7 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
             except Exception: pass
             await safe_edit(st,
                 f"❌ <b>Metadata fetch failed</b>\n<code>{dl.error_message}</code>\n\n"
-                "<i>The magnet link could not be resolved. Try a magnet with more trackers.</i>",
+                "<i>The magnet link could not be resolved.</i>",
                 parse_mode=enums.ParseMode.HTML,
             )
             cleanup(tmp)
@@ -309,7 +304,7 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
     if not file_list:
         await safe_edit(st,
             "❌ <b>Could not resolve torrent metadata.</b>\n\n"
-            "<i>No trackers responded in time. The magnet link may be dead.</i>",
+            "<i>No trackers responded in time.</i>",
             parse_mode=enums.ParseMode.HTML,
         )
         cleanup(tmp)
@@ -346,13 +341,11 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
     await tracker.register(record)
 
     dl_opts = {
-        "dir":                        tmp,
-        "seed-time":                  "0",
-        "select-file":                str(target_file["index"]),
-        "follow-torrent":             "mem",
-        "max-connection-per-server":  "16",
-        "split":                      "16",
-        "bt-max-peers":               "200",
+        "dir": tmp, "seed-time": "0",
+        "select-file": str(target_file["index"]),
+        "follow-torrent": "mem",
+        "max-connection-per-server": "16",
+        "split": "16", "bt-max-peers": "200",
     }
 
     try:
@@ -532,30 +525,28 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         sd    = probe.get("streams", {})
         dur   = probe.get("duration", 0)
         fname = probe.get("fname", os.path.basename(path))
-
         sess_tok = hashlib.md5(path.encode()).hexdigest()[:10]
         _magnet_probe[sess_tok] = {
             "path": path, "tmp": tmp, "streams": sd,
             "fname": fname, "created": time.time(),
         }
         _evict_magnet_probes()
-
         await _show_magnet_streams(client, st, sess_tok, sd, dur, fname, uid)
         return
 
-    # ── 📐 Resize ─────────────────────────────────────────────
+    # ── Resize ────────────────────────────────────────────────
     if mode == "resize":
         from plugins.resize import handle_url_resize
         await handle_url_resize(client, cb, url, token)
         return
 
-    # ── 🗜️ Compress URL ──────────────────────────────────────
+    # ── Compress URL ──────────────────────────────────────────
     if mode == "compress_url":
         from plugins.resize import handle_url_compress
-        await handle_url_compress(client, cb, url, cb.from_user.id)
+        await handle_url_compress(client, cb, url, uid)
         return
 
-    # ── 🔥 Hardsub ────────────────────────────────────────────
+    # ── Hardsub ───────────────────────────────────────────────
     if mode == "hardsub":
         api_key = os.environ.get("CC_API_KEY", "").strip()
         if not api_key:
@@ -564,13 +555,10 @@ async def dl_cb(client: Client, cb: CallbackQuery):
                 "Add <code>CC_API_KEY=your_key</code> to your .env or Colab secrets.",
                 parse_mode=enums.ParseMode.HTML,
             )
-
         from plugins.hardsub import _STATE, _clear
         _clear(uid)
-
-        tmp      = make_tmp(cfg.download_dir, uid)
-        kind_h   = classify(url)
-
+        tmp    = make_tmp(cfg.download_dir, uid)
+        kind_h = classify(url)
         if kind_h == "direct":
             raw_name = url.split("/")[-1].split("?")[0]
             fname    = _up.unquote_plus(raw_name)[:50] or "video.mkv"
@@ -581,12 +569,9 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             fname = "video.mkv"
 
         _STATE[uid] = {
-            "step":     "waiting_subtitle",
-            "tmp":      tmp,
-            "videos":   [{"path": None, "url": url, "fname": fname, "resolution": 0}],
-            "sub_path": None,
-            "sub_fname": None,
-            "_res_idx": 0,
+            "step": "waiting_subtitle", "tmp": tmp,
+            "videos": [{"path": None, "url": url, "fname": fname, "resolution": 0}],
+            "sub_path": None, "sub_fname": None, "_res_idx": 0,
         }
 
         if kind_h in ("magnet", "torrent"):
@@ -602,10 +587,8 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             return
 
         await safe_edit(cb.message,
-            f"🔥 <b>Hardsub</b>\n"
-            "──────────────────────\n\n"
-            f"🎬 <code>{fname[:45]}</code>\n"
-            "📐 Resolution: <b>Original</b>\n\n"
+            f"🔥 <b>Hardsub</b>\n──────────────────────\n\n"
+            f"🎬 <code>{fname[:45]}</code>\n📐 Resolution: <b>Original</b>\n\n"
             "Now send the <b>subtitle</b>:\n"
             "• A <b>file</b> (.ass / .srt / .vtt / .txt)\n"
             "• A <b>URL</b> to a subtitle file\n\n"
@@ -614,7 +597,7 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         )
         return
 
-    # ── 🔄 Convert ────────────────────────────────────────────
+    # ── Convert ───────────────────────────────────────────────
     if mode == "convert":
         api_key = os.environ.get("CC_API_KEY", "").strip()
         if not api_key:
@@ -623,11 +606,9 @@ async def dl_cb(client: Client, cb: CallbackQuery):
                 "Add <code>CC_API_KEY=your_key</code> to your .env or Colab secrets.",
                 parse_mode=enums.ParseMode.HTML,
             )
-
         kind_c = classify(url)
         if kind_c == "direct":
-            raw_name = url.split("/")[-1].split("?")[0]
-            fname    = _up.unquote_plus(raw_name)[:50] or "video.mkv"
+            fname = _up.unquote_plus(url.split("/")[-1].split("?")[0])[:50] or "video.mkv"
         elif kind_c in ("magnet", "torrent"):
             dn_match = re.search(r"[&?]dn=([^&]+)", url)
             fname    = _up.unquote_plus(dn_match.group(1))[:50] if dn_match else "video.mkv"
@@ -635,10 +616,8 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             fname = "video.mkv"
 
         await cb.message.edit(
-            f"🔄 <b>CloudConvert — Convert</b>\n"
-            "──────────────────────\n\n"
-            f"🎬 <code>{fname[:45]}</code>\n\n"
-            "Choose target resolution:",
+            f"🔄 <b>CloudConvert — Convert</b>\n──────────────────────\n\n"
+            f"🎬 <code>{fname[:45]}</code>\n\nChoose target resolution:",
             parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🎬 Original",  callback_data=f"ccv|0|{token}"),
@@ -706,8 +685,7 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
     kind         = classify(url)
 
     if kind == "direct":
-        raw_name = url.split("/")[-1].split("?")[0]
-        fname    = _up.unquote_plus(raw_name)[:50] or "video.mkv"
+        fname = _up.unquote_plus(url.split("/")[-1].split("?")[0])[:50] or "video.mkv"
     elif kind in ("magnet", "torrent"):
         dn_match = re.search(r"[&?]dn=([^&]+)", url)
         fname    = _up.unquote_plus(dn_match.group(1))[:50] if dn_match else "video.mkv"
@@ -719,16 +697,14 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
     output_name = re.sub(r'[^\w\s\-\[\]()]', '_', name_base).strip() + f"{res_tag}.mp4"
 
     await safe_edit(cb.message,
-        f"☁️ <b>Submitting convert job…</b>\n"
-        "──────────────────────\n\n"
-        f"🎬 <code>{fname[:40]}</code>\n"
-        f"📐 → <b>{res_label}</b>\n\n"
+        f"☁️ <b>Submitting convert job…</b>\n──────────────────────\n\n"
+        f"🎬 <code>{fname[:40]}</code>\n📐 → <b>{res_label}</b>\n\n"
         "<i>Checking API keys…</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
-    api_key  = os.environ.get("CC_API_KEY", "").strip()
-    tmp_conv = None
+    api_key    = os.environ.get("CC_API_KEY", "").strip()
+    tmp_conv   = None
     video_path = None
 
     try:
@@ -744,10 +720,8 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
 
         if kind in ("magnet", "torrent"):
             tmp_conv = make_tmp(cfg.download_dir, uid)
-            await safe_edit(cb.message,
-                f"⬇️ Downloading video via {kind}…",
-                parse_mode=enums.ParseMode.HTML,
-            )
+            await safe_edit(cb.message, f"⬇️ Downloading video via {kind}…",
+                            parse_mode=enums.ParseMode.HTML)
             video_path_raw = await smart_download(url, tmp_conv, user_id=uid, label=fname)
             if os.path.isdir(video_path_raw):
                 resolved = largest_file(video_path_raw)
@@ -758,7 +732,7 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
             video_path = video_path_raw
             fname      = os.path.basename(video_path)
 
-        job_id  = await submit_convert(
+        job_id = await submit_convert(
             api_key,
             video_path=video_path,
             video_url=video_url,
@@ -767,16 +741,13 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
         )
         mode_s = "☁️ URL import" if video_url else "📤 File upload"
         await safe_edit(cb.message,
-            f"✅ <b>Convert Job Submitted!</b>\n"
-            "──────────────────────\n\n"
+            f"✅ <b>Convert Job Submitted!</b>\n──────────────────────\n\n"
             f"🆔 <code>{job_id}</code>\n"
             f"🎬 <code>{fname[:38]}</code>\n"
             f"📐 → <b>{res_label}</b>\n"
             f"📦 → <code>{output_name[:40]}</code>\n"
-            f"⚙️ {mode_s}\n"
-            f"{key_info}\n\n"
-            "⏳ <i>CloudConvert is processing…\n"
-            "The webhook will auto-upload the result.</i>",
+            f"⚙️ {mode_s}\n{key_info}\n\n"
+            "⏳ <i>CloudConvert is processing…</i>",
             parse_mode=enums.ParseMode.HTML,
         )
 
@@ -798,7 +769,7 @@ async def _show_magnet_streams(
     client: Client, st, sess_tok: str,
     sd: dict, dur: int, fname: str, uid: int,
 ) -> None:
-    from services.utils import human_size, fmt_hms
+    from services.utils import fmt_hms
 
     v_streams = sd.get("video",    [])
     a_streams = sd.get("audio",    [])
@@ -811,36 +782,30 @@ async def _show_magnet_streams(
         "──────────────────────",
     ]
 
-    if v_streams:
-        lines.append(f"🎬 <b>Video</b>  ({len(v_streams)} track)")
-        for s in v_streams:
-            codec = s.get("codec_name","?").upper()
-            w, h  = s.get("width",0), s.get("height",0)
-            fr    = s.get("r_frame_rate","0/1")
-            try:
-                n2, d2 = fr.split("/")
-                fps = f"{float(n2)/max(float(d2),1):.0f}fps"
-            except Exception:
-                fps = ""
-            lines.append(f"  • <code>{codec}  {w}x{h}  {fps}</code>")
+    for s in v_streams:
+        codec = s.get("codec_name","?").upper()
+        w, h  = s.get("width",0), s.get("height",0)
+        fr    = s.get("r_frame_rate","0/1")
+        try:
+            n2, d2 = fr.split("/")
+            fps = f"{float(n2)/max(float(d2),1):.0f}fps"
+        except Exception:
+            fps = ""
+        lines.append(f"  🎬 <code>{codec}  {w}x{h}  {fps}</code>")
 
-    if a_streams:
-        lines.append(f"🎵 <b>Audio</b>  ({len(a_streams)} track{'s' if len(a_streams)>1 else ''})")
-        for s in a_streams:
-            codec = s.get("codec_name","?").upper()
-            tags  = s.get("tags",{}) or {}
-            lang  = (tags.get("language","und")).lower()
-            ch    = s.get("channels",0)
-            ch_s  = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch, f"{ch}ch") if ch else ""
-            lines.append(f"  • {_flag(lang)} <code>{codec}  {ch_s}</code>  {_lname(lang)}")
+    for s in a_streams:
+        codec = s.get("codec_name","?").upper()
+        tags  = s.get("tags",{}) or {}
+        lang  = (tags.get("language","und")).lower()
+        ch    = s.get("channels",0)
+        ch_s  = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch, f"{ch}ch") if ch else ""
+        lines.append(f"  🎵 {_flag(lang)} <code>{codec}  {ch_s}</code>  {_lname(lang)}")
 
-    if s_streams:
-        lines.append(f"💬 <b>Subtitles</b>  ({len(s_streams)} track{'s' if len(s_streams)>1 else ''})")
-        for s in s_streams:
-            codec = s.get("codec_name","?").upper()
-            tags  = s.get("tags",{}) or {}
-            lang  = (tags.get("language","und")).lower()
-            lines.append(f"  • {_flag(lang)} <code>{codec}</code>  {_lname(lang)}")
+    for s in s_streams:
+        codec = s.get("codec_name","?").upper()
+        tags  = s.get("tags",{}) or {}
+        lang  = (tags.get("language","und")).lower()
+        lines.append(f"  💬 {_flag(lang)} <code>{codec}</code>  {_lname(lang)}")
 
     if not any([v_streams, a_streams, s_streams]):
         lines.append("⚠️ <i>No streams detected in this file.</i>")
@@ -887,7 +852,6 @@ async def _show_magnet_streams(
             "💬 Extract ALL subtitle tracks",
             callback_data=f"mse|s_all|{sess_tok}|all|{uid}",
         )])
-
     rows.append([InlineKeyboardButton("❌ Close", callback_data=f"mse|cancel|{sess_tok}|0|{uid}")])
 
     await safe_edit(st, "\n".join(lines),
@@ -924,7 +888,6 @@ async def mse_cb(client: Client, cb: CallbackQuery):
     base  = os.path.splitext(fname)[0]
 
     from services import ffmpeg as FF
-
     st = await cb.message.edit("📤 Extracting stream…")
 
     try:
@@ -932,14 +895,12 @@ async def mse_cb(client: Client, cb: CallbackQuery):
             stream_list = sd.get("audio" if stype == "a_all" else "subtitle", [])
             if not stream_list:
                 return await safe_edit(st, "❌ No tracks found.")
-
             await safe_edit(st, f"📤 Extracting {len(stream_list)} track(s)…")
             for s in stream_list:
                 idx   = s.get("index", 0)
                 codec = (s.get("codec_name") or "").lower()
                 tags  = s.get("tags", {}) or {}
                 lang  = (tags.get("language") or "und").lower()
-
                 if stype == "a_all":
                     out_ext = FF.audio_ext(codec)
                     out     = os.path.join(tmp, f"{base}_audio_{idx}_{lang}{out_ext}")
@@ -948,7 +909,6 @@ async def mse_cb(client: Client, cb: CallbackQuery):
                     out_ext = FF.subtitle_ext(codec)
                     out     = os.path.join(tmp, f"{base}_sub_{idx}_{lang}{out_ext}")
                     caption = f"💬 <b>Subtitle #{idx}</b>  {_flag(lang)} {_lname(lang)}\n<code>{codec.upper()}</code>"
-
                 try:
                     await FF.stream_op(path, out, ["-map", f"0:{idx}", "-c", "copy"])
                     await client.send_document(
@@ -956,13 +916,11 @@ async def mse_cb(client: Client, cb: CallbackQuery):
                     )
                 except Exception as exc:
                     log.warning("mse all extract idx=%d: %s", idx, exc)
-
             await st.delete()
 
         else:
             all_streams = sd.get("video",[]) + sd.get("audio",[]) + sd.get("subtitle",[])
             target = next((s for s in all_streams if str(s.get("index")) == idx_str), None)
-
             if not target:
                 return await safe_edit(st, f"❌ Stream #{idx_str} not found.")
 
@@ -1006,7 +964,6 @@ async def mse_cb(client: Client, cb: CallbackQuery):
 async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token: str) -> None:
     st  = await cb.message.edit("🧲 Probing magnet content…")
     uid = cb.from_user.id
-
     path, tmp, probe = await _probe_magnet_file(url, uid, st)
     if not path:
         return
@@ -1016,7 +973,7 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
     fname = probe.get("fname", os.path.basename(path))
     fsize = os.path.getsize(path) if os.path.exists(path) else 0
 
-    from services.utils import human_size, fmt_hms
+    from services.utils import fmt_hms
     from services import ffmpeg as FF
 
     v_streams = sd.get("video",    [])
@@ -1024,13 +981,11 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
     s_streams = sd.get("subtitle", [])
 
     lines = [
-        "📊 <b>Magnet Media Info</b>",
-        "──────────────────────",
+        "📊 <b>Magnet Media Info</b>", "──────────────────────",
         f"📄 <code>{fname[:50]}</code>",
         f"💾 <code>{human_size(fsize)}</code>  ⏱ <code>{fmt_hms(dur)}</code>",
         "──────────────────────",
     ]
-
     for s in v_streams:
         codec = s.get("codec_name","?").upper()
         w, h  = s.get("width",0), s.get("height",0)
@@ -1043,7 +998,6 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
         pix   = s.get("pix_fmt","")
         hdr_s = " HDR" if "10" in pix else ""
         lines.append(f"🎬 <code>{codec}  {w}x{h}  {fps}{hdr_s}</code>")
-
     for s in a_streams:
         codec = s.get("codec_name","?").upper()
         ch    = s.get("channels",0)
@@ -1051,13 +1005,11 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
         tags  = s.get("tags",{}) or {}
         lang  = (tags.get("language","und")).lower()
         lines.append(f"🎵 <code>{codec}  {ch_s}</code>  {_flag(lang)} {_lname(lang)}")
-
     for s in s_streams[:6]:
         codec = s.get("codec_name","?").upper()
         tags  = s.get("tags",{}) or {}
         lang  = (tags.get("language","und")).lower()
         lines.append(f"💬 <code>{codec}</code>  {_flag(lang)} {_lname(lang)}")
-
     if not any([v_streams, a_streams, s_streams]):
         lines.append("⚠️ <i>No media streams detected.</i>")
 
@@ -1069,12 +1021,10 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
         kb_rows.append([InlineKeyboardButton("📋 Full MediaInfo →", url=tph)])
     except Exception:
         pass
-
     kb_rows += [
         [InlineKeyboardButton("🧲 Download File", callback_data=f"dl|video|{token}")],
         [InlineKeyboardButton("❌ Close",         callback_data=f"dl|cancel|{token}")],
     ]
-
     cleanup(tmp)
     await safe_edit(st, "\n".join(lines),
         parse_mode=enums.ParseMode.HTML,
@@ -1083,15 +1033,14 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
 
 
 # ─────────────────────────────────────────────────────────────
-# Upload helper
+# Upload + cleanup helper  (used by handle_torrent_file)
 # ─────────────────────────────────────────────────────────────
 
 async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
-    from pyrogram import enums as _enums
     st = await client.send_message(
         uid,
         f"📤 <b>Uploading…</b>\n<code>{os.path.basename(path)}</code>",
-        parse_mode=_enums.ParseMode.HTML,
+        parse_mode=enums.ParseMode.HTML,
     )
     try:
         await upload_file(client, st, path)
@@ -1113,7 +1062,7 @@ async def _safe_delete(msg) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# Download launcher
+# _launch_download  — FIXED: sends live download panel
 # ─────────────────────────────────────────────────────────────
 
 async def _launch_download(
@@ -1127,39 +1076,64 @@ async def _launch_download(
     tmp  = make_tmp(cfg.download_dir, uid)
     kind = classify(url)
 
+    # Build label
     if kind in ("magnet", "torrent"):
         dn_match = re.search(r"[&?]dn=([^&]+)", url)
         if dn_match:
             label = _up.unquote_plus(dn_match.group(1))[:50]
         else:
             ih_match = re.search(r"xt=urn:btih:([a-fA-F0-9]{6,}|[A-Za-z2-7]{6,})", url)
-            label = f"Magnet {ih_match.group(1)[:12].upper()}" if ih_match else "Magnet Download"
+            label = (
+                f"Magnet {ih_match.group(1)[:12].upper()}"
+                if ih_match else "Magnet Download"
+            )
+        engine = "magnet"
+        mode   = "magnet"
     else:
-        raw   = url.split("/")[-1].split("?")[0]
-        label = _up.unquote_plus(raw)[:50] or "Download"
+        raw    = url.split("/")[-1].split("?")[0]
+        label  = _up.unquote_plus(raw)[:50] or "Download"
+        engine = "ytdlp" if kind == "ytdlp" else kind
+        mode   = "dl"
 
-    # FIX (MEDIUM): only one _safe_delete call here — the panel_msg is deleted
-    # before smart_download starts. The second call (after smart_download in the
-    # original code) was operating on an already-deleted message and logged errors.
-    asyncio.create_task(_safe_delete(panel_msg))
+    # Delete action menu
+    try:
+        await panel_msg.delete()
+    except Exception:
+        pass
 
+    # Open live download panel
+    st = await client.send_message(
+        uid,
+        progress_panel(
+            mode=mode, fname=label, done=0, total=0,
+            engine=engine, link_label=label[:24],
+        ),
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    # Download — smart_download edits st with real-time progress
     try:
         path = await smart_download(
-            url, tmp, audio_only=audio_only, fmt_id=fmt_id, user_id=uid, label=label,
+            url, tmp,
+            audio_only=audio_only,
+            fmt_id=fmt_id,
+            user_id=uid,
+            label=label,
+            msg=st,          # ← key fix: live progress goes to st
         )
     except Exception as exc:
         log.error("_launch_download uid=%d failed: %s", uid, exc, exc_info=True)
         cleanup(tmp)
         try:
-            from core.session import get_client
-            await get_client().send_message(
-                uid, f"❌ <b>Download failed</b>\n\n<code>{exc}</code>",
+            await st.edit(
+                f"❌ <b>Download failed</b>\n\n<code>{exc}</code>",
                 parse_mode=enums.ParseMode.HTML,
             )
-        except Exception as send_exc:
-            log.warning("_launch_download: could not notify uid=%d: %s", uid, send_exc)
+        except Exception:
+            pass
         return
 
+    # Resolve directory → largest file
     if os.path.isdir(path):
         resolved = largest_file(path)
         if resolved:
@@ -1169,9 +1143,8 @@ async def _launch_download(
         log.error("_launch_download uid=%d: path not a file: %s", uid, path)
         cleanup(tmp)
         try:
-            from core.session import get_client
-            await get_client().send_message(
-                uid, "❌ <b>Download failed</b>\n\n<code>Output file not found</code>",
+            await st.edit(
+                "❌ <b>Download failed</b>\n\n<code>Output file not found</code>",
                 parse_mode=enums.ParseMode.HTML,
             )
         except Exception:
@@ -1182,9 +1155,7 @@ async def _launch_download(
     if fsize > cfg.file_limit_b:
         cleanup(tmp)
         try:
-            from core.session import get_client
-            await get_client().send_message(
-                uid,
+            await st.edit(
                 f"❌ <b>File too large</b>\n"
                 f"Size: <code>{human_size(fsize)}</code>\n"
                 f"Limit: <code>{human_size(cfg.file_limit_b)}</code>",
@@ -1194,41 +1165,40 @@ async def _launch_download(
             pass
         return
 
+    # Apply prefix / suffix
     from core.session import settings as _settings
-    from services.utils import smart_clean_filename
     s = await _settings.get(uid)
-
-    fname   = os.path.basename(path)
-    cleaned = smart_clean_filename(fname)
-    name, ext = os.path.splitext(cleaned)
-
+    fname      = os.path.basename(path)
+    cleaned    = smart_clean_filename(fname)
+    name, ext  = os.path.splitext(cleaned)
     prefix     = s.get("prefix", "").strip()
     suffix     = s.get("suffix", "").strip()
     final_name = f"{prefix}{name}{suffix}{ext}"
-
     if final_name != fname:
         new_path = os.path.join(os.path.dirname(path), final_name)
         try:
             os.rename(path, new_path)
             path = new_path
-        except OSError as _re:
-            log.warning("Rename failed: %s", _re)
+        except OSError as rename_err:
+            log.warning("Rename failed: %s", rename_err)
 
-    asyncio.create_task(_upload_and_cleanup(client, uid, path, tmp))
+    # Upload — upload_file deletes st and opens its own upload panel
+    try:
+        await upload_file(client, st, path)
+    except Exception as exc:
+        log.error("Upload failed for %s: %s", path, exc)
+    finally:
+        cleanup(tmp)
 
 
 # ─────────────────────────────────────────────────────────────
 # Info handler (non-magnet)
-# CRITICAL FIX: For direct URLs, use ffprobe directly on the URL —
-# DO NOT download any bytes first. Downloading burns CDN single-use
-# auth tokens (SonicBit, etc.) before the Download button is even used.
 # ─────────────────────────────────────────────────────────────
 
 async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) -> None:
     st   = await cb.message.edit("📊 Fetching info…")
     kind = classify(url)
 
-    # ── yt-dlp sites ──────────────────────────────────────────
     if kind == "ytdlp":
         try:
             import yt_dlp
@@ -1270,11 +1240,7 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
                             parse_mode=enums.ParseMode.HTML)
         return
 
-    # ── Direct URL — FIX: ffprobe on the URL, zero bytes downloaded ──
-    # The old code downloaded 5MB (Range: bytes=0-5242880) using aiohttp.
-    # For CDN signed URLs that burns the single-use auth token, making the
-    # subsequent Download click fail with 403. Now we run ffprobe directly
-    # on the URL via its built-in HTTP demuxer — no download, token intact.
+    # Direct URL — ffprobe on the URL, zero bytes downloaded
     try:
         cmd = [
             "ffprobe", "-v", "quiet",
@@ -1293,30 +1259,24 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            try: proc.kill()
+            except Exception: pass
             raise RuntimeError("ffprobe timed out (30s)")
 
         data    = _json.loads(out.decode(errors="replace") or "{}")
         streams = data.get("streams", [])
         fmt     = data.get("format", {})
 
-        # Try to get the filename from the URL
         from pathlib import Path as _P
-        fn = _P(url.split("?")[0]).name or "file"
-        fn = fn[:50]
-
-        # Try to get total size — first from ffprobe format, then via HEAD
+        fn    = _P(url.split("?")[0]).name or "file"
+        fn    = fn[:50]
         total = int(fmt.get("size", 0) or 0)
+
         if not total:
             try:
                 async with aiohttp.ClientSession() as sess:
-                    async with sess.head(
-                        url, allow_redirects=True,
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as resp:
+                    async with sess.head(url, allow_redirects=True,
+                                         timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         total = int(resp.headers.get("Content-Length", 0))
                         cd = resp.headers.get("Content-Disposition", "")
                         if "filename=" in cd:
@@ -1327,8 +1287,6 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
                 pass
 
         dur_s = float(fmt.get("duration", 0) or 0)
-
-        # Classify streams
         sd: dict = {"video": [], "audio": [], "subtitle": []}
         for s in streams:
             t = s.get("codec_type", "")
@@ -1342,7 +1300,6 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
             f"⏱ <code>{_fmt_dur(int(dur_s))}</code>",
             "──────────────────",
         ]
-
         for s in sd.get("video", []):
             codec = s.get("codec_name","?").upper()
             w, h  = s.get("width",0), s.get("height",0)
@@ -1366,8 +1323,7 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
             lines.append(f"💬 <code>{codec}</code>  {_flag(lang)} {_lname(lang)}")
 
         if not any(sd.get(t) for t in ("video", "audio")):
-            lines.append("⚠️ <i>ffprobe could not read streams "
-                         "(CDN may require auth headers).</i>")
+            lines.append("⚠️ <i>ffprobe could not read streams.</i>")
 
         kb = [
             [InlineKeyboardButton("🎬 Download", callback_data=f"dl|video|{token}")],
@@ -1375,7 +1331,6 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
         ]
         try:
             from services.telegraph import post_mediainfo
-            # Build a minimal mediainfo text from ffprobe data (no download)
             mi_lines = [f"File: {fn}"]
             if total:
                 mi_lines.append(f"Size: {human_size(total)}")
