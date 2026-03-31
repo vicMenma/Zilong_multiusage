@@ -2,17 +2,24 @@
 services/utils.py
 Pure helper functions — no Telegram types, no side effects.
 
-FIX: smart_clean_filename now only applies the noise-token stop rule after
-the 3rd token (index >= 2). Previously "TS Online - Episode 01.mkv" would
-be cleaned to just "Online - Episode 01" because "TS" matched the noise
-pattern on the very first token.
+REWRITE:
+  - New progress_panel() matching the Image 1 design:
+      DOWNLOADING FROM » Link 01
+      Name » filename.mkv
+      [████████░░] 68.3%
+      Speed / Engine / ETA / Elapsed / Done / Total
+      CPU [█████░] 47% / RAM / Disk Free
+      Footer quote
+  - smart_clean_filename: noise guard after 3rd token (kept)
+  - All language tables kept
+  - system_stats kept
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
+import re as _re
 import shutil
 import time
 from typing import Optional
@@ -20,36 +27,41 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
-# Shared language lookup tables
+# Language tables
 # ─────────────────────────────────────────────────────────────
 
 LANG_FLAG: dict[str, str] = {
-    "eng":"🇬🇧","en":"🇬🇧","jpn":"🇯🇵","ja":"🇯🇵",
-    "fra":"🇫🇷","fre":"🇫🇷","fr":"🇫🇷","deu":"🇩🇪","ger":"🇩🇪","de":"🇩🇪",
-    "spa":"🇪🇸","es":"🇪🇸","por":"🇧🇷","pt":"🇧🇷","ita":"🇮🇹","it":"🇮🇹",
-    "kor":"🇰🇷","ko":"🇰🇷","chi":"🇨🇳","zho":"🇨🇳","zh":"🇨🇳",
-    "rus":"🇷🇺","ru":"🇷🇺","ara":"🇸🇦","ar":"🇸🇦","hin":"🇮🇳","hi":"🇮🇳",
-    "tha":"🇹🇭","th":"🇹🇭","vie":"🇻🇳","vi":"🇻🇳","ind":"🇮🇩","id":"🇮🇩",
-    "msa":"🇲🇾","ms":"🇲🇾","tur":"🇹🇷","tr":"🇹🇷","pol":"🇵🇱","pl":"🇵🇱",
-    "nld":"🇳🇱","nl":"🇳🇱","swe":"🇸🇪","sv":"🇸🇪","nor":"🇳🇴","no":"🇳🇴",
-    "dan":"🇩🇰","da":"🇩🇰","fin":"🇫🇮","fi":"🇫🇮","heb":"🇮🇱","he":"🇮🇱",
-    "ces":"🇨🇿","cze":"🇨🇿","ron":"🇷🇴","rum":"🇷🇴","hun":"🇭🇺","hu":"🇭🇺",
-    "bul":"🇧🇬","bg":"🇧🇬","ukr":"🇺🇦","uk":"🇺🇦","und":"🌐",
+    "eng": "🇬🇧", "en": "🇬🇧", "jpn": "🇯🇵", "ja": "🇯🇵",
+    "fra": "🇫🇷", "fre": "🇫🇷", "fr": "🇫🇷", "deu": "🇩🇪", "ger": "🇩🇪", "de": "🇩🇪",
+    "spa": "🇪🇸", "es": "🇪🇸", "por": "🇧🇷", "pt": "🇧🇷", "ita": "🇮🇹", "it": "🇮🇹",
+    "kor": "🇰🇷", "ko": "🇰🇷", "chi": "🇨🇳", "zho": "🇨🇳", "zh": "🇨🇳",
+    "rus": "🇷🇺", "ru": "🇷🇺", "ara": "🇸🇦", "ar": "🇸🇦", "hin": "🇮🇳", "hi": "🇮🇳",
+    "tha": "🇹🇭", "th": "🇹🇭", "vie": "🇻🇳", "vi": "🇻🇳", "ind": "🇮🇩", "id": "🇮🇩",
+    "msa": "🇲🇾", "ms": "🇲🇾", "tur": "🇹🇷", "tr": "🇹🇷", "pol": "🇵🇱", "pl": "🇵🇱",
+    "nld": "🇳🇱", "nl": "🇳🇱", "swe": "🇸🇪", "sv": "🇸🇪", "nor": "🇳🇴", "no": "🇳🇴",
+    "dan": "🇩🇰", "da": "🇩🇰", "fin": "🇫🇮", "fi": "🇫🇮", "heb": "🇮🇱", "he": "🇮🇱",
+    "ces": "🇨🇿", "cze": "🇨🇿", "ron": "🇷🇴", "rum": "🇷🇴", "hun": "🇭🇺", "hu": "🇭🇺",
+    "bul": "🇧🇬", "bg": "🇧🇬", "ukr": "🇺🇦", "uk": "🇺🇦", "und": "🌐",
 }
 
 LANG_NAME: dict[str, str] = {
-    "eng":"English","en":"English","jpn":"Japanese","ja":"Japanese",
-    "fra":"French","fre":"French","fr":"French","deu":"German","ger":"German","de":"German",
-    "spa":"Spanish","es":"Spanish","por":"Portuguese","pt":"Portuguese",
-    "ita":"Italian","it":"Italian","kor":"Korean","ko":"Korean",
-    "chi":"Chinese","zho":"Chinese","zh":"Chinese","rus":"Russian","ru":"Russian",
-    "ara":"Arabic","ar":"Arabic","hin":"Hindi","hi":"Hindi","tha":"Thai","th":"Thai",
-    "vie":"Vietnamese","vi":"Vietnamese","ind":"Indonesian","id":"Indonesian",
-    "msa":"Malay","ms":"Malay","tur":"Turkish","tr":"Turkish","pol":"Polish","pl":"Polish",
-    "nld":"Dutch","nl":"Dutch","swe":"Swedish","sv":"Swedish","nor":"Norwegian","no":"Norwegian",
-    "dan":"Danish","da":"Danish","fin":"Finnish","fi":"Finnish","heb":"Hebrew","he":"Hebrew",
-    "ces":"Czech","cze":"Czech","ron":"Romanian","rum":"Romanian","hun":"Hungarian","hu":"Hungarian",
-    "bul":"Bulgarian","bg":"Bulgarian","ukr":"Ukrainian","uk":"Ukrainian","und":"Unknown",
+    "eng": "English", "en": "English", "jpn": "Japanese", "ja": "Japanese",
+    "fra": "French", "fre": "French", "fr": "French",
+    "deu": "German", "ger": "German", "de": "German",
+    "spa": "Spanish", "es": "Spanish", "por": "Portuguese", "pt": "Portuguese",
+    "ita": "Italian", "it": "Italian", "kor": "Korean", "ko": "Korean",
+    "chi": "Chinese", "zho": "Chinese", "zh": "Chinese",
+    "rus": "Russian", "ru": "Russian", "ara": "Arabic", "ar": "Arabic",
+    "hin": "Hindi", "hi": "Hindi", "tha": "Thai", "th": "Thai",
+    "vie": "Vietnamese", "vi": "Vietnamese", "ind": "Indonesian", "id": "Indonesian",
+    "msa": "Malay", "ms": "Malay", "tur": "Turkish", "tr": "Turkish",
+    "pol": "Polish", "pl": "Polish", "nld": "Dutch", "nl": "Dutch",
+    "swe": "Swedish", "sv": "Swedish", "nor": "Norwegian", "no": "Norwegian",
+    "dan": "Danish", "da": "Danish", "fin": "Finnish", "fi": "Finnish",
+    "heb": "Hebrew", "he": "Hebrew", "ces": "Czech", "cze": "Czech",
+    "ron": "Romanian", "rum": "Romanian", "hun": "Hungarian", "hu": "Hungarian",
+    "bul": "Bulgarian", "bg": "Bulgarian", "ukr": "Ukrainian", "uk": "Ukrainian",
+    "und": "Unknown",
 }
 
 
@@ -67,7 +79,7 @@ def lang_name(lang: str) -> str:
 
 def human_size(n: float) -> str:
     if n < 0:
-        n = 0
+        n = 0.0
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if abs(n) < 1024.0:
             return f"{n:.2f} {unit}"
@@ -80,7 +92,7 @@ def human_dur(secs: float) -> str:
     d, s = divmod(s, 86400)
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
-    if d:   return f"{d}d {h}h {m}m {s}s"
+    if d:   return f"{d}d {h}h {m}m"
     if h:   return f"{h}h {m}m {s}s"
     if m:   return f"{m}m {s}s"
     return f"{s}s"
@@ -98,102 +110,165 @@ def pct_bar(pct: float, length: int = 14) -> str:
     return "█" * filled + "░" * (length - filled)
 
 
-def speed_emoji(bps: float) -> str:
-    mib = bps / (1024 * 1024)
-    if mib >= 50: return "🚀"
-    if mib >= 10: return "⚡"
-    if mib >= 1:  return "🔥"
-    if mib >= .1: return "🏃"
-    return "🐢"
+# ─────────────────────────────────────────────────────────────
+# Engine display map
+# ─────────────────────────────────────────────────────────────
+
+_ENGINE_DISPLAY: dict[str, str] = {
+    "telegram":  "Telegram 📲",
+    "ytdlp":     "yt-dlp ▶️",
+    "aria2":     "Aria2c 🧨",
+    "magnet":    "Aria2c 🧲",
+    "direct":    "Direct 🔗",
+    "gdrive":    "GDrive ☁️",
+    "ffmpeg":    "FFmpeg ⚙️",
+    "mediafire": "Mediafire 📁",
+    "cc":        "CloudConvert ☁️",
+}
+
+
+def engine_display(engine: str) -> str:
+    return _ENGINE_DISPLAY.get(engine, engine.capitalize() if engine else "—")
 
 
 # ─────────────────────────────────────────────────────────────
-# Progress panel
+# Progress panel — new design matching Image 1
 # ─────────────────────────────────────────────────────────────
+
+_PANEL_FOOTER = (
+    "💗 <i>When I'm Doin This, Do Something Else !"
+    " Because, Time Is Precious</i> ✨"
+)
+
+_MODE_META: dict[str, tuple[str, str, str]] = {
+    "dl":     ("📥", "DOWNLOADING FROM", "🔗"),
+    "ul":     ("📤", "UPLOADING TO",     "📡"),
+    "magnet": ("🧲", "DOWNLOADING FROM", "🔗"),
+    "proc":   ("⚙️", "PROCESSING",       "🔧"),
+    "queue":  ("⏳", "QUEUED",           "📋"),
+}
+
 
 def progress_panel(
     *,
-    mode: str = "dl",
-    fname: str = "",
-    done: int = 0,
-    total: int = 0,
-    speed: float = 0,
-    eta: int = 0,
-    elapsed: float = 0,
-    engine: str = "",
-    state: str = "",
-    seeds: int = 0,
+    mode:       str   = "dl",
+    fname:      str   = "",
+    done:       int   = 0,
+    total:      int   = 0,
+    speed:      float = 0.0,
+    eta:        int   = 0,
+    elapsed:    float = 0.0,
+    engine:     str   = "",
+    state:      str   = "",
+    link_label: str   = "Link 01",
+    cpu:        float = 0.0,
+    ram_used:   int   = 0,
+    disk_free:  int   = 0,
+    seeds:      int   = 0,
 ) -> str:
-    pct   = min((done / total * 100) if total else 0, 100)
-    bar   = pct_bar(pct, 14)
-    spd_s = human_size(speed) + "/s" if speed else "—"
-    eta_s = human_dur(eta) if eta > 0 else "—"
-    el_s  = human_dur(elapsed) if elapsed else "0s"
+    """
+    Build a Telegram-formatted progress message matching the Image 1 design:
 
-    header_map = {
-        "dl":     "📥 <b>DOWNLOADING</b>",
-        "ul":     "📤 <b>UPLOADING</b>",
-        "magnet": "🧲 <b>TORRENT/MAGNET</b>",
-        "proc":   "⚙️ <b>PROCESSING</b>",
-    }
-    header = header_map.get(mode, "⚙️ <b>PROCESSING</b>")
-    if state:
-        header += f"  <i>— {state}</i>"
+        📥 DOWNLOADING FROM » 🔗Link 01
+        🏷 Name » filename.mkv
+        [████████░░░░░░░░░░] 44.3%
+        ──────────────────────
+        🔥  Speed      42.51 MiB/s
+        ⚙️  Engine     Aria2c 🧨
+        ⏳  ETA        1m 12s
+        🕰  Elapsed    3m 45s
+        ✅  Done       892.40 MiB
+        📦  Total      1.31 GiB
+        ──────────────────────
+        🖥  CPU   [████░░░░░░] 47%
+        💾  RAM        1.24 GiB
+        💿  Disk Free  48.32 GiB
+        ──────────────────────
+        💗 When I'm Doin This, Do Something Else ! ...
+    """
+    pct     = min((done / total * 100) if total else 0.0, 100.0)
+    bar_w   = 18
+    filled  = round(pct / 100 * bar_w)
+    bar     = "█" * filled + "░" * (bar_w - filled)
 
-    engine_map = {
-        "telegram": "📲 Telegram",
-        "ytdlp":    "▶️ yt-dlp",
-        "aria2":    "🧨 Aria2",
-        "direct":   "🔗 Direct",
-        "gdrive":   "☁️ GDrive",
-        "ffmpeg":   "⚙️ FFmpeg",
-        "magnet":   "🧲 Aria2",
-    }
-    eng_s = engine_map.get(engine, engine)
+    spd_s   = (human_size(speed) + "/s") if speed else "—"
+    eta_s   = human_dur(eta) if eta > 0 else "—"
+    el_s    = human_dur(elapsed) if elapsed else "0s"
+    done_s  = human_size(done)
+    total_s = human_size(total) if total else "—"
 
-    lines = [header, ""]
-    if fname:
-        short = fname[:52] + "…" if len(fname) > 52 else fname
-        lines.append(f"📄 <code>{short}</code>")
+    m_icon, m_hdr, m_link_icon = _MODE_META.get(mode, ("📦", "PROCESSING", "🔧"))
+    eng_s = engine_display(engine)
+
+    fname_s = (fname[:48] + "…") if len(fname) > 48 else fname
+
+    SEP = "──────────────────────"
+
+    lines: list[str] = [
+        f"{m_icon} <b>{m_hdr} » {m_link_icon}{link_label}</b>",
+        f"🏷  <b>Name »</b> <code>{fname_s}</code>",
+        "",
+        f"<code>[{bar}]</code>  <b>{pct:.1f}%</b>",
+        "",
+        SEP,
+        f"🔥  <b>Speed</b>     <code>{spd_s}</code>",
+        f"⚙️  <b>Engine</b>    <code>{eng_s}</code>",
+        f"⏳  <b>ETA</b>       <code>{eta_s}</code>",
+        f"🕰  <b>Elapsed</b>   <code>{el_s}</code>",
+        f"✅  <b>Done</b>      <code>{done_s}</code>",
+        f"📦  <b>Total</b>     <code>{total_s}</code>",
+    ]
+
+    if seeds:
+        lines.append(f"🌱  <b>Seeds</b>     <code>{seeds}</code>")
+
+    # System stats block — only if we have data
+    if cpu or ram_used or disk_free:
+        cpu_bar_w   = 10
+        cpu_filled  = round(cpu / 100 * cpu_bar_w)
+        cpu_bar_str = "█" * cpu_filled + "░" * (cpu_bar_w - cpu_filled)
+        ram_s       = human_size(ram_used)
+        disk_s      = human_size(disk_free)
+        lines += [
+            "",
+            SEP,
+            f"🖥  <b>CPU</b>       <code>[{cpu_bar_str}]</code> <b>{cpu:.0f}%</b>",
+            f"💾  <b>RAM</b>       <code>{ram_s}</code>",
+            f"💿  <b>Disk Free</b>  <code>{disk_s}</code>",
+        ]
 
     lines += [
         "",
-        f"<code>[{bar}]</code>  <b>{pct:.1f}%</b>",
-        "──────────────────────",
-        f"{speed_emoji(speed)}  <b>Speed</b>  <code>{spd_s}</code>",
+        SEP,
+        _PANEL_FOOTER,
     ]
-    if eng_s:
-        lines.append(f"⚙️  <b>Engine</b>  <code>{eng_s}</code>")
-    lines += [
-        f"⏳  <b>ETA</b>     <code>{eta_s}</code>",
-        f"🕰  <b>Elapsed</b> <code>{el_s}</code>",
-        f"✅  <b>Done</b>    <code>{human_size(done)}</code>"
-        + (f" / <code>{human_size(total)}</code>" if total else ""),
-    ]
-    if seeds:
-        lines.append(f"🌱  <b>Seeders</b> <code>{seeds}</code>")
+
     return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────
-# Telegram helpers
+# Telegram safe_edit
 # ─────────────────────────────────────────────────────────────
 
 _TG_MAX = 4096
 
+_EDIT_SUPPRESSED = frozenset({
+    "MESSAGE_NOT_MODIFIED",
+    "message was not modified",
+    "MESSAGE_ID_INVALID",
+    "message to edit not found",
+    "Bad Request: message is not modified",
+    "MESSAGE_TOO_LONG",
+})
+
 async def safe_edit(msg, text: str, **kwargs) -> None:
     if len(text) > _TG_MAX:
-        text = text[:_TG_MAX - 64] + "\n\n<i>⚠️ Panel truncated — too many active tasks</i>"
+        text = text[:_TG_MAX - 64] + "\n\n<i>⚠️ Truncated</i>"
     try:
         await msg.edit(text, **kwargs)
     except Exception as e:
         err = str(e)
-        if any(x in err for x in (
-            "MESSAGE_NOT_MODIFIED", "message was not modified",
-            "MESSAGE_ID_INVALID", "message to edit not found",
-            "Bad Request: message is not modified",
-            "MESSAGE_TOO_LONG", "message is too long",
-        )):
+        if any(x in err for x in _EDIT_SUPPRESSED):
             return
         if "FLOOD_WAIT" in err or "peer_id_invalid" in err.lower():
             log.debug("safe_edit suppressed: %s", err[:100])
@@ -226,89 +301,16 @@ def safe_fname(name: str) -> str:
     return "".join(c for c in name if c.isalnum() or c in keep).strip() or "file"
 
 
-# ─────────────────────────────────────────────────────────────
-# Smart filename cleaner
-# ─────────────────────────────────────────────────────────────
-import re as _re
-
-_KEEP_TAGS: frozenset[str] = frozenset({
-    "VOSTFR", "VOSTA", "VF", "VO", "VOFR", "MULTI", "FRENCH", "ENGLISH",
-    "ENG", "FR", "JAP", "JPN", "KOR", "CHI", "SPA", "ITA", "GER", "POR",
-    "DUAL", "TRUEFRENCH", "SUBFRENCH", "VOSTEN", "VOSTJP",
-})
-
-_NOISE_RE = _re.compile(
-    r"^("
-    r"\d{3,4}p"
-    r"|4[Kk]|UHD|SDR|HDR|HDR10|HDR10\+|DV|DoVi|10[Bb]it|8[Bb]it"
-    r"|WEB[\-\.]?DL|WEB|BluRay|Blu[\-\.]?Ray|BDRip|BRRip|HDRip"
-    r"|HDTV|PDTV|DVDRip|DVDScr|CAMRip|TELESYNC|TS"
-    r"|AMZN|NF|DSNP|HMAX|ATVP|CR|ADN|DISNEY\+?"
-    r"|x26[45]|HEVC|AVC|H\.?26[45]|XviD|DivX|VP9|AV1"
-    r"|AAC|AC3|DTS(?:[\-\.]?HD)?|FLAC|MP3|TrueHD|Atmos|EAC3|DD5|DD\+"
-    r"|REPACK|PROPER|EXTENDED|UNRATED|THEATRICAL|REMASTERED|REMUX"
-    r")\Z",
-    _re.IGNORECASE,
-)
-
-def smart_clean_filename(fname: str) -> str:
-    """
-    Strip technical release tags from an anime/series filename, keeping
-    the show name, episode identifier, and language tag.
-
-    FIX: noise token matching now only kicks in after the 3rd token (i >= 2).
-    This prevents show names like "TS Online", "WEB Series", or "BluRay
-    Adventures" from being eaten by the noise pattern on the first token.
-    """
-    name, ext = os.path.splitext(fname)
-
-    # Strip leading group tag in square brackets e.g. "[SubsPlease]"
-    name = _re.sub(r"^\[[^\]]{1,40}\]\s*", "", name).strip()
-
-    # Replace dots/underscores used as word separators with spaces
-    if " " not in name and ("." in name or "_" in name):
-        name = name.replace(".", " ").replace("_", " ")
-
-    tokens = name.split()
-    keep: list[str] = []
-
-    for i, tok in enumerate(tokens):
-        bare = _re.sub(r"[^\w\+]", "", tok).upper()
-
-        if bare in _KEEP_TAGS:
-            keep.append(tok)
-            continue
-
-        # FIX: only stop on noise tokens after the 3rd position (index >= 2)
-        # so show names like "TS Online" or "WEB Series" are preserved.
-        if i >= 2 and _NOISE_RE.match(bare):
-            break
-
-        if tok.startswith("-") and len(tok) > 1 and i > 0:
-            break
-        if tok.startswith("(") and tok.endswith(")") and i > 0:
-            break
-        if tok.startswith("[") and tok.endswith("]") and i > 0:
-            break
-
-        keep.append(tok)
-
-    result = " ".join(keep).strip(" -_.,")
-    if not result:
-        return fname
-    return result + ext
-
-
 def largest_file(directory: str) -> Optional[str]:
     best: Optional[str] = None
     best_sz = -1
     try:
         for root, dirs, files in os.walk(directory):
             dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for fname in files:
-                if fname.endswith(".aria2"):
+            for fn in files:
+                if fn.endswith(".aria2"):
                     continue
-                fp = os.path.join(root, fname)
+                fp = os.path.join(root, fn)
                 try:
                     sz = os.path.getsize(fp)
                     if sz > best_sz:
@@ -321,45 +323,87 @@ def largest_file(directory: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────
+# Smart filename cleaner
+# ─────────────────────────────────────────────────────────────
+
+_KEEP_TAGS: frozenset[str] = frozenset({
+    "VOSTFR", "VOSTA", "VF", "VO", "VOFR", "MULTI", "FRENCH", "ENGLISH",
+    "ENG", "FR", "JAP", "JPN", "KOR", "CHI", "SPA", "ITA", "GER", "POR",
+    "DUAL", "TRUEFRENCH", "SUBFRENCH", "VOSTEN", "VOSTJP",
+})
+
+_NOISE_RE = _re.compile(
+    r"^("
+    r"\d{3,4}p|4[Kk]|UHD|SDR|HDR10?\+?|DV|DoVi|10[Bb]it|8[Bb]it"
+    r"|WEB[\-\.]?DL|WEB|BluRay|Blu[\-\.]?Ray|BDRip|BRRip|HDRip"
+    r"|HDTV|PDTV|DVDRip|DVDScr|CAMRip|TELESYNC|TS"
+    r"|AMZN|NF|DSNP|HMAX|ATVP|CR|ADN|DISNEY\+?"
+    r"|x26[45]|HEVC|AVC|H\.?26[45]|XviD|DivX|VP9|AV1"
+    r"|AAC|AC3|DTS(?:[\-\.]?HD)?|FLAC|MP3|TrueHD|Atmos|EAC3|DD5|DD\+"
+    r"|REPACK|PROPER|EXTENDED|UNRATED|THEATRICAL|REMASTERED|REMUX"
+    r")\Z",
+    _re.IGNORECASE,
+)
+
+
+def smart_clean_filename(fname: str) -> str:
+    """Strip release tags from a filename, preserving show name and episode id."""
+    name, ext = os.path.splitext(fname)
+
+    # Strip leading group tag e.g. "[SubsPlease]"
+    name = _re.sub(r"^\[[^\]]{1,40}\]\s*", "", name).strip()
+
+    # Replace dots/underscores used as word separators
+    if " " not in name and ("." in name or "_" in name):
+        name = name.replace(".", " ").replace("_", " ")
+
+    tokens = name.split()
+    keep: list[str] = []
+
+    for i, tok in enumerate(tokens):
+        bare = _re.sub(r"[^\w\+]", "", tok).upper()
+        if bare in _KEEP_TAGS:
+            keep.append(tok)
+            continue
+        # Only block on noise after 3rd token to protect show names
+        if i >= 2 and _NOISE_RE.match(bare):
+            break
+        if tok.startswith("-") and len(tok) > 1 and i > 0:
+            break
+        if tok.startswith("(") and tok.endswith(")") and i > 0:
+            break
+        if tok.startswith("[") and tok.endswith("]") and i > 0:
+            break
+        keep.append(tok)
+
+    result = " ".join(keep).strip(" -_.,")
+    return (result + ext) if result else fname
+
+
+# ─────────────────────────────────────────────────────────────
 # System stats
 # ─────────────────────────────────────────────────────────────
 
 async def system_stats() -> dict:
-    out = {"cpu": 0.0, "ram_pct": 0.0, "ram_used": 0, "disk_free": 0, "dl_speed": 0.0, "ul_speed": 0.0}
+    out: dict = {
+        "cpu": 0.0, "ram_pct": 0.0, "ram_used": 0,
+        "disk_free": 0, "dl_speed": 0.0, "ul_speed": 0.0,
+    }
     try:
         import psutil
-        out["cpu"]      = psutil.cpu_percent(interval=None)
-        vm              = psutil.virtual_memory()
-        out["ram_pct"]  = vm.percent
-        out["ram_used"] = vm.used
+        out["cpu"]       = psutil.cpu_percent(interval=None)
+        vm               = psutil.virtual_memory()
+        out["ram_pct"]   = vm.percent
+        out["ram_used"]  = vm.used
         out["disk_free"] = psutil.disk_usage("/").free
         n1 = psutil.net_io_counters()
         await asyncio.sleep(0.25)
         n2 = psutil.net_io_counters()
-        out["dl_speed"] = (n2.bytes_recv - n1.bytes_recv) / 0.25
-        out["ul_speed"] = (n2.bytes_sent - n1.bytes_sent) / 0.25
+        out["dl_speed"]  = (n2.bytes_recv - n1.bytes_recv) / 0.25
+        out["ul_speed"]  = (n2.bytes_sent - n1.bytes_sent) / 0.25
     except Exception:
         try:
             out["disk_free"] = shutil.disk_usage("/").free
         except Exception:
             pass
     return out
-
-
-def idle_panel(stats: dict) -> str:
-    def ring(p):
-        return "🟢" if p < 40 else ("🟡" if p < 70 else "🔴")
-
-    cpu = stats.get("cpu", 0)
-    rp  = stats.get("ram_pct", 0)
-    df  = stats.get("disk_free", 0)
-    dl  = stats.get("dl_speed", 0)
-    ul  = stats.get("ul_speed", 0)
-    return "\n".join([
-        "⚡ <b>ZILONG BOT</b>  <i>— Idle</i>",
-        "──────────────────────",
-        f"🖥  CPU  {ring(cpu)}<code>[{pct_bar(cpu, 10)}]</code> <b>{cpu:.0f}%</b>",
-        f"💾  RAM  {ring(rp)}<code>[{pct_bar(rp, 10)}]</code> <b>{rp:.0f}%</b>",
-        f"💿  Disk  <code>{human_size(df)} free</code>",
-        f"🌐  ⬇ <code>{human_size(dl)}/s</code>  ⬆ <code>{human_size(ul)}/s</code>",
-    ])

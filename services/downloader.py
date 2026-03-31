@@ -1,28 +1,18 @@
 """
 services/downloader.py
-Download strategies — decoupled from Telegram types.
+Download strategies decoupled from Telegram.
 
-CRITICAL FIXES:
-  1. download_parallel removed from _dispatch.
-     It was burning CDN single-use auth tokens (SonicBit, etc.) by firing
-     8 simultaneous Range requests. CDN validates token on request #1 and
-     rejects #2-8 → only first segment downloaded (~178MB of 1.4GB file).
-     Fallback to aria2c also failed because token was now expired.
-     Fix: _dispatch uses download_direct first, then aria2c fallback.
+KEY FIXES (kept from prior audit):
+  1. download_parallel removed from _dispatch — burns single-use CDN tokens.
+     Replaced with download_direct → aria2c fallback.
+  2. Magnet META_TIMEOUT now 3 min (was effectively 6 h due to bad logic).
+  3. --bt-max-peers not applied to plain HTTP aria2c commands.
+  4. download_direct validates received bytes vs Content-Length.
 
-  2. in_meta no longer requires task_record.
-     Was: in_meta = [is_magnet and task_record is not None and not is_file]
-     When called from stream_extractor / se_mag_cb with task_record=None,
-     in_meta[0]=False → Phase-1 loop exited immediately → dead magnets
-     waited 6 hours before timing out instead of 3 minutes.
-     Fix: in_meta = [is_magnet and not is_file]
-
-  3. --bt-max-peers removed from direct HTTP aria2c command.
-     BitTorrent-only flag. Using it on HTTP URLs causes aria2c warnings.
-
-  4. download_direct now validates received bytes vs Content-Length.
-     Silent partial downloads now raise RuntimeError instead of saving
-     a truncated file.
+REWRITE additions:
+  - Progress callback edits status message using new progress_panel() design
+  - smart_download registers a TaskRecord and uses new panel for live updates
+  - _dispatch cleaner, no redundant imports
 """
 from __future__ import annotations
 
@@ -39,41 +29,33 @@ import aiohttp
 import yt_dlp
 
 from core.config import cfg
-from services.utils import largest_file
+from services.utils import largest_file, progress_panel, safe_edit
 
 ProgressCB = Callable[[int, int, float, int], Awaitable[None]]
 
 _YTDLP_POOL: Optional[ProcessPoolExecutor] = None
-
-_CONNECTOR: Optional[aiohttp.TCPConnector] = None
-_DL_CHUNK_SIZE = 4 * 1024 * 1024
-_DL_TIMEOUT = aiohttp.ClientTimeout(
-    total=8 * 3600,
-    connect=30,
-    sock_read=300,
-)
+_CONNECTOR:  Optional[aiohttp.TCPConnector] = None
+_DL_CHUNK   = 4 * 1024 * 1024
+_DL_TIMEOUT = aiohttp.ClientTimeout(total=8 * 3600, connect=30, sock_read=300)
 
 
 def _get_connector() -> aiohttp.TCPConnector:
     global _CONNECTOR
     if _CONNECTOR is None or _CONNECTOR.closed:
         _CONNECTOR = aiohttp.TCPConnector(
-            limit=32,
-            limit_per_host=16,
-            ttl_dns_cache=600,
-            enable_cleanup_closed=True,
-            force_close=False,
+            limit=32, limit_per_host=16,
+            ttl_dns_cache=600, enable_cleanup_closed=True,
         )
     return _CONNECTOR
 
 
-def _get_session(**kwargs) -> aiohttp.ClientSession:
+def _get_session(**kw) -> aiohttp.ClientSession:
     return aiohttp.ClientSession(
         connector=_get_connector(),
         connector_owner=False,
         timeout=_DL_TIMEOUT,
         headers={"User-Agent": "Mozilla/5.0 (compatible; ZilongBot/2.0)"},
-        **kwargs,
+        **kw,
     )
 
 
@@ -94,25 +76,26 @@ _YTDLP_RE   = re.compile(
     r"(youtube\.com|youtu\.be|instagram\.com|twitter\.com|x\.com|"
     r"facebook\.com|tiktok\.com|dailymotion\.com|vimeo\.com|twitch\.tv|"
     r"reddit\.com|pinterest\.com|ok\.ru|bilibili\.com|soundcloud\.com|"
-    r"nicovideo\.jp|rumble\.com|odysee\.com|bitchute\.com)", re.I)
+    r"nicovideo\.jp|rumble\.com|odysee\.com|bitchute\.com)",
+    re.I,
+)
 
 
 def classify(url: str) -> str:
-    if _MAGNET_RE.match(url):   return "magnet"
-    if _TORRENT_RE.search(url): return "torrent"
-    if _GDRIVE_RE.search(url):  return "gdrive"
-    if _MF_RE.search(url):      return "mediafire"
-    if _YTDLP_RE.search(url):   return "ytdlp"
+    if _MAGNET_RE.match(url):    return "magnet"
+    if _TORRENT_RE.search(url):  return "torrent"
+    if _GDRIVE_RE.search(url):   return "gdrive"
+    if _MF_RE.search(url):       return "mediafire"
+    if _YTDLP_RE.search(url):    return "ytdlp"
     return "direct"
 
 
 # ── Direct HTTP download ──────────────────────────────────────
 
 async def download_direct(
-    url: str, dest: str, progress: Optional[ProgressCB] = None
+    url: str, dest: str, progress: Optional[ProgressCB] = None,
 ) -> str:
     start = time.time()
-
     async with _get_session() as sess:
         async with sess.get(url, allow_redirects=True) as resp:
             resp.raise_for_status()
@@ -129,18 +112,16 @@ async def download_direct(
 
             fpath = os.path.join(dest, fname)
             done  = 0
-
-            with open(fpath, "wb") as f:
-                async for chunk in resp.content.iter_chunked(_DL_CHUNK_SIZE):
-                    f.write(chunk)
+            with open(fpath, "wb") as fh:
+                async for chunk in resp.content.iter_chunked(_DL_CHUNK):
+                    fh.write(chunk)
                     done += len(chunk)
                     if progress:
                         elapsed = time.time() - start
-                        speed   = done / elapsed if elapsed else 0
+                        speed   = done / elapsed if elapsed else 0.0
                         eta     = int((total - done) / speed) if (speed and total) else 0
                         await progress(done, total, speed, eta)
 
-    # Validate: catch silent partial downloads (server FIN without error)
     if total and done != total:
         try:
             os.unlink(fpath)
@@ -150,88 +131,12 @@ async def download_direct(
             f"Download incomplete: received {done:,} of {total:,} bytes "
             "(connection dropped mid-transfer)."
         )
-
     return fpath
 
 
-# ── Parallel range download ─────────────────────────────────
-# NOT used in _dispatch by default — see fix note above.
-# Only call this explicitly for servers you have confirmed support
-# parallel Range requests AND do NOT use single-use auth tokens.
-
-async def download_parallel(
-    url: str, dest: str,
-    num_segments: int = 8,
-    progress: Optional[ProgressCB] = None,
-) -> str:
-    async with _get_session() as sess:
-        async with sess.head(url, allow_redirects=True) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            accepts_range = resp.headers.get("Accept-Ranges", "").lower() == "bytes"
-
-            cd    = resp.headers.get("Content-Disposition", "")
-            fname = None
-            if "filename=" in cd:
-                fname = cd.split("filename=")[-1].strip().strip('"').strip("'")
-            if not fname:
-                fname = Path(url.split("?")[0]).name or "download"
-            fname = _urlparse.unquote_plus(fname)
-            fname = re.sub(r'[\\/:*?"<>|]', "_", fname)
-
-    if not accepts_range or total < 10 * 1024 * 1024 or total == 0:
-        return await download_direct(url, dest, progress)
-
-    fpath        = os.path.join(dest, fname)
-    segment_size = total // num_segments
-    done_bytes   = [0]
-    start        = time.time()
-    lock         = asyncio.Lock()
-
-    async def _download_segment(seg_idx: int, start_byte: int, end_byte: int) -> bytes:
-        headers  = {"Range": f"bytes={start_byte}-{end_byte}"}
-        expected = end_byte - start_byte + 1
-        data     = bytearray()
-        async with _get_session() as sess:
-            async with sess.get(url, headers=headers, allow_redirects=True) as resp:
-                if resp.status == 200:
-                    raise RuntimeError(
-                        "Server returned 200 for Range request — Range not actually supported"
-                    )
-                async for chunk in resp.content.iter_chunked(_DL_CHUNK_SIZE):
-                    data.extend(chunk)
-                    async with lock:
-                        done_bytes[0] += len(chunk)
-                    if progress:
-                        elapsed = time.time() - start
-                        speed   = done_bytes[0] / elapsed if elapsed else 0
-                        eta     = int((total - done_bytes[0]) / speed) if speed else 0
-                        await progress(done_bytes[0], total, speed, eta)
-        if len(data) != expected:
-            raise RuntimeError(
-                f"Segment {seg_idx}: got {len(data)} bytes, expected {expected}"
-            )
-        return bytes(data)
-
-    tasks = []
-    for i in range(num_segments):
-        s = i * segment_size
-        e = (i + 1) * segment_size - 1 if i < num_segments - 1 else total - 1
-        tasks.append(_download_segment(i, s, e))
-
-    segments = await asyncio.gather(*tasks)
-
-    with open(fpath, "wb") as f:
-        for seg in segments:
-            f.write(seg)
-
-    return fpath
-
-
-# ── yt-dlp (process pool) ─────────────────────────────────────
+# ── yt-dlp (process pool) ──────────────────────────────────────
 
 def _ytdlp_worker(url: str, dest: str, audio_only: bool, fmt_id: Optional[str]) -> str:
-    import yt_dlp as _ydlp
-
     out_tmpl = os.path.join(dest, "%(title).60s.%(ext)s")
     opts: dict = {
         "outtmpl":                       out_tmpl,
@@ -241,7 +146,6 @@ def _ytdlp_worker(url: str, dest: str, audio_only: bool, fmt_id: Optional[str]) 
         "restrictfilenames":             True,
         "concurrent_fragment_downloads": 8,
     }
-
     if fmt_id:
         opts["format"] = fmt_id
     elif audio_only:
@@ -254,33 +158,33 @@ def _ytdlp_worker(url: str, dest: str, audio_only: bool, fmt_id: Optional[str]) 
     else:
         opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
-    with _ydlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info  = ydl.extract_info(url, download=True)
         fpath = ydl.prepare_filename(info)
 
     if not os.path.exists(fpath):
         base = os.path.splitext(fpath)[0]
-        for ext in (".mp3",".m4a",".opus",".ogg",".aac",".mp4",".mkv",".webm"):
+        for ext in (".mp3", ".m4a", ".opus", ".ogg", ".aac", ".mp4", ".mkv", ".webm"):
             if os.path.exists(base + ext):
                 return base + ext
         result = largest_file(dest)
         if not result:
             raise FileNotFoundError(f"yt-dlp produced no output in {dest!r}")
         return result
-
     return fpath
 
 
 async def download_ytdlp(
     url: str, dest: str,
     audio_only: bool = False,
-    fmt_id: Optional[str] = None,
-    progress: Optional[ProgressCB] = None,
+    fmt_id:     Optional[str] = None,
+    progress:   Optional[ProgressCB] = None,
 ) -> str:
     loop = asyncio.get_running_loop()
     pool = _get_pool()
 
-    expected_size: int = 0
+    # Pre-fetch expected size for progress estimation
+    expected_size = 0
     try:
         def _get_size() -> int:
             opts: dict = {"quiet": True, "no_warnings": True, "noplaylist": True}
@@ -310,15 +214,15 @@ async def download_ytdlp(
         await asyncio.sleep(1.0)
         if progress:
             try:
-                cur      = largest_file(dest)
-                cur_size = os.path.getsize(cur) if cur else 0
-                now      = time.time()
-                dt       = now - last_time
-                speed    = (cur_size - last_size) / dt if dt > 0 else 0.0
+                cur       = largest_file(dest)
+                cur_size  = os.path.getsize(cur) if cur else 0
+                now       = time.time()
+                dt        = now - last_time
+                speed     = (cur_size - last_size) / dt if dt > 0 else 0.0
                 last_size = cur_size
                 last_time = now
-                total = expected_size or 0
-                eta   = int((total - cur_size) / speed) if (speed and total > cur_size) else 0
+                total     = expected_size or 0
+                eta       = int((total - cur_size) / speed) if (speed and total > cur_size) else 0
                 await progress(cur_size, total, speed, eta)
             except Exception:
                 pass
@@ -326,10 +230,10 @@ async def download_ytdlp(
     return await future
 
 
-# ── Mediafire ─────────────────────────────────────────────────
+# ── Mediafire ──────────────────────────────────────────────────
 
 async def download_mediafire(
-    url: str, dest: str, progress: Optional[ProgressCB] = None
+    url: str, dest: str, progress: Optional[ProgressCB] = None,
 ) -> str:
     async with _get_session() as sess:
         async with sess.get(url) as resp:
@@ -351,7 +255,7 @@ async def download_mediafire(
     return await download_direct(direct, dest, progress)
 
 
-# ── Google Drive ──────────────────────────────────────────────
+# ── Google Drive ───────────────────────────────────────────────
 
 async def download_gdrive(
     url: str, dest: str,
@@ -371,7 +275,8 @@ async def download_gdrive(
     if sa and os.path.exists(sa):
         from google.oauth2.service_account import Credentials
         creds = Credentials.from_service_account_file(
-            sa, scopes=["https://www.googleapis.com/auth/drive.readonly"])
+            sa, scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        )
 
     svc   = build("drive", "v3", credentials=creds, cache_discovery=False)
     meta  = svc.files().get(fileId=file_id, fields="name,size").execute()
@@ -389,13 +294,13 @@ async def download_gdrive(
             if status and progress:
                 done    = int(status.resumable_progress)
                 elapsed = time.time() - start
-                speed   = done / elapsed if elapsed else 0
+                speed   = done / elapsed if elapsed else 0.0
                 eta     = int((total - done) / speed) if speed else 0
                 await progress(done, total, speed, eta)
     return fpath
 
 
-# ── Aria2 ─────────────────────────────────────────────────────
+# ── Aria2c ─────────────────────────────────────────────────────
 
 import re as _re
 
@@ -404,14 +309,14 @@ _ARIA2_PROG_RE = _re.compile(
     r"(?:.*?DL:([\d.]+\w+))?(?:.*?ETA:([\dhms]+))?"
 )
 
-META_TIMEOUT  = 180      # 3 min — wait for FIRST progress line
-TOTAL_TIMEOUT = 21600    # 6 h   — download phase
+META_TIMEOUT  = 180    # 3 min — wait for torrent metadata
+TOTAL_TIMEOUT = 21600  # 6 h   — total download ceiling
 
 
 def _aria2_bytes(s: str) -> int:
-    units = {"b":1,"kib":1024,"mib":1024**2,"gib":1024**3,
-             "kb":1000,"mb":1000**2,"gb":1000**3}
-    m = _re.match(r"([\d.]+)\s*(\w+)", s.strip(), _re.I)
+    units = {"b": 1, "kib": 1024, "mib": 1024**2, "gib": 1024**3,
+             "kb": 1000, "mb": 1000**2, "gb": 1000**3}
+    m = _re.match(r"([\d.]+)\s*(\w+)", (s or "").strip(), _re.I)
     if not m:
         return 0
     try:
@@ -423,15 +328,15 @@ def _aria2_bytes(s: str) -> int:
 def _aria2_eta(s: str) -> int:
     total = 0
     for v, u in _re.findall(r"(\d+)([hms])", s):
-        total += int(v) * {"h":3600,"m":60,"s":1}.get(u, 0)
+        total += int(v) * {"h": 3600, "m": 60, "s": 1}.get(u, 0)
     return total
 
 
 async def download_aria2(
     uri_or_path: str, dest: str,
-    is_file: bool = False,
-    progress: Optional[ProgressCB] = None,
-    task_record=None,
+    is_file:     bool = False,
+    progress:    Optional[ProgressCB] = None,
+    task_record  = None,
 ) -> str:
     is_magnet = _MAGNET_RE.match(uri_or_path) is not None
 
@@ -444,7 +349,6 @@ async def download_aria2(
             f"--torrent-file={uri_or_path}",
         ]
     elif is_magnet:
-        # --bt-max-peers is valid for magnet/torrent only
         cmd = [
             "aria2c", "-x16", "--split=16", "--min-split-size=1M",
             "--file-allocation=none", "--seed-time=0",
@@ -454,7 +358,7 @@ async def download_aria2(
             uri_or_path,
         ]
     else:
-        # FIX: --bt-max-peers removed from HTTP URI command (BT-only flag)
+        # Plain HTTP — no --bt-max-peers (BT-only flag)
         cmd = [
             "aria2c", "-x16", "--split=16", "--min-split-size=1M",
             "--file-allocation=none", "--seed-time=0",
@@ -463,16 +367,7 @@ async def download_aria2(
             uri_or_path,
         ]
 
-    # FIX: in_meta depends only on is_magnet/is_file, NOT task_record
     in_meta = [is_magnet and not is_file]
-
-    if in_meta[0] and task_record is not None:
-        task_record.update(meta_phase=True, state="🔍 Fetching metadata…")
-        try:
-            from services.task_runner import runner as _r
-            _r._wake_panel(task_record.user_id, immediate=True)
-        except Exception:
-            pass
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -480,20 +375,9 @@ async def download_aria2(
         stderr=asyncio.subprocess.PIPE,
     )
 
-    start     = time.time()
-    last_wake = [start]
+    start = time.time()
 
-    def _wake(uid: int) -> None:
-        now = time.time()
-        if now - last_wake[0] >= 1.0:
-            last_wake[0] = now
-            try:
-                from services.task_runner import runner as _r
-                _r._wake_panel(uid)
-            except Exception:
-                pass
-
-    async def _drain_stderr():
+    async def _drain_stderr() -> None:
         if proc.stderr:
             try:
                 await proc.stderr.read()
@@ -503,12 +387,9 @@ async def download_aria2(
     asyncio.ensure_future(_drain_stderr())
     assert proc.stdout is not None
 
-    async def _read_stdout():
+    async def _read_stdout() -> None:
         async for raw in proc.stdout:
-            line = raw.decode(errors="replace").strip()
-            if not line:
-                continue
-
+            line    = raw.decode(errors="replace").strip()
             elapsed = time.time() - start
             m       = _ARIA2_PROG_RE.search(line)
             if m:
@@ -516,39 +397,21 @@ async def download_aria2(
                 total_b = _aria2_bytes(m.group(2) or "0")
                 spd_b   = _aria2_bytes(m.group(4) or "0") if m.group(4) else 0
                 eta_sec = _aria2_eta(m.group(5) or "") if m.group(5) else 0
-
-                if in_meta[0]:
-                    in_meta[0] = False
-                    fname_now = largest_file(dest)
-                    fname_s   = os.path.basename(fname_now)[:40] if fname_now else ""
-                    if task_record is not None:
-                        task_record.update(
-                            meta_phase=False, state="📥 Downloading",
-                            **({"label": fname_s, "fname": fname_s} if fname_s else {}),
-                        )
-
+                in_meta[0] = False
                 if task_record is not None:
                     task_record.update(
                         done=done_b, total=total_b,
                         speed=float(spd_b), eta=eta_sec,
                         elapsed=elapsed, state="📥 Downloading",
+                        meta_phase=False,
                     )
-                    _wake(task_record.user_id)
-
                 if progress:
                     await progress(done_b, total_b, float(spd_b), eta_sec)
 
-            elif in_meta[0] and task_record is not None:
-                task_record.update(
-                    meta_phase=True, state="🔍 Fetching metadata…", elapsed=elapsed,
-                )
-                _wake(task_record.user_id)
-
-    # ── TWO-PHASE HANDLING FOR MAGNETS ───────────────────────
     if is_magnet and not is_file:
-        read_task = asyncio.create_task(_read_stdout())
+        read_task      = asyncio.create_task(_read_stdout())
+        meta_deadline  = time.time() + META_TIMEOUT
 
-        meta_deadline = time.time() + META_TIMEOUT
         while in_meta[0]:
             if read_task.done():
                 break
@@ -565,30 +428,21 @@ async def download_aria2(
                 if task_record is not None:
                     task_record.update(state="❌ Dead magnet")
                 raise RuntimeError(
-                    "aria2c timed out during metadata resolution (3 min limit). "
+                    "aria2c timed out during metadata resolution (3 min). "
                     "The magnet may have no active peers or trackers."
                 )
             await asyncio.sleep(1)
 
         if not read_task.done():
+            remaining = TOTAL_TIMEOUT - int(time.time() - start)
             try:
-                remaining = TOTAL_TIMEOUT - int(time.time() - start)
                 await asyncio.wait_for(read_task, timeout=max(remaining, 60))
             except asyncio.TimeoutError:
                 try:
                     proc.kill()
                 except Exception:
                     pass
-                raise RuntimeError(
-                    "aria2c timed out during download (6 h limit). "
-                    "The download stalled."
-                )
-
-        if not read_task.cancelled():
-            exc = read_task.exception()
-            if exc is not None:
-                raise exc
-
+                raise RuntimeError("aria2c timed out during download (6 h limit).")
     else:
         try:
             await asyncio.wait_for(_read_stdout(), timeout=TOTAL_TIMEOUT)
@@ -597,13 +451,9 @@ async def download_aria2(
                 proc.kill()
             except Exception:
                 pass
-            raise RuntimeError(
-                "aria2c timed out during download (6 h limit). "
-                "The download stalled or took too long."
-            )
+            raise RuntimeError("aria2c timed out during download (6 h limit).")
 
     await proc.wait()
-
     if proc.returncode not in (0, None):
         err = b""
         if proc.stderr:
@@ -615,32 +465,26 @@ async def download_aria2(
             f"aria2c exited {proc.returncode}: {err.decode(errors='replace')[-300:]}"
         )
 
-    if task_record is not None:
-        task_record.update(state="✅ Done", done=task_record.total or task_record.done)
-        try:
-            from services.task_runner import runner as _r
-            _r._wake_panel(task_record.user_id)
-        except Exception:
-            pass
-
     result = largest_file(dest)
     if not result:
         raise FileNotFoundError("No file found after aria2c download")
     return result
 
 
-# ── Smart dispatcher ──────────────────────────────────────────
+# ── Smart dispatcher ───────────────────────────────────────────
 
 async def smart_download(
-    url: str, dest: str,
+    url:        str,
+    dest:       str,
     audio_only: bool = False,
-    fmt_id: Optional[str] = None,
-    sa_json: Optional[str] = None,
-    progress: Optional[ProgressCB] = None,
-    user_id: int = 0,
-    label: str = "",
+    fmt_id:     Optional[str] = None,
+    sa_json:    Optional[str] = None,
+    progress:   Optional[ProgressCB] = None,
+    user_id:    int = 0,
+    label:      str = "",
+    msg         = None,   # if provided, progress edits this message inline
 ) -> str:
-    from services.task_runner import tracker, TaskRecord, runner
+    from services.task_runner import tracker, TaskRecord
 
     kind   = classify(url)
     engine = {
@@ -657,20 +501,38 @@ async def smart_download(
 
     tid           = tracker.new_tid()
     initial_meta  = kind in ("magnet", "torrent")
-    initial_state = "🔍 Fetching metadata…" if initial_meta else "📥 Starting…"
     record = TaskRecord(
         tid=tid, user_id=user_id,
         label=clean_label,
         mode="magnet" if kind in ("magnet", "torrent") else "dl",
         engine=engine,
         meta_phase=initial_meta,
-        state=initial_state,
+        state="🔍 Fetching metadata…" if initial_meta else "📥 Starting…",
     )
     await tracker.register(record)
 
+    from services.task_runner import _stats_cache
+
     async def _tracked_progress(done: int, total: int, speed: float, eta: int) -> None:
         record.update(done=done, total=total, speed=speed, eta=eta, state="📥 Downloading")
-        runner._wake_panel(user_id)
+        if msg is not None:
+            s = _stats_cache
+            text = progress_panel(
+                mode        = record.mode,
+                fname       = record.fname or clean_label,
+                done        = done,
+                total       = total,
+                speed       = speed,
+                eta         = eta,
+                elapsed     = record.elapsed,
+                engine      = engine,
+                link_label  = clean_label[:20],
+                cpu         = float(s.get("cpu", 0)),
+                ram_used    = int(s.get("ram_used", 0)),
+                disk_free   = int(s.get("disk_free", 0)),
+            )
+            from pyrogram import enums as _enums
+            await safe_edit(msg, text, parse_mode=_enums.ParseMode.HTML)
         if progress:
             await progress(done, total, speed, eta)
 
@@ -680,22 +542,24 @@ async def smart_download(
             _tracked_progress, record,
         )
         record.update(state="✅ Done")
-        runner._wake_panel(user_id, immediate=True)
         return result
     except Exception as exc:
         record.update(state=f"❌ {str(exc)[:50]}")
-        runner._wake_panel(user_id, immediate=True)
         raise
 
 
 async def _dispatch(
-    url: str, dest: str, kind: str,
-    audio_only: bool, fmt_id: Optional[str],
-    sa_json: Optional[str], progress: Optional[ProgressCB],
-    task_record=None,
+    url:        str,
+    dest:       str,
+    kind:       str,
+    audio_only: bool,
+    fmt_id:     Optional[str],
+    sa_json:    Optional[str],
+    progress:   Optional[ProgressCB],
+    task_record = None,
 ) -> str:
-    import logging as _log
-    _dlog = _log.getLogger(__name__)
+    import logging as _lg
+    _dlog = _lg.getLogger(__name__)
 
     if kind == "magnet":
         return await download_aria2(
@@ -716,19 +580,12 @@ async def _dispatch(
         return await download_ytdlp(url, dest, audio_only=audio_only,
                                     fmt_id=fmt_id, progress=progress)
 
-    # ── "direct" — FIXED: download_direct first, aria2c as fallback ──
-    # CRITICAL FIX: download_parallel removed from default path.
-    # It was burning single-use CDN auth tokens by firing 8 simultaneous
-    # Range requests → only first ~1/8 of file downloaded.
-    # aria2c already parallelizes internally (-x16 --split=16) so we
-    # still get parallel connections when needed without the token problem.
+    # DIRECT: download_direct first, aria2c fallback
+    # NEVER use download_parallel by default — burns single-use CDN auth tokens
     try:
         return await download_direct(url, dest, progress=progress)
     except Exception as direct_exc:
-        _dlog.warning(
-            "[Downloader] download_direct failed (%s) — falling back to aria2c",
-            direct_exc,
-        )
+        _dlog.warning("[Downloader] direct failed (%s) — trying aria2c", direct_exc)
 
     try:
         return await download_aria2(
