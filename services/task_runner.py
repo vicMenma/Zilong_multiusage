@@ -320,6 +320,10 @@ class TaskRunner:
                     count += 1
         return count
 
+    def _wake_panel(self, uid: int, immediate: bool = False) -> None:
+        """No-op stub — LivePanel removed, inline progress handles display."""
+        pass
+
     async def submit(
         self,
         user_id:      int,
