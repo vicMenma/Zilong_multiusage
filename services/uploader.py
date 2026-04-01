@@ -370,6 +370,22 @@ async def _upload_single(
         except Exception:
             pass
 
+    # Auto-forward to user's saved channels (if enabled in Settings)
+    if sent and user_id:
+        try:
+            s = await settings.get(user_id)
+            if s.get("auto_forward") and s.get("forward_channels"):
+                for ch in s["forward_channels"]:
+                    ch_id = ch.get("id")
+                    if not ch_id:
+                        continue
+                    try:
+                        await sent.copy(ch_id)
+                    except Exception as fwd_exc:
+                        log.warning("Auto-forward to %s failed: %s", ch_id, fwd_exc)
+        except Exception as af_exc:
+            log.warning("Auto-forward error: %s", af_exc)
+
     log.info("✅ %s  %s/s  %.1fs", fname, human_size(speed), elapsed)
 
 

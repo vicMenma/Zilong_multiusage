@@ -66,16 +66,18 @@ def _extract_urls(data: dict) -> list[dict]:
 
 
 async def _process_file(url: str, filename: str, owner_id: int) -> None:
+    # FIX: _enums must be imported at the TOP of this function.
+    # It was previously imported at line ~126 (after send_message calls at lines
+    # ~93 and ~106 that already use _enums.ParseMode.HTML), causing a NameError
+    # on every error path. The log showed: "Could not DM owner: name '_enums' is not defined"
+    from pyrogram import enums as _enums
     from core.config import cfg
     from core.session import get_client, settings as _settings
     from services.uploader import upload_file
     from services.utils import cleanup, make_tmp, smart_clean_filename, human_size
-
-    # FIX: use download_direct instead of smart_download.
-    # CC export URLs are single-use signed tokens. smart_download → _dispatch
-    # → download_parallel first, which fires 8 simultaneous Range requests and
-    # burns the token on #1, causing all other segments to get 403/empty.
-    # download_direct uses a single streaming GET — the correct approach.
+    # CC export URLs are single-use signed tokens — use download_direct (single
+    # streaming GET), not smart_download which fires 8 parallel Range requests
+    # and burns the token on request #1, corrupting the assembled file.
     from services.downloader import download_direct
 
     client = get_client()
@@ -123,7 +125,6 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             except OSError:
                 pass
 
-        from pyrogram import enums as _enums
         st = await client.send_message(
             owner_id,
             f"📤 <b>Uploading…</b>\n<code>{os.path.basename(path)}</code>",
