@@ -23,6 +23,7 @@ import logging
 import os
 
 from aiohttp import web
+from services.cloudconvert_api import parse_api_keys, pick_best_key
 
 log = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
                 owner_id,
                 f"❌ <b>CloudConvert download failed</b>\n"
                 f"<code>{filename}</code>\n<i>No output file found.</i>",
-                parse_mode="html",
+                parse_mode=_enums.ParseMode.HTML,
             )
             cleanup(tmp)
             return
@@ -102,7 +103,7 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
                 f"<code>{filename}</code>\n"
                 f"Size: <code>{human_size(fsize)}</code>\n"
                 f"Limit: <code>{human_size(cfg.file_limit_b)}</code>",
-                parse_mode="html",
+                parse_mode=_enums.ParseMode.HTML,
             )
             cleanup(tmp)
             return
@@ -138,7 +139,7 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
                 f"❌ <b>CloudConvert auto-upload failed</b>\n"
                 f"<code>{filename}</code>\n"
                 f"<code>{str(exc)[:200]}</code>",
-                parse_mode="html",
+                parse_mode=_enums.ParseMode.HTML,
             )
         except Exception:
             pass
@@ -182,7 +183,7 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
                     f"──────────────────────\n\n"
                     f"📁 <b>File:</b> <code>{name[:50]}</code>\n\n"
                     f"<i>Downloading and uploading automatically…</i>",
-                    parse_mode="html",
+                    parse_mode=_enums.ParseMode.HTML,
                 )
             except Exception as notify_exc:
                 log.warning("[CC-Hook] Could not notify owner: %s", notify_exc)
@@ -268,7 +269,7 @@ async def _register_cc_webhook(base_url: str, api_key: str) -> None:
             f"🔑 <b>Secret:</b> {'✅ Set' if WEBHOOK_SECRET else '❌ None (open endpoint)'}\n\n"
             f"<i>Auto-registered with CloudConvert.\n"
             f"ccstatus poller also running as backup.</i>",
-            parse_mode="html",
+            parse_mode=_enums.ParseMode.HTML,
         )
     except Exception as exc:
         log.warning("[CC-Hook] Could not DM owner: %s", exc)
@@ -293,14 +294,25 @@ async def start_webhook_server(
         )
 
     from core.config import cfg
-    api_key = cfg.cc_api_key
+    raw_keys = cfg.cc_api_key
 
     base_url = os.environ.get("WEBHOOK_BASE_URL", "").strip().rstrip("/")
     if base_url:
         webhook_url = f"{base_url}/webhook/cloudconvert"
         log.info("[CC-Hook] Using WEBHOOK_BASE_URL: %s", webhook_url)
-        if api_key:
-            asyncio.create_task(_register_cc_webhook(base_url, api_key))
+        if raw_keys:
+            async def _register_with_best_key() -> None:
+                api_keys = parse_api_keys(raw_keys)
+                log.info("[CC-Hook] Checking credits on %d API key(s)…", len(api_keys))
+                try:
+                    best_key, credits = await pick_best_key(api_keys)
+                    log.info("[CC-Hook] Using key with %d credits for webhook registration", credits)
+                    await _register_cc_webhook(base_url, best_key)
+                except RuntimeError as exc:
+                    log.error("[CC-Hook] All CC API keys exhausted: %s", exc)
+                except Exception as exc:
+                    log.error("[CC-Hook] Key selection failed: %s", exc)
+            asyncio.create_task(_register_with_best_key())
         else:
             log.warning(
                 "[CC-Hook] No CC_API_KEY — auto-registration skipped. "
