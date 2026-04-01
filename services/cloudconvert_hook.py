@@ -23,6 +23,7 @@ import logging
 import os
 
 from aiohttp import web
+from pyrogram import enums as _enums
 from services.cloudconvert_api import parse_api_keys, pick_best_key
 
 log = logging.getLogger(__name__)
