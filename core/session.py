@@ -179,6 +179,7 @@ _DEFAULTS: dict[str, Any] = {
     "thumb_id":         None,     # Telegram file_id of saved thumbnail
     "auto_forward":     False,    # copy to all channels automatically after upload
     "forward_channels": [],       # list of {"id": int, "name": str}
+    "progress_style":   "B",      # "B" (cards) | "C" (minimal)
 }
 
 
