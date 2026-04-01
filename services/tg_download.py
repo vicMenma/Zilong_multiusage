@@ -32,11 +32,11 @@ async def tg_download(
 
     display_name = fname or label or os.path.basename(dest_path) or "file"
     start        = time.time()
-    last_edit    = [start - 2.0]   # allow first edit immediately
+    last_edit    = [start - 4.0]   # allow first edit immediately
 
     async def _prog(current: int, total: int) -> None:
         now = time.time()
-        if now - last_edit[0] < 1.5:
+        if now - last_edit[0] < 4.0:
             return
         last_edit[0] = now
 

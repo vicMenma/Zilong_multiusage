@@ -251,11 +251,11 @@ async def _upload_single(
         pass
 
     start        = time.time()
-    last_edit    = [start - 2.0]
+    last_edit    = [start - 4.0]
 
     async def progress(current: int, total: int) -> None:
         now = time.time()
-        if now - last_edit[0] < 1.5:
+        if now - last_edit[0] < 4.0:
             return
         last_edit[0] = now
         elapsed = now - start
@@ -435,6 +435,7 @@ async def upload_file(
                 f"<code>{original_fname}</code>\n"
                 f"📦 <b>Part {i}/{total_parts}</b>  <code>{human_size(part_size)}</code>"
             )
+            await asyncio.sleep(1.5)   # avoid burst of send_message calls
             ph = await client.send_message(
                 chat_id,
                 f"📤 Part {i}/{total_parts}…\n<code>{os.path.basename(pp)}</code>",

@@ -211,7 +211,7 @@ async def download_ytdlp(
     last_time = start
 
     while not future.done():
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(3.0)
         if progress:
             try:
                 cur       = largest_file(dest)
@@ -513,9 +513,15 @@ async def smart_download(
 
     from services.task_runner import _stats_cache
 
+    _last_edit = [0.0]  # throttle gate for _tracked_progress
+
     async def _tracked_progress(done: int, total: int, speed: float, eta: int) -> None:
         record.update(done=done, total=total, speed=speed, eta=eta, state="📥 Downloading")
         if msg is not None:
+            now = time.time()
+            if now - _last_edit[0] < 4.0:
+                return
+            _last_edit[0] = now
             s = _stats_cache
             text = progress_panel(
                 mode        = record.mode,

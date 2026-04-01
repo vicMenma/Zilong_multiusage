@@ -262,18 +262,27 @@ _EDIT_SUPPRESSED = frozenset({
 })
 
 async def safe_edit(msg, text: str, **kwargs) -> None:
+    import re as _re2
     if len(text) > _TG_MAX:
         text = text[:_TG_MAX - 64] + "\n\n<i>⚠️ Truncated</i>"
-    try:
-        await msg.edit(text, **kwargs)
-    except Exception as e:
-        err = str(e)
-        if any(x in err for x in _EDIT_SUPPRESSED):
+    for _attempt in range(3):
+        try:
+            await msg.edit(text, **kwargs)
             return
-        if "FLOOD_WAIT" in err or "peer_id_invalid" in err.lower():
-            log.debug("safe_edit suppressed: %s", err[:100])
-            return
-        raise
+        except Exception as e:
+            err = str(e)
+            if any(x in err for x in _EDIT_SUPPRESSED):
+                return
+            if "FLOOD_WAIT" in err:
+                m = _re2.search(r"FLOOD_WAIT_(\d+)", err)
+                wait = min(int(m.group(1)) if m else 30, 60)  # cap at 60s
+                log.warning("safe_edit FLOOD_WAIT %ds — backing off", wait)
+                await asyncio.sleep(wait)
+                continue  # retry after sleep
+            if "peer_id_invalid" in err.lower():
+                log.debug("safe_edit suppressed: %s", err[:100])
+                return
+            raise
 
 
 # ─────────────────────────────────────────────────────────────
