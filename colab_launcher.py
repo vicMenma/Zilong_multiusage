@@ -13,7 +13,8 @@
 # @markdown | `OWNER_ID` | ✅ | `987654321` |
 # @markdown | `GITHUB_TOKEN` | private repo | PAT with `repo` scope |
 # @markdown | `CC_API_KEY` | hardsub | CloudConvert key |
-# @markdown | `NGROK_TOKEN` | webhook | ngrok authtoken |
+# @markdown | `NGROK_TOKEN` | webhook (legacy) | ngrok authtoken |
+# @markdown | `WEBHOOK_BASE_URL` | webhook | auto-set by launcher via Serveo; override for VPS |
 
 API_ID    = 0      # @param {type:"integer"}
 API_HASH  = ""     # @param {type:"string"}
@@ -27,6 +28,8 @@ NGROK_TOKEN       = ""  # @param {type:"string"}
 CC_WEBHOOK_SECRET = ""  # @param {type:"string"}
 CC_API_KEY        = ""  # @param {type:"string"}
 GITHUB_TOKEN      = ""  # @param {type:"string"}
+# Set manually only for VPS/EC2 — on Colab this is auto-filled via Serveo tunnel
+WEBHOOK_BASE_URL  = ""  # @param {type:"string"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 import os, sys, subprocess, shutil, time, glob, threading
@@ -76,6 +79,7 @@ NGROK_TOKEN       = _secret("NGROK_TOKEN") or _secret("NGROK_AUTHTOKEN") or NGRO
 CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET") or CC_WEBHOOK_SECRET
 CC_API_KEY        = _secret("CC_API_KEY")        or CC_API_KEY
 GITHUB_TOKEN      = _secret("GITHUB_TOKEN")      or GITHUB_TOKEN
+WEBHOOK_BASE_URL  = _secret("WEBHOOK_BASE_URL")  or WEBHOOK_BASE_URL
 
 errors = []
 if not API_ID:    errors.append("API_ID is required")
@@ -91,9 +95,10 @@ if errors:
     raise SystemExit("Missing required credentials.")
 
 _log("OK", f"API_ID={API_ID}  OWNER_ID={OWNER_ID}")
-if NGROK_TOKEN:  _log("OK", "CloudConvert webhook enabled (NGROK_TOKEN set)")
-if CC_API_KEY:   _log("OK", "CloudConvert hardsub enabled (CC_API_KEY set)")
-if GITHUB_TOKEN: _log("OK", "GitHub token set — will clone private repo")
+if WEBHOOK_BASE_URL: _log("OK", f"CloudConvert webhook URL set: {WEBHOOK_BASE_URL}")
+elif NGROK_TOKEN:    _log("OK", "NGROK_TOKEN set (legacy — Serveo tunnel preferred)")
+if CC_API_KEY:       _log("OK", "CloudConvert hardsub enabled (CC_API_KEY set)")
+if GITHUB_TOKEN:     _log("OK", "GitHub token set — will clone private repo")
 
 # ── System packages ───────────────────────────────────────────────────────
 _log("STEP", "Installing system packages…")
@@ -160,6 +165,7 @@ env_lines = [
     f"NGROK_TOKEN={NGROK_TOKEN}",
     f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
     f"CC_API_KEY={CC_API_KEY}",
+    f"WEBHOOK_BASE_URL={WEBHOOK_BASE_URL}",
 ]
 for optional in ("ADMINS", "GDRIVE_SA_JSON"):
     val = _secret(optional)
@@ -227,6 +233,58 @@ try:
         os.remove(_PID_FILE)
 except Exception as _ke:
     _log("WARN", f"Could not clean up stale PID: {_ke}")
+
+# ── Open Serveo tunnel for CloudConvert webhook (port 8765) ──────────────
+# Only runs when CC_API_KEY is set and WEBHOOK_BASE_URL is not already
+# provided (e.g. manually set for VPS deployments).
+def _open_webhook_tunnel() -> str:
+    """
+    SSH reverse-tunnel: Serveo public HTTPS → localhost:8765
+    Returns the public base URL (e.g. https://xyz.serveo.net) or '' on failure.
+    """
+    import re as _re2
+    try:
+        proc = subprocess.Popen(
+            [
+                "ssh", "-o", "StrictHostKeyChecking=no",
+                "-o", "ServerAliveInterval=30",
+                "-R", "80:localhost:8765",
+                "serveo.net",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        deadline = time.time() + 20
+        for line in proc.stdout:
+            m = _re2.search(r"(https://\S+\.serveo\.net)", line)
+            if m:
+                return m.group(1).rstrip("/")
+            if time.time() > deadline:
+                break
+        _log("WARN", "Serveo webhook tunnel timed out — webhook unavailable.")
+        return ""
+    except Exception as exc:
+        _log("WARN", f"Serveo webhook tunnel failed: {exc}")
+        return ""
+
+
+if CC_API_KEY and not WEBHOOK_BASE_URL:
+    _log("STEP", "Opening Serveo tunnel for CloudConvert webhook (port 8765)…")
+    WEBHOOK_BASE_URL = _open_webhook_tunnel()
+    if WEBHOOK_BASE_URL:
+        _log("OK", f"Webhook tunnel active: {WEBHOOK_BASE_URL}/webhook/cloudconvert")
+        # Patch env_lines and .env so the bot picks it up
+        env_lines = [
+            ln if not ln.startswith("WEBHOOK_BASE_URL=") else f"WEBHOOK_BASE_URL={WEBHOOK_BASE_URL}"
+            for ln in env_lines
+        ]
+        with open(f"{BASE_DIR}/.env", "w") as _f:
+            _f.write("\n".join(env_lines))
+    else:
+        _log("WARN", "No webhook URL — falling back to ccstatus poller (~5 s lag).")
+elif WEBHOOK_BASE_URL:
+    _log("OK", f"Using provided WEBHOOK_BASE_URL: {WEBHOOK_BASE_URL}")
 
 # ── Bot restart loop ──────────────────────────────────────────────────────
 _log("OK", "Starting bot…\n" + "─" * 50)
