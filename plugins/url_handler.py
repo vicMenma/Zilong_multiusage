@@ -35,7 +35,7 @@ from services.downloader import classify, smart_download, download_ytdlp
 from services.tg_download import tg_download
 from services.uploader import upload_file
 from services.utils import (
-    cleanup, human_size, lang_flag, lang_name,
+    all_video_files, cleanup, human_size, lang_flag, lang_name,
     largest_file, make_tmp, progress_panel, safe_edit,
     smart_clean_filename,
 )
@@ -1116,14 +1116,20 @@ async def _launch_download(
             pass
         return
 
-    # Resolve directory → largest file
+    # Collect ALL files from batch download (fixes single-file bug for multi-episode magnets)
+    from services.utils import all_video_files as _all_videos
     if os.path.isdir(path):
-        resolved = largest_file(path)
-        if resolved:
-            path = resolved
+        all_files = _all_videos(path)
+        if not all_files:
+            resolved = largest_file(path)
+            all_files = [resolved] if resolved else []
+    elif os.path.isfile(path):
+        all_files = [path]
+    else:
+        all_files = []
 
-    if not os.path.isfile(path):
-        log.error("_launch_download uid=%d: path not a file: %s", uid, path)
+    if not all_files:
+        log.error("_launch_download uid=%d: no output files in %s", uid, tmp)
         cleanup(tmp)
         try:
             await st.edit(
@@ -1134,42 +1140,76 @@ async def _launch_download(
             pass
         return
 
-    fsize = os.path.getsize(path)
-    if fsize > cfg.file_limit_b:
-        cleanup(tmp)
+    total_files = len(all_files)
+    if total_files > 1:
         try:
             await st.edit(
-                f"❌ <b>File too large</b>\n"
-                f"Size: <code>{human_size(fsize)}</code>\n"
-                f"Limit: <code>{human_size(cfg.file_limit_b)}</code>",
+                f"✅ <b>Download complete — {total_files} files</b>\n"
+                f"📤 <i>Starting batch upload…</i>",
                 parse_mode=enums.ParseMode.HTML,
             )
         except Exception:
             pass
-        return
 
-    # Apply prefix / suffix
+    # Apply prefix / suffix settings once
     from core.session import settings as _settings
-    s = await _settings.get(uid)
-    fname      = os.path.basename(path)
-    cleaned    = smart_clean_filename(fname)
-    name, ext  = os.path.splitext(cleaned)
-    prefix     = s.get("prefix", "").strip()
-    suffix     = s.get("suffix", "").strip()
-    final_name = f"{prefix}{name}{suffix}{ext}"
-    if final_name != fname:
-        new_path = os.path.join(os.path.dirname(path), final_name)
-        try:
-            os.rename(path, new_path)
-            path = new_path
-        except OSError as rename_err:
-            log.warning("Rename failed: %s", rename_err)
+    s      = await _settings.get(uid)
+    prefix = s.get("prefix", "").strip()
+    suffix = s.get("suffix", "").strip()
 
-    # Upload — upload_file deletes st and opens its own upload panel
     try:
-        await upload_file(client, st, path)
-    except Exception as exc:
-        log.error("Upload failed for %s: %s", path, exc)
+        for i, fpath in enumerate(all_files, 1):
+            fsize = os.path.getsize(fpath)
+
+            if fsize > cfg.file_limit_b:
+                log.warning("Skipping %s — exceeds file limit", fpath)
+                try:
+                    await client.send_message(
+                        uid,
+                        f"⚠️ <b>Skipped ({i}/{total_files})</b>\n"
+                        f"<code>{os.path.basename(fpath)}</code>\n"
+                        f"Size <code>{human_size(fsize)}</code> exceeds "
+                        f"limit <code>{human_size(cfg.file_limit_b)}</code>",
+                        parse_mode=enums.ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+                continue
+
+            # Rename with prefix/suffix
+            fname     = os.path.basename(fpath)
+            cleaned   = smart_clean_filename(fname)
+            name, ext = os.path.splitext(cleaned)
+            final_name = f"{prefix}{name}{suffix}{ext}"
+            if final_name != fname:
+                new_path = os.path.join(os.path.dirname(fpath), final_name)
+                try:
+                    os.rename(fpath, new_path)
+                    fpath = new_path
+                except OSError as rename_err:
+                    log.warning("Rename failed: %s", rename_err)
+
+            # Each file gets its own upload status message
+            upload_st = await client.send_message(
+                uid,
+                f"📤 <b>Uploading {i}/{total_files}</b>\n"
+                f"<code>{os.path.basename(fpath)}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            try:
+                await upload_file(client, upload_st, fpath)
+            except Exception as exc:
+                log.error("Upload failed for %s: %s", fpath, exc)
+
+            # Breathing room between uploads to avoid FloodWait
+            if i < total_files:
+                await asyncio.sleep(2)
+
+        # Clean up the original download status message
+        try:
+            await st.delete()
+        except Exception:
+            pass
     finally:
         cleanup(tmp)
 
