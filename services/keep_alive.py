@@ -1,40 +1,41 @@
 """
 services/keep_alive.py
-Proper Colab keep-alive via HTTP health server + ngrok tunnel.
-
-Replaces the fragile JS-click hack in colab_launcher.py.
+Colab keep-alive via HTTP health server + Serveo SSH tunnel.
 
 How it works:
-  1. Starts an aiohttp HTTP server on port 8080 inside the bot process
-  2. Exposes it publicly via ngrok (reuses the existing NGROK_TOKEN)
-  3. Prints the public URL so you can add it to UptimeRobot
+  1. Starts an aiohttp HTTP server on a free port inside the bot process
+  2. Exposes it publicly via Serveo (free, no account, no token needed)
+     ssh -R 80:localhost:PORT serveo.net
+  3. Prints the public HTTPS URL so you can add it to UptimeRobot
   4. UptimeRobot pings every 5 minutes → Colab sees network activity → stays alive
 
 UptimeRobot setup (free):
   1. Go to uptimerobot.com → Add New Monitor
   2. Monitor Type: HTTP(s)
-  3. URL: paste the ngrok URL printed below
+  3. URL: paste the Serveo URL printed in the logs
   4. Monitoring Interval: 5 minutes
   5. Save — done.
-
-If NGROK_TOKEN is not set, the server runs on localhost only and the
-existing JS heartbeat in colab_launcher.py remains the fallback.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
+import subprocess
+import threading
 import time
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
-_runner: Optional[object] = None
-_site:   Optional[object] = None
+_runner:     Optional[object] = None
+_site:       Optional[object] = None
 _public_url: str = ""
+_START_TIME  = time.time()
 
-_START_TIME = time.time()
 
+# ── Health endpoints ──────────────────────────────────────────
 
 async def _handle_health(request) -> "web.Response":
     from aiohttp import web
@@ -42,16 +43,16 @@ async def _handle_health(request) -> "web.Response":
     from core.bot_name import get_bot_name
     from services.task_runner import tracker
 
-    uptime    = human_dur(int(time.time() - _START_TIME))
-    active    = len(tracker.active_tasks())
-    bot_name  = get_bot_name()
+    uptime   = human_dur(int(time.time() - _START_TIME))
+    active   = len(tracker.active_tasks())
+    bot_name = get_bot_name()
 
     return web.json_response({
-        "status":   "online",
-        "bot":      bot_name,
-        "uptime":   uptime,
+        "status":       "online",
+        "bot":          bot_name,
+        "uptime":       uptime,
         "active_tasks": active,
-        "timestamp": int(time.time()),
+        "timestamp":    int(time.time()),
     })
 
 
@@ -80,8 +81,9 @@ def _build_app():
     return app
 
 
+# ── Port finder ───────────────────────────────────────────────
+
 def _find_free_port(start: int = 8080, end: int = 8199) -> int:
-    """Find the first free TCP port in the given range."""
     import socket
     for p in range(start, end):
         try:
@@ -93,17 +95,74 @@ def _find_free_port(start: int = 8080, end: int = 8199) -> int:
     raise RuntimeError(f"No free port found in range {start}-{end}")
 
 
+# ── Serveo tunnel ─────────────────────────────────────────────
+
+def _open_serveo(local_port: int) -> str:
+    """
+    Open a Serveo SSH reverse tunnel: public HTTPS → localhost:local_port.
+    Blocks up to 20 seconds waiting for the URL, then returns it (or "" on failure).
+    Keeps the SSH process alive in a daemon thread for the lifetime of the bot.
+    """
+    result: dict = {"url": ""}
+
+    def _run() -> None:
+        cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", f"80:localhost:{local_port}",
+            "serveo.net",
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            for line in proc.stdout:
+                if not result["url"]:
+                    m = re.search(r"(https://\S+\.serveo\.net)", line)
+                    if m:
+                        result["url"] = m.group(1)
+                        log.info("🌐 Serveo tunnel active: %s → localhost:%d",
+                                 result["url"], local_port)
+        except Exception as exc:
+            log.warning("Serveo thread error: %s", exc)
+
+    threading.Thread(target=_run, daemon=True, name="serveo-keepalive").start()
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if result["url"]:
+            return result["url"]
+        time.sleep(0.5)
+
+    log.warning("Serveo tunnel did not return a URL within 20s — health is localhost only.")
+    return ""
+
+
+# ── Public API ────────────────────────────────────────────────
+
 async def start(port: int = 8080, ngrok_token: str = "") -> str:
     """
-    Start the health server. Returns the public URL (empty if no ngrok).
-    Auto-finds a free port if the requested one is busy.
-    Call this from main.py after the bot starts.
+    Start the health server and open a Serveo tunnel.
+    `ngrok_token` parameter kept for API compatibility but is unused.
+    Returns the public URL (empty string if tunnel fails).
     """
     global _runner, _site, _public_url
 
     from aiohttp import web
 
-    # Auto-find a free port if the default is busy
+    # If a public URL was pre-set by the launcher via env, use it as-is
+    env_url = os.environ.get("HEALTH_PUBLIC_URL", "").strip()
+    if env_url:
+        log.info("🌐 Keep-alive public URL (from env): %s", env_url)
+        _public_url = env_url
+
+    # Find a free port
     try:
         import socket
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -119,43 +178,29 @@ async def start(port: int = 8080, ngrok_token: str = "") -> str:
     await _site.start()
     log.info("🏥 Health server listening on 0.0.0.0:%d", port)
 
-    if not ngrok_token:
-        log.info(
-            "ℹ️  No NGROK_TOKEN — health server is localhost only.\n"
-            "    Set NGROK_TOKEN in Colab Secrets to get a public URL for UptimeRobot."
-        )
-        return ""
-
-    try:
-        from pyngrok import ngrok, conf
-        conf.get_default().auth_token = ngrok_token
-
-        # Use a named tunnel so we don't stack up multiple tunnels on restart
-        try:
-            ngrok.disconnect("http://localhost:" + str(port))
-        except Exception:
-            pass
-
-        tunnel      = ngrok.connect(port, "http", bind_tls=True)
-        _public_url = tunnel.public_url
-        log.info("🌐 Keep-alive public URL: %s", _public_url)
+    # URL already known from env — no tunnel needed
+    if _public_url:
         return _public_url
 
-    except ImportError:
-        log.error("pyngrok not installed — pip install pyngrok")
-    except Exception as exc:
-        log.error("ngrok error: %s", exc)
+    # Open Serveo tunnel
+    url = _open_serveo(port)
+    if url:
+        _public_url = url
+        log.info(
+            "📌 Add this URL to UptimeRobot (5-min interval) to keep Colab alive:\n"
+            "    %s/health", url,
+        )
+        return url
 
+    log.warning(
+        "⚠️  Serveo tunnel failed — health server is localhost only.\n"
+        "    Colab may disconnect after ~90 min without external pings."
+    )
     return ""
 
 
 async def stop() -> None:
     global _runner, _site
-    try:
-        from pyngrok import ngrok
-        ngrok.kill()
-    except Exception:
-        pass
     if _site:
         await _site.stop()
     if _runner:

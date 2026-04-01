@@ -276,7 +276,7 @@ async def _register_cc_webhook(base_url: str, api_key: str) -> None:
 
 async def start_webhook_server(
     port: int = LISTEN_PORT,
-    ngrok_token: str = "",
+    ngrok_token: str = "",   # kept for API compat, unused
 ) -> str:
     global _runner, _site
 
@@ -298,7 +298,7 @@ async def start_webhook_server(
     base_url = os.environ.get("WEBHOOK_BASE_URL", "").strip().rstrip("/")
     if base_url:
         webhook_url = f"{base_url}/webhook/cloudconvert"
-        log.info("[CC-Hook] Using static WEBHOOK_BASE_URL: %s", webhook_url)
+        log.info("[CC-Hook] Using WEBHOOK_BASE_URL: %s", webhook_url)
         if api_key:
             asyncio.create_task(_register_cc_webhook(base_url, api_key))
         else:
@@ -308,24 +308,8 @@ async def start_webhook_server(
             )
         return webhook_url
 
-    if ngrok_token:
-        try:
-            from pyngrok import ngrok, conf
-            conf.get_default().auth_token = ngrok_token
-            tunnel      = ngrok.connect(port, "http")
-            public_url  = tunnel.public_url
-            webhook_url = f"{public_url}/webhook/cloudconvert"
-            log.info("[CC-Hook] ngrok tunnel active: %s", webhook_url)
-            if api_key:
-                asyncio.create_task(_register_cc_webhook(public_url, api_key))
-            return webhook_url
-        except ImportError:
-            log.error("[CC-Hook] pyngrok not installed — pip install pyngrok")
-        except Exception as exc:
-            log.error("[CC-Hook] ngrok error: %s", exc)
-
     log.info(
-        "[CC-Hook] No WEBHOOK_BASE_URL or NGROK_TOKEN set. "
+        "[CC-Hook] No WEBHOOK_BASE_URL set. "
         "Webhook server running locally only. "
         "The ccstatus poller will poll CloudConvert API and deliver jobs."
     )
@@ -334,11 +318,6 @@ async def start_webhook_server(
 
 async def stop_webhook_server() -> None:
     global _runner, _site
-    try:
-        from pyngrok import ngrok
-        ngrok.kill()
-    except Exception:
-        pass
     if _site:
         await _site.stop()
     if _runner:
