@@ -36,7 +36,7 @@ async def tg_download(
     last_edit    = [start - 4.0]   # allow first edit immediately
 
     user_cfg     = await settings.get(user_id)
-    panel_style  = user_cfg.get("progress_style", "1")
+    panel_style  = user_cfg.get("progress_style", "B")
 
     async def _prog(current: int, total: int) -> None:
         now = time.time()

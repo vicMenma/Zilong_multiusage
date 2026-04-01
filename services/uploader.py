@@ -234,7 +234,7 @@ async def _upload_single(
     cap         = caption or f"<code>{fname}</code>"
 
     user_cfg    = await settings.get(user_id)
-    panel_style = user_cfg.get("progress_style", "1")
+    panel_style = user_cfg.get("progress_style", "B")
 
     # Video metadata + thumbnail
     meta:       dict = {"duration": 0, "width": 0, "height": 0}
