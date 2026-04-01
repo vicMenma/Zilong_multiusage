@@ -237,29 +237,46 @@ except Exception as _ke:
 # ── Open Serveo tunnel for CloudConvert webhook (port 8765) ──────────────
 # Only runs when CC_API_KEY is set and WEBHOOK_BASE_URL is not already
 # provided (e.g. manually set for VPS deployments).
+#
+# SERVEO_SUBDOMAIN: set this to a fixed name (e.g. "zilong") so the URL
+# stays stable across Colab restarts — no need to re-register the webhook
+# in CloudConvert every time.  Leave blank for a random subdomain.
+SERVEO_SUBDOMAIN = "console"   # ← your fixed subdomain; change or blank-out as needed
+
+
 def _open_webhook_tunnel() -> str:
     """
     SSH reverse-tunnel: Serveo public HTTPS → localhost:8765
-    Returns the public base URL (e.g. https://xyz.serveo.net) or '' on failure.
+    Uses SERVEO_SUBDOMAIN for a stable URL that survives Colab restarts.
+    Returns the public base URL (e.g. https://console.serveo.net) or '' on failure.
     """
     import re as _re2
+    remote_spec = (
+        f"{SERVEO_SUBDOMAIN}:80:localhost:8765"
+        if SERVEO_SUBDOMAIN
+        else "80:localhost:8765"
+    )
     try:
         proc = subprocess.Popen(
             [
                 "ssh", "-o", "StrictHostKeyChecking=no",
                 "-o", "ServerAliveInterval=30",
-                "-R", "80:localhost:8765",
+                "-o", "ServerAliveCountMax=3",
+                "-R", remote_spec,
                 "serveo.net",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
-        deadline = time.time() + 20
+        deadline = time.time() + 30   # was 20 — give Serveo more time
         for line in proc.stdout:
+            _log("INFO", f"[Serveo] {line.rstrip()}")
             m = _re2.search(r"(https://\S+\.serveo\.net)", line)
             if m:
-                return m.group(1).rstrip("/")
+                url = m.group(1).rstrip("/")
+                _log("OK", f"Serveo tunnel established: {url}")
+                return url
             if time.time() > deadline:
                 break
         _log("WARN", "Serveo webhook tunnel timed out — webhook unavailable.")
