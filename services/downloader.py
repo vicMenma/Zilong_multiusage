@@ -465,10 +465,22 @@ async def download_aria2(
             f"aria2c exited {proc.returncode}: {err.decode(errors='replace')[-300:]}"
         )
 
-    result = largest_file(dest)
-    if not result:
-        raise FileNotFoundError("No file found after aria2c download")
-    return result
+    # For magnet / torrent downloads the output is a directory that may contain
+    # multiple files.  Return the directory so the caller (smart_download →
+    # _launch_download, or handle_torrent_file → _upload_and_cleanup) can
+    # iterate all files with all_video_files().
+    # For plain HTTP downloads (single file) keep the original behaviour of
+    # returning the largest file directly.
+    if is_magnet or is_file:
+        from services.utils import all_video_files as _avf
+        if not _avf(dest, min_bytes=0) and not largest_file(dest):
+            raise FileNotFoundError("No file found after aria2c download")
+        return dest   # directory — caller iterates
+    else:
+        result = largest_file(dest)
+        if not result:
+            raise FileNotFoundError("No file found after aria2c download")
+        return result
 
 
 # ── Smart dispatcher ───────────────────────────────────────────
@@ -523,8 +535,6 @@ async def smart_download(
                 return
             _last_edit[0] = now
             s = _stats_cache
-            from core.session import settings as _settings
-            _user_s = await _settings.get(user_id) if user_id else {}
             text = progress_panel(
                 mode        = record.mode,
                 fname       = record.fname or clean_label,
@@ -538,7 +548,6 @@ async def smart_download(
                 cpu         = float(s.get("cpu", 0)),
                 ram_used    = int(s.get("ram_used", 0)),
                 disk_free   = int(s.get("disk_free", 0)),
-                style       = _user_s.get("progress_style", "B"),
             )
             from pyrogram import enums as _enums
             await safe_edit(msg, text, parse_mode=_enums.ParseMode.HTML)
