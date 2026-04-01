@@ -72,6 +72,8 @@ def _settings_kb(s: dict) -> InlineKeyboardMarkup:
     af       = s.get("auto_forward", False)
     chs      = s.get("forward_channels", [])
     af_lbl   = f"📡 Auto-Forward: ✅ ({len(chs)} ch)" if af else "📡 Auto-Forward: ❌"
+    ps       = s.get("progress_style", "B")
+    ps_lbl   = "🎨 Progress: Cards (B)" if ps == "B" else "🎨 Progress: Minimal (C)"
 
     prefix_lbl = f"🔡 Prefix: {prefix[:18]}" if prefix else "🔡 Prefix: none"
     suffix_lbl = f"🔤 Suffix: {suffix[:18]}" if suffix else "🔤 Suffix: none"
@@ -87,6 +89,7 @@ def _settings_kb(s: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(af_lbl,                    callback_data="st_af_toggle"),
          InlineKeyboardButton("⚙️ Channels",              callback_data="st_af_manage")],
         [InlineKeyboardButton(f"✏️ Caption: {s.get('caption_style', 'Monospace')}", callback_data="st_caption")],
+        [InlineKeyboardButton(ps_lbl,                    callback_data="st_progress_style")],
         [InlineKeyboardButton("❌ Close",                  callback_data="st_close")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -261,6 +264,18 @@ async def cq_st_mode(client: Client, cb: CallbackQuery):
     s["upload_mode"] = new
     await cb.message.edit_reply_markup(_settings_kb(s))
     await cb.answer(f"Mode: {new} ✅")
+
+
+@Client.on_callback_query(filters.regex("^st_progress_style$"))
+async def cq_st_progress_style(client: Client, cb: CallbackQuery):
+    s       = await settings.get(cb.from_user.id)
+    current = s.get("progress_style", "B")
+    new     = "C" if current == "B" else "B"
+    await settings.update(cb.from_user.id, {"progress_style": new})
+    s["progress_style"] = new
+    await cb.message.edit_reply_markup(_settings_kb(s))
+    label = "Cards (B)" if new == "B" else "Minimal (C)"
+    await cb.answer(f"Progress style: {label} ✅")
 
 
 @Client.on_callback_query(filters.regex("^st_thumb$"))
