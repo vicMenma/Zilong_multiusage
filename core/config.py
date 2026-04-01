@@ -8,6 +8,12 @@ colab_launcher.py into the .env file always win over any stale env vars
 that were set earlier in the Colab runtime session. Without override=True,
 a stale NGROK_TOKEN exported into os.environ before clone persists and
 makes it look like the token is missing even though .env has the right value.
+
+WEBHOOK_BASE_URL: public base URL for the CloudConvert webhook server.
+  On Colab, colab_launcher.py opens a Serveo tunnel on port 8765 before
+  starting the bot and writes the resulting URL here automatically.
+  On a VPS/EC2, set it manually: e.g. http://YOUR_IP:8765
+  Leave empty to fall back to the ccstatus poller (~5 s lag).
 """
 import os
 import sys
@@ -72,6 +78,13 @@ class Config:
         os.environ.get("NGROK_TOKEN", ""))
     cc_webhook_secret: str = field(default_factory=lambda:
         os.environ.get("CC_WEBHOOK_SECRET", ""))
+
+    # Public base URL for the CloudConvert webhook receiver (port 8765).
+    # On Colab, colab_launcher.py opens a Serveo tunnel and writes this
+    # automatically before the bot starts. On a VPS, set it manually.
+    # Leave empty to use the ccstatus poller fallback instead.
+    webhook_base_url: str = field(default_factory=lambda:
+        os.environ.get("WEBHOOK_BASE_URL", "").strip().rstrip("/"))
 
     # CloudConvert API key (for /hardsub and /ccstatus)
     cc_api_key: str = field(default_factory=lambda:
