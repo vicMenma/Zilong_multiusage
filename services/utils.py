@@ -310,6 +310,48 @@ def safe_fname(name: str) -> str:
     return "".join(c for c in name if c.isalnum() or c in keep).strip() or "file"
 
 
+_VIDEO_EXTS_SET = frozenset({
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv",
+    ".ts", ".m2ts", ".wmv", ".m4v", ".rmvb", ".mpg", ".mpeg",
+})
+
+
+def all_video_files(directory: str, min_bytes: int = 5 * 1024 * 1024) -> list[str]:
+    """
+    Return every video file in `directory` (recursively) that is at least
+    `min_bytes` large, sorted naturally by filename.
+    Files ending in .aria2 are skipped.
+    If no video files are found, returns all non-.aria2 files >= min_bytes
+    (so plain-document batches still work).
+    """
+    videos: list[tuple[str, str]] = []   # (lower_name, path)
+    others: list[tuple[str, str]] = []
+
+    try:
+        for root, dirs, files in os.walk(directory):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fn in files:
+                if fn.endswith(".aria2"):
+                    continue
+                fp = os.path.join(root, fn)
+                try:
+                    if os.path.getsize(fp) < min_bytes:
+                        continue
+                except OSError:
+                    continue
+                ext = os.path.splitext(fn)[1].lower()
+                if ext in _VIDEO_EXTS_SET:
+                    videos.append((fn.lower(), fp))
+                else:
+                    others.append((fn.lower(), fp))
+    except Exception:
+        pass
+
+    results = videos or others
+    results.sort(key=lambda x: x[0])
+    return [fp for _, fp in results]
+
+
 def largest_file(directory: str) -> Optional[str]:
     best: Optional[str] = None
     best_sz = -1
