@@ -29,6 +29,7 @@ import aiohttp
 import yt_dlp
 
 from core.config import cfg
+from core.session import settings
 from services.utils import largest_file, progress_panel, safe_edit
 
 ProgressCB = Callable[[int, int, float, int], Awaitable[None]]
@@ -525,7 +526,9 @@ async def smart_download(
 
     from services.task_runner import _stats_cache
 
-    _last_edit = [0.0]  # throttle gate for _tracked_progress
+    _last_edit  = [0.0]  # throttle gate for _tracked_progress
+    user_cfg    = await settings.get(record.user_id)
+    panel_style = user_cfg.get("progress_style", "B")
 
     async def _tracked_progress(done: int, total: int, speed: float, eta: int) -> None:
         record.update(done=done, total=total, speed=speed, eta=eta, state="📥 Downloading")
@@ -548,6 +551,7 @@ async def smart_download(
                 cpu         = float(s.get("cpu", 0)),
                 ram_used    = int(s.get("ram_used", 0)),
                 disk_free   = int(s.get("disk_free", 0)),
+                style       = panel_style,
             )
             from pyrogram import enums as _enums
             await safe_edit(msg, text, parse_mode=_enums.ParseMode.HTML)

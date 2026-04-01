@@ -16,6 +16,7 @@ import time
 from pyrogram import Client, enums
 
 from services.utils import human_size, progress_panel, safe_edit
+from core.session import settings
 
 
 async def tg_download(
@@ -33,6 +34,9 @@ async def tg_download(
     display_name = fname or label or os.path.basename(dest_path) or "file"
     start        = time.time()
     last_edit    = [start - 4.0]   # allow first edit immediately
+
+    user_cfg     = await settings.get(user_id)
+    panel_style  = user_cfg.get("progress_style", "B")
 
     async def _prog(current: int, total: int) -> None:
         now = time.time()
@@ -58,6 +62,7 @@ async def tg_download(
             cpu         = float(s.get("cpu", 0)),
             ram_used    = int(s.get("ram_used", 0)),
             disk_free   = int(s.get("disk_free", 0)),
+            style       = panel_style,
         )
         await safe_edit(msg, text, parse_mode=enums.ParseMode.HTML)
 
