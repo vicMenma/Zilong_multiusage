@@ -130,7 +130,7 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             f"📤 <b>Uploading…</b>\n<code>{os.path.basename(path)}</code>",
             parse_mode=_enums.ParseMode.HTML,
         )
-        await upload_file(client, st, path)
+        await upload_file(client, st, path, user_id=owner_id)
 
     except Exception as exc:
         log.error("[CC-Hook] Pipeline failed for %s: %s", filename, exc)
