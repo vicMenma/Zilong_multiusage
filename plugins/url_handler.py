@@ -1020,19 +1020,104 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
 # ─────────────────────────────────────────────────────────────
 
 async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
-    st = await client.send_message(
-        uid,
-        f"📤 <b>Uploading…</b>\n<code>{os.path.basename(path)}</code>",
-        parse_mode=enums.ParseMode.HTML,
-    )
-    try:
-        await upload_file(client, st, path)
-    except Exception as exc:
-        log.error("Upload failed for %s: %s", path, exc)
+    """
+    Upload one file or a full directory of files, then clean up tmp.
+    `path` may be:
+      - a single file  → upload it directly
+      - a directory    → collect all files with all_video_files() and batch-upload
+    """
+    from services.utils import all_video_files as _avf, smart_clean_filename
+    from core.session import settings as _settings
+    from core.config import cfg
+
+    # Collect files to upload
+    if os.path.isdir(path):
+        all_files = _avf(path)
+        if not all_files:
+            resolved = largest_file(path)
+            all_files = [resolved] if resolved else []
+    elif os.path.isfile(path):
+        all_files = [path]
+    else:
+        all_files = []
+
+    if not all_files:
         try:
-            await st.delete()
+            await client.send_message(
+                uid, "❌ <b>Upload failed</b>\n\n<code>No output files found</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
         except Exception:
             pass
+        cleanup(tmp)
+        return
+
+    total_files = len(all_files)
+
+    # Notify when it's a real batch
+    if total_files > 1:
+        try:
+            await client.send_message(
+                uid,
+                f"✅ <b>Download complete — {total_files} files</b>\n"
+                f"📤 <i>Starting batch upload…</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+    s      = await _settings.get(uid)
+    prefix = s.get("prefix", "").strip()
+    suffix = s.get("suffix", "").strip()
+
+    try:
+        for i, fpath in enumerate(all_files, 1):
+            fsize = os.path.getsize(fpath)
+
+            if fsize > cfg.file_limit_b:
+                log.warning("Skipping %s — exceeds file limit", fpath)
+                try:
+                    await client.send_message(
+                        uid,
+                        f"⚠️ <b>Skipped ({i}/{total_files})</b>\n"
+                        f"<code>{os.path.basename(fpath)}</code>\n"
+                        f"Size <code>{human_size(fsize)}</code> exceeds "
+                        f"limit <code>{human_size(cfg.file_limit_b)}</code>",
+                        parse_mode=enums.ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+                continue
+
+            # Apply prefix / suffix
+            fname     = os.path.basename(fpath)
+            cleaned   = smart_clean_filename(fname)
+            name, ext = os.path.splitext(cleaned)
+            final_name = f"{prefix}{name}{suffix}{ext}"
+            if final_name != fname:
+                new_path = os.path.join(os.path.dirname(fpath), final_name)
+                try:
+                    os.rename(fpath, new_path)
+                    fpath = new_path
+                except OSError as rename_err:
+                    log.warning("Rename failed: %s", rename_err)
+
+            progress_label = (
+                f"📤 <b>Uploading {i}/{total_files}</b>\n"
+                f"<code>{os.path.basename(fpath)}</code>"
+            )
+            st = await client.send_message(
+                uid, progress_label,
+                parse_mode=enums.ParseMode.HTML,
+            )
+            try:
+                await upload_file(client, st, fpath)
+            except Exception as exc:
+                log.error("Upload failed for %s: %s", fpath, exc)
+
+            if i < total_files:
+                await asyncio.sleep(2)
+
     finally:
         cleanup(tmp)
 
