@@ -72,8 +72,8 @@ def _settings_kb(s: dict) -> InlineKeyboardMarkup:
     af       = s.get("auto_forward", False)
     chs      = s.get("forward_channels", [])
     af_lbl   = f"📡 Auto-Forward: ✅ ({len(chs)} ch)" if af else "📡 Auto-Forward: ❌"
-    ps       = s.get("progress_style", "B")
-    ps_lbl   = "🎨 Progress: Cards (B)" if ps == "B" else "🎨 Progress: Minimal (C)"
+    ps       = s.get("progress_style", "1")
+    ps_lbl   = "🎨 Progress: Style 1 (card)" if ps == "1" else "🎨 Progress: Style 2 (grid)"
 
     prefix_lbl = f"🔡 Prefix: {prefix[:18]}" if prefix else "🔡 Prefix: none"
     suffix_lbl = f"🔤 Suffix: {suffix[:18]}" if suffix else "🔤 Suffix: none"
@@ -269,12 +269,12 @@ async def cq_st_mode(client: Client, cb: CallbackQuery):
 @Client.on_callback_query(filters.regex("^st_progress_style$"))
 async def cq_st_progress_style(client: Client, cb: CallbackQuery):
     s       = await settings.get(cb.from_user.id)
-    current = s.get("progress_style", "B")
-    new     = "C" if current == "B" else "B"
+    current = s.get("progress_style", "1")
+    new     = "2" if current == "1" else "1"
     await settings.update(cb.from_user.id, {"progress_style": new})
     s["progress_style"] = new
     await cb.message.edit_reply_markup(_settings_kb(s))
-    label = "Cards (B)" if new == "B" else "Minimal (C)"
+    label = "Style 1 (card)" if new == "1" else "Style 2 (grid)"
     await cb.answer(f"Progress style: {label} ✅")
 
 
