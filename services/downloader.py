@@ -523,6 +523,8 @@ async def smart_download(
                 return
             _last_edit[0] = now
             s = _stats_cache
+            from core.session import settings as _settings
+            _user_s = await _settings.get(user_id) if user_id else {}
             text = progress_panel(
                 mode        = record.mode,
                 fname       = record.fname or clean_label,
@@ -536,6 +538,7 @@ async def smart_download(
                 cpu         = float(s.get("cpu", 0)),
                 ram_used    = int(s.get("ram_used", 0)),
                 disk_free   = int(s.get("disk_free", 0)),
+                style       = _user_s.get("progress_style", "B"),
             )
             from pyrogram import enums as _enums
             await safe_edit(msg, text, parse_mode=_enums.ParseMode.HTML)
