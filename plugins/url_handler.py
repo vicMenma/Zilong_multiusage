@@ -932,7 +932,7 @@ async def mse_cb(client: Client, cb: CallbackQuery):
 
             await safe_edit(st, f"📤 Extracting stream #{idx_str}…")
             await FF.stream_op(path, out, ["-map", f"0:{idx_str}", "-c", "copy"])
-            await upload_file(client, st, out, caption=caption, force_document=force_doc)
+            await upload_file(client, st, out, caption=caption, force_document=force_doc, user_id=user_id)
 
     except Exception as exc:
         log.error("mse extraction failed: %s", exc, exc_info=True)
@@ -1111,7 +1111,7 @@ async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
                 parse_mode=enums.ParseMode.HTML,
             )
             try:
-                await upload_file(client, st, fpath)
+                await upload_file(client, st, fpath, user_id=uid)
             except Exception as exc:
                 log.error("Upload failed for %s: %s", fpath, exc)
 
@@ -1282,7 +1282,7 @@ async def _launch_download(
                 parse_mode=enums.ParseMode.HTML,
             )
             try:
-                await upload_file(client, upload_st, fpath)
+                await upload_file(client, upload_st, fpath, user_id=uid)
             except Exception as exc:
                 log.error("Upload failed for %s: %s", fpath, exc)
 

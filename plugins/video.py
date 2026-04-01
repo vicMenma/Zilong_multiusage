@@ -336,7 +336,7 @@ async def _execute(client, cb, action, key, session, user_id,
         await safe_edit(st, "🔇 Removing audio…")
         await _tracked_ffmpeg(user_id, "Remove Audio", os.path.basename(out),
                               FF.remove_audio(path, out))
-        await upload_file(client, st, out)
+        await upload_file(client, st, out, user_id=user_id)
         cleanup(tmp); await sessions.remove(key)
 
     # ── Screenshots ───────────────────────────────────────────
@@ -476,7 +476,7 @@ async def stream_cb(client: Client, cb: CallbackQuery):
                 else:
                     out = os.path.join(tmp, f"{base}_mapped{ext}")
                     await FF.stream_op(path, out, ["-map", f"0:{idx_str}", "-c", "copy"])
-                await upload_file(client, st, out)
+                await upload_file(client, st, out, user_id=user_id)
 
             elif action_raw == "srem":
                 await safe_edit(st, f"🗑️ Removing stream #{idx_str}…")
@@ -485,7 +485,7 @@ async def stream_cb(client: Client, cb: CallbackQuery):
                     await FF.remove_audio_and_subs(path, out)
                 else:
                     await FF.stream_op(path, out, ["-map","0","-map",f"-0:{idx_str}","-c","copy"])
-                await upload_file(client, st, out)
+                await upload_file(client, st, out, user_id=user_id)
 
             elif action_raw == "sext":
                 await safe_edit(st, f"📤 Extracting stream #{idx_str}…")
@@ -505,7 +505,7 @@ async def stream_cb(client: Client, cb: CallbackQuery):
                     await FF.stream_op(path, out, ["-vn","-c","copy"])
                 else:
                     await FF.stream_op(path, out, ["-map",f"0:{idx_str}","-c","copy"])
-                await upload_file(client, st, out, force_document=True)
+                await upload_file(client, st, out, force_document=True, user_id=user_id)
 
         except Exception as exc:
             log.error("stream_cb action=%s idx=%s: %s", action_raw, idx_str, exc, exc_info=True)
@@ -546,7 +546,7 @@ async def audio_fmt_cb(client: Client, cb: CallbackQuery):
             return await safe_edit(st, f"❌ Conversion failed: <code>{exc}</code>",
                                    parse_mode=enums.ParseMode.HTML,
                                    reply_markup=video_menu_kb(key))
-        await upload_file(client, st, out)
+        await upload_file(client, st, out, user_id=user_id)
         cleanup(session.tmp_dir)
         await sessions.remove(key)
 
@@ -579,7 +579,7 @@ async def video_conv_cb(client: Client, cb: CallbackQuery):
             return await safe_edit(st, f"❌ Conversion failed: <code>{exc}</code>",
                                    parse_mode=enums.ParseMode.HTML,
                                    reply_markup=video_menu_kb(key))
-        await upload_file(client, st, out)
+        await upload_file(client, st, out, user_id=user_id)
         cleanup(session.tmp_dir)
         await sessions.remove(key)
 
@@ -613,7 +613,7 @@ async def opt_cb(client: Client, cb: CallbackQuery):
             return await safe_edit(st, f"❌ Optimization failed: <code>{exc}</code>",
                                    parse_mode=enums.ParseMode.HTML,
                                    reply_markup=video_menu_kb(key))
-        await upload_file(client, st, out)
+        await upload_file(client, st, out, user_id=user_id)
         cleanup(session.tmp_dir)
         await sessions.remove(key)
 
@@ -662,7 +662,7 @@ async def text_reply_handler(client: Client, msg: Message):
             return await safe_edit(st, f"❌ Trim failed: <code>{exc}</code>",
                                    parse_mode=enums.ParseMode.HTML)
         session.waiting = None
-        await upload_file(client, st, out)
+        await upload_file(client, st, out, user_id=user_id)
         cleanup(tmp); await sessions.remove(session.key)
 
     # ── Split ─────────────────────────────────────────────────
@@ -687,7 +687,7 @@ async def text_reply_handler(client: Client, msg: Message):
         if not parts_done:
             return await safe_edit(st, "❌ Split produced no files.")
         for p in parts_done:
-            await upload_file(client, st, p)
+            await upload_file(client, st, p, user_id=user_id)
         session.waiting = None
         cleanup(tmp); await sessions.remove(session.key)
 
@@ -708,7 +708,7 @@ async def text_reply_handler(client: Client, msg: Message):
             return await safe_edit(st, f"❌ Sample failed: <code>{exc}</code>",
                                    parse_mode=enums.ParseMode.HTML)
         session.waiting = None
-        await upload_file(client, st, out)
+        await upload_file(client, st, out, user_id=user_id)
         cleanup(tmp); await sessions.remove(session.key)
 
     # ── Manual screenshots ────────────────────────────────────
@@ -772,7 +772,7 @@ async def text_reply_handler(client: Client, msg: Message):
             return await safe_edit(st, f"❌ Metadata failed: <code>{exc}</code>",
                                    parse_mode=enums.ParseMode.HTML)
         session.waiting = None
-        await upload_file(client, st, out)
+        await upload_file(client, st, out, user_id=user_id)
         cleanup(tmp); await sessions.remove(session.key)
 
 
@@ -822,7 +822,7 @@ async def handle_secondary_file(client: Client, msg: Message, session: FileSessi
             return await safe_edit(st3, f"❌ Merge failed: <code>{exc}</code>",
                                    parse_mode=enums.ParseMode.HTML)
         session.waiting = None
-        await upload_file(client, st3, out)
+        await upload_file(client, st3, out, user_id=user_id)
         cleanup(tmp); await sessions.remove(session.key)
 
     elif action in ("merge_vs", "burn_sub"):
@@ -838,7 +838,7 @@ async def handle_secondary_file(client: Client, msg: Message, session: FileSessi
             return await safe_edit(st3, f"❌ Subtitle failed: <code>{exc}</code>",
                                    parse_mode=enums.ParseMode.HTML)
         session.waiting = None
-        await upload_file(client, st3, out)
+        await upload_file(client, st3, out, user_id=user_id)
         cleanup(tmp); await sessions.remove(session.key)
 
     elif action == "merge_vids":
@@ -890,5 +890,5 @@ async def cmd_mergedone(client: Client, msg: Message):
                                parse_mode=enums.ParseMode.HTML)
 
     session.waiting = None
-    await upload_file(client, st, out)
+    await upload_file(client, st, out, user_id=user_id)
     cleanup(tmp); await sessions.remove(session.key)

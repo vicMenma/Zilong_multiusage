@@ -601,7 +601,7 @@ async def _do_resize(
         f"⬆️ Uploading…",
         parse_mode=enums.ParseMode.HTML,
     )
-    await upload_file(client, st, out)
+    await upload_file(client, st, out, user_id=uid)
     cleanup(tmp)
 
 
@@ -657,5 +657,5 @@ async def _do_compress(
         f"⬆️ Uploading…",
         parse_mode=enums.ParseMode.HTML,
     )
-    await upload_file(client, st, out)
+    await upload_file(client, st, out, user_id=uid)
     cleanup(tmp)
