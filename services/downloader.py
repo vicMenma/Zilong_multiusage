@@ -528,7 +528,7 @@ async def smart_download(
 
     _last_edit  = [0.0]  # throttle gate for _tracked_progress
     user_cfg    = await settings.get(record.user_id)
-    panel_style = user_cfg.get("progress_style", "B")
+    panel_style = user_cfg.get("progress_style", "1")
 
     async def _tracked_progress(done: int, total: int, speed: float, eta: int) -> None:
         record.update(done=done, total=total, speed=speed, eta=eta, state="📥 Downloading")

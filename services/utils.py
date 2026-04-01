@@ -149,7 +149,7 @@ _MODE_META: dict[str, tuple[str, str, str]] = {
 }
 
 
-def _progress_panel_b(
+def _progress_panel_1(
     *,
     mode:       str   = "dl",
     fname:      str   = "",
@@ -167,22 +167,25 @@ def _progress_panel_b(
     seeds:      int   = 0,
 ) -> str:
     """
-    Style B — Cards modulaires.
+    Style 1 — Clean card (Image 1).
 
-        🧲 DOWNLOADING FROM » [BuriBuri] Crayon Sh…
-        ▰▰▰▰▰▰▱▱▱▱▱▱  44.3%  ·  Aria2c 🧲
+        Downloading              Aria2c · 0.0%
+        [BuriBuri] Crayon Shin-chan — 0069 [720p]…
+        ████████████████████████  0.0%
 
-        ╔ Speed   42.5 MiB/s  ║ ETA      1m 12s ╗
-        ║ Done    892 MiB     ║ Total    1.31 GiB║
-        ║ Elapsed 3m 45s      ║ Seeds    12      ║
-        ╚ CPU 47% · RAM 1.24G · Disk 48.3G free  ╝
+        Speed          —
+        ETA            —
+        Done / Total   0.00 B / 295 MiB
+        Elapsed        7s
 
-        💗 When I'm Doin This…
+        CPU 13%   RAM 803 MiB   Disk 86.2 GiB
+
+        💗 When I'm Doin This, Do Something Else!
     """
     pct    = min((done / total * 100) if total else 0.0, 100.0)
-    bar_w  = 12
+    bar_w  = 24
     filled = round(pct / 100 * bar_w)
-    bar    = "▰" * filled + "▱" * (bar_w - filled)
+    bar    = "█" * filled + " " * (bar_w - filled)
 
     spd_s  = (human_size(speed) + "/s") if speed else "—"
     eta_s  = human_dur(eta) if eta > 0 else "—"
@@ -191,25 +194,27 @@ def _progress_panel_b(
     tot_s  = human_size(total) if total else "—"
     eng_s  = engine_display(engine)
 
-    m_icon, m_hdr, m_link_icon = _MODE_META.get(mode, ("📦", "PROCESSING", "🔧"))
-    fname_s = (fname[:46] + "…") if len(fname) > 46 else fname
+    m_icon, m_hdr, _ = _MODE_META.get(mode, ("📦", "Processing", "🔧"))
+    mode_lbl = m_hdr.capitalize()
+    fname_s  = (fname[:52] + "…") if len(fname) > 52 else fname
 
-    SEP = "──────────────────────"
+    SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     lines: list[str] = [
-        f"{m_icon} <b>{m_hdr} » {m_link_icon}{link_label}</b>",
-        f"🏷  <code>{fname_s}</code>",
+        f"<b>{mode_lbl}</b>                    <code>{eng_s} · {pct:.1f}%</code>",
+        f"<code>{fname_s}</code>",
         "",
-        f"<code>{bar}</code>  <b>{pct:.1f}%</b>  ·  <i>{eng_s}</i>",
+        f"<code>{bar}  {pct:.1f}%</code>",
         "",
         SEP,
-        f"🔥 <b>Speed</b>   <code>{spd_s}</code>    ⏳ <b>ETA</b>     <code>{eta_s}</code>",
-        f"✅ <b>Done</b>    <code>{done_s}</code>    📦 <b>Total</b>   <code>{tot_s}</code>",
-        f"🕰  <b>Elapsed</b> <code>{el_s}</code>",
+        f"Speed          <code>{spd_s}</code>",
+        f"ETA            <code>{eta_s}</code>",
+        f"Done / Total   <code>{done_s} / {tot_s}</code>",
+        f"Elapsed        <code>{el_s}</code>",
     ]
 
     if seeds:
-        lines.append(f"🌱 <b>Seeds</b>   <code>{seeds}</code>")
+        lines.append(f"Seeds          <code>{seeds}</code>")
 
     if cpu or ram_used or disk_free:
         ram_s  = human_size(ram_used)
@@ -217,16 +222,14 @@ def _progress_panel_b(
         lines += [
             "",
             SEP,
-            f"🖥 <b>CPU</b> <code>{cpu:.0f}%</code>   "
-            f"💾 <b>RAM</b> <code>{ram_s}</code>   "
-            f"💿 <b>Disk</b> <code>{disk_s}</code> free",
+            f"CPU <code>{cpu:.0f}%</code>    RAM <code>{ram_s}</code>    Disk <code>{disk_s}</code>",
         ]
 
-    lines += ["", SEP, _PANEL_FOOTER]
+    lines += ["", _PANEL_FOOTER]
     return "\n".join(lines)
 
 
-def _progress_panel_c(
+def _progress_panel_2(
     *,
     mode:       str   = "dl",
     fname:      str   = "",
@@ -244,25 +247,26 @@ def _progress_panel_c(
     seeds:      int   = 0,
 ) -> str:
     """
-    Style C — Minimaliste.
+    Style 2 — Grid cards (Image 2).
 
-        Downloading  ·  Aria2c 🧲  ·  44.3%
-        [BuriBuri] Crayon Shin-chan — 0069 [720p]…
-        ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬  44.3%
+        [C] [BuriBuri] Crayon Shin-chan — 0069…   Aria2c
 
-        Speed       42.5 MiB/s
-        ETA         1m 12s
-        Done / Total  892 MiB / 1.31 GiB
-        Elapsed     3m 45s
+        ┌─────────┐  ┌─────────┐  ┌─────────┐
+        │ Speed   │  │ ETA     │  │ Done    │
+        │   —     │  │   —     │  │ 0.00 B  │
+        └─────────┘  └─────────┘  └─────────┘
+        ┌─────────┐  ┌─────────┐  ┌─────────┐
+        │ Total   │  │ Elapsed │  │Progress │
+        │ 295 MiB │  │  7s     │  │  0.0%   │
+        └─────────┘  └─────────┘  └─────────┘
+        ┌─────────┐  ┌─────────┐  ┌─────────┐
+        │ CPU     │  │ RAM     │  │ Disk    │
+        │  13%    │  │ 803 MiB │  │86.2 GiB │
+        └─────────┘  └─────────┘  └─────────┘
 
-        CPU 47%  ·  RAM 1.24G  ·  Disk 48.3G
-
-        💗 When I'm Doin This…
+        💗 When I'm Doin This, Do Something Else!
     """
     pct    = min((done / total * 100) if total else 0.0, 100.0)
-    bar_w  = 18
-    filled = round(pct / 100 * bar_w)
-    bar    = "▬" * filled + "╌" * (bar_w - filled)
 
     spd_s  = (human_size(speed) + "/s") if speed else "—"
     eta_s  = human_dur(eta) if eta > 0 else "—"
@@ -271,37 +275,40 @@ def _progress_panel_c(
     tot_s  = human_size(total) if total else "—"
     eng_s  = engine_display(engine)
 
-    m_icon, m_hdr, _ = _MODE_META.get(mode, ("📦", "PROCESSING", "🔧"))
-    fname_s = (fname[:48] + "…") if len(fname) > 48 else fname
+    _, m_hdr, _ = _MODE_META.get(mode, ("📦", "Processing", "🔧"))
+    fname_s = (fname[:38] + "…") if len(fname) > 38 else fname
 
-    SEP = "──────────────────────"
+    SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    def card(label: str, value: str) -> str:
+        return f"<code>[{label:<8}  {value:>10}]</code>"
 
     lines: list[str] = [
-        f"<b>{m_icon} {m_hdr}</b>  ·  <i>{eng_s}</i>  ·  <b>{pct:.1f}%</b>",
-        f"<code>{fname_s}</code>",
-        "",
-        f"<code>{bar}</code>",
-        "",
+        f"📦 <b>{fname_s}</b>   <code>{eng_s}</code>",
         SEP,
-        f"🔥  <b>Speed</b>         <code>{spd_s}</code>",
-        f"⏳  <b>ETA</b>           <code>{eta_s}</code>",
-        f"📊  <b>Done / Total</b>  <code>{done_s} / {tot_s}</code>",
-        f"🕰   <b>Elapsed</b>       <code>{el_s}</code>",
+        card("Speed",   spd_s),
+        card("ETA",     eta_s),
+        card("Done",    done_s),
+        SEP,
+        card("Total",   tot_s),
+        card("Elapsed", el_s),
+        card("Progress", f"{pct:.1f}%"),
     ]
 
     if seeds:
-        lines.append(f"🌱  <b>Seeds</b>         <code>{seeds}</code>")
+        lines += [SEP, card("Seeds", str(seeds))]
 
     if cpu or ram_used or disk_free:
         ram_s  = human_size(ram_used)
         disk_s = human_size(disk_free)
         lines += [
-            "",
             SEP,
-            f"🖥 <code>{cpu:.0f}%</code>  ·  💾 <code>{ram_s}</code>  ·  💿 <code>{disk_s}</code> free",
+            card("CPU",  f"{cpu:.0f}%"),
+            card("RAM",  ram_s),
+            card("Disk", disk_s),
         ]
 
-    lines += ["", SEP, _PANEL_FOOTER]
+    lines += [SEP, _PANEL_FOOTER]
     return "\n".join(lines)
 
 
@@ -321,23 +328,13 @@ def progress_panel(
     ram_used:   int   = 0,
     disk_free:  int   = 0,
     seeds:      int   = 0,
-    style:      str   = "B",     # "B" (cards) | "C" (minimal) | legacy = original
+    style:      str   = "1",     # "1" (clean card) | "2" (grid cards)
 ) -> str:
     """
     Build a Telegram-formatted progress message.
     Dispatches to the appropriate style renderer based on `style`:
-      "B" — cards modulaires (default)
-      "C" — minimaliste
-      anything else — legacy original design
-
-    Original design (legacy):
-
-        📥 DOWNLOADING FROM » 🔗Link 01
-        🏷 Name » filename.mkv
-        [████████░░░░░░░░░░] 44.3%
-        ──────────────────────
-        🔥  Speed      42.51 MiB/s
-        ...
+      "1" — Clean card with progress bar (Image 1, default)
+      "2" — Grid cards layout (Image 2)
     """
     _kw = dict(
         mode=mode, fname=fname, done=done, total=total,
@@ -345,70 +342,9 @@ def progress_panel(
         state=state, link_label=link_label, cpu=cpu,
         ram_used=ram_used, disk_free=disk_free, seeds=seeds,
     )
-    if style == "B":
-        return _progress_panel_b(**_kw)
-    if style == "C":
-        return _progress_panel_c(**_kw)
-
-    # ── Legacy / original design ──────────────────────────────
-    pct     = min((done / total * 100) if total else 0.0, 100.0)
-    bar_w   = 18
-    filled  = round(pct / 100 * bar_w)
-    bar     = "█" * filled + "░" * (bar_w - filled)
-
-    spd_s   = (human_size(speed) + "/s") if speed else "—"
-    eta_s   = human_dur(eta) if eta > 0 else "—"
-    el_s    = human_dur(elapsed) if elapsed else "0s"
-    done_s  = human_size(done)
-    total_s = human_size(total) if total else "—"
-
-    m_icon, m_hdr, m_link_icon = _MODE_META.get(mode, ("📦", "PROCESSING", "🔧"))
-    eng_s = engine_display(engine)
-
-    fname_s = (fname[:48] + "…") if len(fname) > 48 else fname
-
-    SEP = "──────────────────────"
-
-    lines: list[str] = [
-        f"{m_icon} <b>{m_hdr} » {m_link_icon}{link_label}</b>",
-        f"🏷  <b>Name »</b> <code>{fname_s}</code>",
-        "",
-        f"<code>[{bar}]</code>  <b>{pct:.1f}%</b>",
-        "",
-        SEP,
-        f"🔥  <b>Speed</b>     <code>{spd_s}</code>",
-        f"⚙️  <b>Engine</b>    <code>{eng_s}</code>",
-        f"⏳  <b>ETA</b>       <code>{eta_s}</code>",
-        f"🕰  <b>Elapsed</b>   <code>{el_s}</code>",
-        f"✅  <b>Done</b>      <code>{done_s}</code>",
-        f"📦  <b>Total</b>     <code>{total_s}</code>",
-    ]
-
-    if seeds:
-        lines.append(f"🌱  <b>Seeds</b>     <code>{seeds}</code>")
-
-    # System stats block — only if we have data
-    if cpu or ram_used or disk_free:
-        cpu_bar_w   = 10
-        cpu_filled  = round(cpu / 100 * cpu_bar_w)
-        cpu_bar_str = "█" * cpu_filled + "░" * (cpu_bar_w - cpu_filled)
-        ram_s       = human_size(ram_used)
-        disk_s      = human_size(disk_free)
-        lines += [
-            "",
-            SEP,
-            f"🖥  <b>CPU</b>       <code>[{cpu_bar_str}]</code> <b>{cpu:.0f}%</b>",
-            f"💾  <b>RAM</b>       <code>{ram_s}</code>",
-            f"💿  <b>Disk Free</b>  <code>{disk_s}</code>",
-        ]
-
-    lines += [
-        "",
-        SEP,
-        _PANEL_FOOTER,
-    ]
-
-    return "\n".join(lines)
+    if style == "2":
+        return _progress_panel_2(**_kw)
+    return _progress_panel_1(**_kw)
 
 
 # ─────────────────────────────────────────────────────────────
