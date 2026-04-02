@@ -180,6 +180,8 @@ async def _deliver_job(job: CCJob) -> None:
             parse_mode="html",
         )
         await upload_file(client, st, dest)
+        # job is already marked notified before this task was spawned,
+        # but call again as a safe no-op in case of any edge case.
         await cc_job_store.mark_notified(job.job_id)
         log.info("[CCStatus] Delivered job %s to uid=%d", job.job_id, job.uid)
 
@@ -222,8 +224,11 @@ async def _poll_loop() -> None:
     consecutive_idle = 0
 
     while True:
-        active   = cc_job_store.active_jobs()
-        interval = 5 if active else 60
+        active      = cc_job_store.active_jobs()
+        undelivered = cc_job_store.undelivered_jobs()
+        # Use 5 s interval whenever there is real work: active jobs being processed,
+        # or finished jobs waiting to be downloaded and uploaded to Telegram.
+        interval = 5 if (active or undelivered) else 60
 
         for job in active:
             try:
@@ -251,6 +256,9 @@ async def _poll_loop() -> None:
 
                     if export_url:
                         await cc_job_store.finish(job.job_id, export_url=export_url)
+                        # Mark notified BEFORE spawning the task so a second poller
+                        # cycle or a restart cannot pick up the same job and double-upload.
+                        await cc_job_store.mark_notified(job.job_id)
                         asyncio.create_task(_deliver_job(
                             cc_job_store.get(job.job_id) or job
                         ))
