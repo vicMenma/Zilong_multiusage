@@ -1,30 +1,50 @@
 FROM python:3.11-slim
 
-# Install system dependencies: ffmpeg, aria2, and build tools
-RUN apt-get update && apt-get install -y \
+# ── System dependencies ────────────────────────────────────────────────────────
+# ffmpeg        — video/audio processing (transcode, thumbnail, hardsub)
+# aria2         — multi-connection HTTP + torrent/magnet downloads
+# mediainfo     — media stream metadata (fallback when ffprobe returns nothing)
+# p7zip-full    — 7z archive extraction (/archive command)
+# unrar-free    — RAR archive extraction (/archive command)
+#                 NOTE: unrar-free has limited RAR5 support. For full RAR5,
+#                 switch to the non-free "unrar" package (requires multiverse).
+# git           — used by some yt-dlp extractors and the deploy workflow
+# curl          — healthcheck probe + misc HTTP fetches
+# openssh-client— Serveo keep-alive tunnel (services/keep_alive.py)
+# build-essential — needed to compile native extensions (TgCrypto, uvloop)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
+    mediainfo \
+    p7zip-full \
+    unrar-free \
     git \
     curl \
+    openssh-client \
     build-essential \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# ── Python dependencies ────────────────────────────────────────────────────────
 WORKDIR /app
-
-# Copy and install Python dependencies first (layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the bot code
+# ── Application code ───────────────────────────────────────────────────────────
 COPY . .
 
-# Create the downloads/temp directory (will be mounted as a volume)
-RUN mkdir -p /app/downloads
+# Persistent directories
+# /app/data      — Pyrogram session file (ZilongBot.session). Mount as a volume
+#                  so auth survives container restarts/re-deploys.
+# /app/downloads — active download workspace. Mount a volume here if you want
+#                  downloads to survive container restarts (optional).
+RUN mkdir -p /app/data /app/downloads
 
-# Expose port for webhook
-EXPOSE 8080
+# ── Ports ─────────────────────────────────────────────────────────────────────
+# 8080 — keep-alive health server (UptimeRobot / ELB health checks)
+# 8765 — CloudConvert webhook receiver (open this in your EC2 Security Group
+#         and set WEBHOOK_BASE_URL=http://<your-ip>:8765 in .env)
+EXPOSE 8080 8765
 
-# Start the bot
+# ── Runtime ────────────────────────────────────────────────────────────────────
 CMD ["python", "main.py"]

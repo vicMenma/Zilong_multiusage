@@ -69,10 +69,14 @@ if _UVLOOP:
 else:
     log.warning("⚠️  uvloop not installed — using default asyncio event loop")
 
-for _f in glob.glob("*.session") + glob.glob("*.session-journal"):
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+for _f in (
+    glob.glob("*.session") + glob.glob("*.session-journal") +
+    glob.glob(os.path.join(_DATA_DIR, "*.session-journal"))   # stale journals only
+):
     try:
         os.remove(_f)
-        log.info("Removed stale session: %s", _f)
+        log.info("Removed stale session artifact: %s", _f)
     except OSError:
         pass
 
@@ -83,13 +87,17 @@ from services.task_runner import runner, MAX_CONCURRENT
 
 
 def build_client() -> Client:
+    # Store the session in data/ (next to the repo) so it survives reboots.
+    # /tmp is wiped on every EC2 restart and would force re-auth + FloodWait.
+    _session_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    os.makedirs(_session_dir, exist_ok=True)
     return Client(
         name="ZilongBot",
         api_id=cfg.api_id,
         api_hash=cfg.api_hash,
         bot_token=cfg.bot_token,
         plugins={"root": "plugins"},
-        workdir="/tmp",
+        workdir=_session_dir,
         # max_concurrent_transmissions was added in pyrofork >2.2.11.
         # We pin to 2.2.11 for its superior upload throughput internals,
         # so this parameter must not be passed.

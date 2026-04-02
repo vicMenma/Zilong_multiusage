@@ -1,0 +1,13 @@
+.env
+*.session
+*.session-journal
+data/*.session
+data/*.session-journal
+downloads/
+__pycache__/
+*.pyc
+*.pyo
+service_account.json
+zilong.log
+/tmp/
+.DS_Store
