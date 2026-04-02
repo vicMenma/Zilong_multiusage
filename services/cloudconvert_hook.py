@@ -194,7 +194,29 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
                     await cc_job_store.finish(job_id, export_url=export_url)
                     log.info("[CC-Hook] Updated cc_job_store for job %s with export URL", job_id)
                 elif not job:
-                    log.warning("[CC-Hook] job_id=%s not in cc_job_store — poller will poll CC directly", job_id)
+                    # Job was created directly on the CloudConvert website (not via the bot).
+                    # The export URL is in the webhook payload — inject a synthetic CCJob so
+                    # the poller picks it up and delivers it to the owner, just like a bot job.
+                    log.info("[CC-Hook] job_id=%s not in cc_job_store — injecting external job for delivery", job_id)
+                    try:
+                        from services.cc_job_store import cc_job_store as _store, CCJob
+                        import time as _time
+                        export_url  = files[0]["url"]
+                        output_name = files[0]["filename"]
+                        synthetic   = CCJob(
+                            job_id      = job_id,
+                            uid         = cfg.owner_id,
+                            fname       = output_name,
+                            output_name = output_name,
+                            status      = "finished",
+                            export_url  = export_url,
+                            finished_at = _time.time(),
+                        )
+                        await _store.add(synthetic)
+                        log.info("[CC-Hook] Injected external job %s (%s) for uid=%d",
+                                 job_id, output_name, cfg.owner_id)
+                    except Exception as inj_exc:
+                        log.error("[CC-Hook] Failed to inject external job: %s", inj_exc)
                 else:
                     log.info("[CC-Hook] job_id=%s already notified — skipping (no double upload)", job_id)
             except Exception as store_exc:
