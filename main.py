@@ -2,6 +2,10 @@
 Zilong Bot — main.py
 Entry point. Loads config, builds client, registers plugins, starts.
 """
+"""
+Zilong Bot — main.py
+Entry point. Loads config, builds client, registers plugins, starts.
+"""
 import asyncio
 import logging
 import os
@@ -47,10 +51,6 @@ except ImportError:
     _UVLOOP = False
 
 # Python 3.12 no longer creates an implicit event loop on the main thread.
-# pyrofork 2.2.11's sync.py calls asyncio.get_event_loop() at import time —
-# without an existing loop this raises RuntimeError under Python 3.12 + uvloop.
-# Creating and setting a loop here (before any pyrogram import) fixes it.
-# This mirrors exactly what zilong-leech's colab_leecher/__init__.py does.
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
 
@@ -72,7 +72,7 @@ else:
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 for _f in (
     glob.glob("*.session") + glob.glob("*.session-journal") +
-    glob.glob(os.path.join(_DATA_DIR, "*.session-journal"))   # stale journals only
+    glob.glob(os.path.join(_DATA_DIR, "*.session-journal"))
 ):
     try:
         os.remove(_f)
@@ -85,10 +85,7 @@ from core.config import cfg
 from core.bot_name import get_bot_name, set_bot_name, is_name_configured
 from services.task_runner import runner, MAX_CONCURRENT
 
-
 def build_client() -> Client:
-    # Store the session in data/ (next to the repo) so it survives reboots.
-    # /tmp is wiped on every EC2 restart and would force re-auth + FloodWait.
     _session_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     os.makedirs(_session_dir, exist_ok=True)
     return Client(
@@ -98,15 +95,11 @@ def build_client() -> Client:
         bot_token=cfg.bot_token,
         plugins={"root": "plugins"},
         workdir=_session_dir,
-        # max_concurrent_transmissions was added in pyrofork >2.2.11.
-        # We pin to 2.2.11 for its superior upload throughput internals,
-        # so this parameter must not be passed.
     )
-
 
 async def _ask_bot_name(client) -> None:
     loop = asyncio.get_running_loop()
-    fut  = loop.create_future()
+    fut = loop.create_future()
 
     async def _on_name(_, msg):
         name = msg.text.strip()
@@ -171,7 +164,6 @@ async def _ask_bot_name(client) -> None:
 
     log.info("Bot name configured: %s", name)
 
-
 async def main() -> None:
     if os.environ.get("KOYEB", "").strip() == "1":
         from koyeb_server import start_health_server
@@ -180,7 +172,6 @@ async def main() -> None:
         log.info("🌐 Koyeb health server started on port %d", port)
 
     client = build_client()
-
     import core.session as _cs
     _cs._client = client
 
@@ -191,16 +182,15 @@ async def main() -> None:
             await client.start()
             break
         except _FloodWait as _fw:
-            _wait_sec = _fw.value
             log.warning(
                 "🚦 FloodWait on auth — waiting %ds (attempt %d/%d)",
-                _wait_sec, _attempt, _MAX_AUTH_RETRIES,
+                _fw.value, _attempt, _MAX_AUTH_RETRIES,
             )
-            print(f"FLOOD_WAIT_SECONDS={_wait_sec}", flush=True)
+            print(f"FLOOD_WAIT_SECONDS={_fw.value}", flush=True)
             if _attempt >= _MAX_AUTH_RETRIES:
                 log.error("❌ Giving up after %d FloodWait retries.", _MAX_AUTH_RETRIES)
                 raise
-            await asyncio.sleep(_wait_sec + 5)
+            await asyncio.sleep(_fw.value + 5)
 
     me = await client.get_me()
     log.info("✅ @%s (id=%d) started", me.username or me.first_name, me.id)
@@ -208,20 +198,23 @@ async def main() -> None:
     runner.start()
     log.info("🚀 Task runner started (max %d concurrent)", MAX_CONCURRENT)
 
-    # ── Webhook server (optional) ────────────────────────────
+    # ── Webhook server (optional) ───────────────────────────────────
     webhook_url = ""
     has_webhook_config = bool(
         os.environ.get("WEBHOOK_BASE_URL", "").strip()
-        or cfg.ngrok_token
+        or cfg.ngrok_token  # keep check for backwards env var
     )
 
     if cfg.cc_api_key or has_webhook_config:
         import services.cloudconvert_hook as cc_hook
         if cfg.cc_webhook_secret:
             cc_hook.WEBHOOK_SECRET = cfg.cc_webhook_secret
+
+        # ✂️ Remove ngrok_token – we use Serveo instead
         webhook_url = await cc_hook.start_webhook_server(
-            port=8765, ngrok_token=cfg.ngrok_token,
+            port=8765
         )
+
         if webhook_url:
             log.info("☁️  CloudConvert webhook active: %s", webhook_url)
         else:
@@ -238,23 +231,19 @@ async def main() -> None:
         except Exception as exc:
             log.warning("ccstatus poller startup failed: %s", exc)
 
-    # ── Bot name first-run prompt ──────────────────────────────
     if not is_name_configured():
         await _ask_bot_name(client)
 
     bot_name = get_bot_name()
     log.info("🤖 Bot name: %s", bot_name.upper())
 
-    # ── Keep-alive health server (replaces JS click hack) ──────
-    # Starts an HTTP server on port 8080 and exposes it via ngrok.
-    # Point UptimeRobot at the printed URL to keep Colab alive 24/7.
-    # Falls back gracefully if no NGROK_TOKEN is set.
+    # ── Keep-alive health server (optional) ─────────────────────
     keepalive_url = ""
     try:
         from services.keep_alive import start as _ka_start
         keepalive_url = await _ka_start(
             port=8080,
-            ngrok_token=cfg.ngrok_token,
+            ngrok_token=cfg.ngrok_token,  # keep as-is for keepalive only
         )
         if keepalive_url:
             log.info("🏥 Keep-alive URL: %s", keepalive_url)
@@ -262,22 +251,14 @@ async def main() -> None:
                 await client.send_message(
                     cfg.owner_id,
                     f"🏥 <b>Keep-Alive Active</b>\n"
-                    f"──────────────────────\n\n"
-                    f"🌐 <b>URL:</b>\n<code>{keepalive_url}/health</code>\n\n"
-                    f"<b>Add to UptimeRobot (free):</b>\n"
-                    f"1. uptimerobot.com → Add New Monitor\n"
-                    f"2. Type: <b>HTTP(s)</b>\n"
-                    f"3. URL: <code>{keepalive_url}/health</code>\n"
-                    f"4. Interval: <b>5 minutes</b>\n"
-                    f"5. Save ✅\n\n"
-                    f"<i>Colab will stay alive as long as UptimeRobot pings.</i>",
+                    f"🌐 <code>{keepalive_url}/health</code>\n",
                     parse_mode=enums.ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
             except Exception:
                 pass
         else:
-            log.info("🏥 Health server on localhost:8080 (no public URL — set NGROK_TOKEN)")
+            log.info("🏥 Health server on localhost:8080 (no public URL)")
     except Exception as exc:
         log.warning("Keep-alive server failed to start: %s", exc)
 
@@ -285,7 +266,6 @@ async def main() -> None:
     await idle()
 
     log.info("👋 Shutting down…")
-    # Stop keep-alive server
     try:
         from services.keep_alive import stop as _ka_stop
         await _ka_stop()
@@ -300,7 +280,6 @@ async def main() -> None:
     runner.stop()
     await client.stop()
     log.info("✅ Shutdown complete.")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
