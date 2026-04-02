@@ -287,7 +287,7 @@ async def _poll_loop() -> None:
                 else:
                     log.debug("[CCStatus] Panel edit uid=%d: %s", uid, err)
 
-        if not cc_job_store.active_jobs() and not _open_panels:
+        if not cc_job_store.active_jobs() and not cc_job_store.undelivered_jobs() and not _open_panels:
             consecutive_idle += 1
             if consecutive_idle >= 3:
                 log.info("[CCStatus] Poller stopping — no active jobs, no open panels")
