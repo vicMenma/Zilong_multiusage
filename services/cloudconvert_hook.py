@@ -167,90 +167,78 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
         if event not in ("job.finished", "job.failed"):
             return web.json_response({"status": "ignored", "event": event})
 
-        # Extract job_id to look up cc_job_store (the poller is the single delivery path)
-        job_id = (data.get("job") or {}).get("id", "")
+        job   = data.get("job", {})
+        job_id = job.get("id", "")
 
+        # Extract files
         files = _extract_urls(data)
+
         if not files:
             log.warning("[CC-Hook] No export URLs in payload (job_id=%s)", job_id)
-            # Still wake the poller — it will poll CC directly and find the URL itself
-            try:
-                from plugins.ccstatus import _ensure_poller
-                # _ensure_poller()  # disabled by patch
-                log.info("[CC-Hook] Woke ccstatus poller (no URLs in payload)")
-            except Exception as pe:
-                log.warning("[CC-Hook] Could not wake poller: %s", pe)
             return web.json_response({"status": "no_urls"})
 
-        # Update cc_job_store so the poller can deliver without a separate download race.
-        # The poller is the SINGLE authoritative delivery path — we never call _process_file
-        # here to avoid double-upload when both webhook and poller fire for the same job.
-        if job_id and files:
-            try:
-                from services.cc_job_store import cc_job_store
-                job = cc_job_store.get(job_id)
-                if job and not job.notified:
-                    export_url = files[0]["url"]
-                    await cc_job_store.finish(job_id, export_url=export_url)
+        # -------------------------------
+        # ✅ UPDATE cc_job_store (SAFE)
+        # -------------------------------
+        try:
+            from services.cc_job_store import cc_job_store
 
-        # 🚀 Immediate download trigger (patched)
-        files = []
-        for task in data["job"]["tasks"]:
-            if task.get("operation") == "export/url" and task.get("status") == "finished":
-                files.extend(task.get("result", {}).get("files", []))
+            job_obj = cc_job_store.get(job_id)
 
+            if job_obj and not job_obj.notified:
+                await cc_job_store.finish(job_id, export_url=files[0]["url"])
+                log.info("[CC-Hook] Updated cc_job_store for job %s", job_id)
+
+            elif not job_obj:
+                # Inject external job (optional fallback)
+                try:
+                    from services.cc_job_store import CCJob
+                    import time
+
+                    synthetic = CCJob(
+                        job_id      = job_id,
+                        uid         = cfg.owner_id,
+                        fname       = files[0]["filename"],
+                        output_name = files[0]["filename"],
+                        status      = "finished",
+                        export_url  = files[0]["url"],
+                        finished_at = time.time(),
+                    )
+
+                    await cc_job_store.add(synthetic)
+
+                    log.info("[CC-Hook] Injected external job %s", job_id)
+
+                except Exception as inj_exc:
+                    log.error("[CC-Hook] Injection failed: %s", inj_exc)
+
+        except Exception as store_exc:
+            log.warning("[CC-Hook] cc_job_store update failed: %s", store_exc)
+
+        # -------------------------------
+        # 🚀 IMMEDIATE DOWNLOAD (MAIN FIX)
+        # -------------------------------
         for f in files:
             url = f.get("url")
             filename = f.get("filename", "file")
 
-            if url:
-                log.info("[CC-Hook] Triggering download: %s (%s)", filename, job_id)
-                asyncio.create_task(_safe_process_file(url, filename, cfg.owner_id, job_id))
+            if not url:
+                continue
 
-                    log.info("[CC-Hook] Updated cc_job_store for job %s with export URL", job_id)
-                elif not job:
-                    # Job was created directly on the CloudConvert website (not via the bot).
-                    # The export URL is in the webhook payload — inject a synthetic CCJob so
-                    # the poller picks it up and delivers it to the owner, just like a bot job.
-                    log.info("[CC-Hook] job_id=%s not in cc_job_store — injecting external job for delivery", job_id)
-                    try:
-                        from services.cc_job_store import cc_job_store as _store, CCJob
-                        import time as _time
-                        export_url  = files[0]["url"]
-                        output_name = files[0]["filename"]
-                        synthetic   = CCJob(
-                            job_id      = job_id,
-                            uid         = cfg.owner_id,
-                            fname       = output_name,
-                            output_name = output_name,
-                            status      = "finished",
-                            export_url  = export_url,
-                            finished_at = _time.time(),
-                        )
-                        await _store.add(synthetic)
-                        log.info("[CC-Hook] Injected external job %s (%s) for uid=%d",
-                                 job_id, output_name, cfg.owner_id)
-                    except Exception as inj_exc:
-                        log.error("[CC-Hook] Failed to inject external job: %s", inj_exc)
-                else:
-                    log.info("[CC-Hook] job_id=%s already notified — skipping (no double upload)", job_id)
-            except Exception as store_exc:
-                log.warning("[CC-Hook] cc_job_store update failed: %s", store_exc)
+            log.info("[CC-Hook] Triggering download: %s (%s)", filename, job_id)
 
-        # Wake the poller — it will pick up the finished job and deliver it
-        try:
-            from plugins.ccstatus import _ensure_poller
-            # _ensure_poller()  # disabled by patch
-            log.info("[CC-Hook] Webhook received for %d file(s) — woke ccstatus poller", len(files))
-        except Exception as pe:
-            log.warning("[CC-Hook] Could not wake poller: %s", pe)
+            asyncio.create_task(
+                _safe_process_file(url, filename, cfg.owner_id, job_id)
+            )
 
-        return web.json_response({"status": "ok", "woke_poller": True, "files": [f["filename"] for f in files]})
+        return web.json_response({
+            "status": "ok",
+            "files": [f["filename"] for f in files]
+        })
 
     except Exception as exc:
         log.error("[CC-Hook] Error: %s", exc)
         return web.json_response({"error": str(exc)}, status=500)
-
 
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "online", "service": "cloudconvert-webhook"})
