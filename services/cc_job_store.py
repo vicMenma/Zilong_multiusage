@@ -157,6 +157,13 @@ class CCJobStore:
     def active_jobs(self) -> list[CCJob]:
         return [j for j in self._jobs.values() if j.status == "processing"]
 
+    def undelivered_jobs(self) -> list[CCJob]:
+        """Jobs that finished successfully but have not been uploaded to Telegram yet."""
+        return [
+            j for j in self._jobs.values()
+            if j.status == "finished" and j.export_url and not j.notified
+        ]
+
     def all_jobs(self) -> list[CCJob]:
         self._evict()
         return list(self._jobs.values())
