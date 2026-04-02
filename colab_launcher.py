@@ -238,19 +238,26 @@ except Exception as _ke:
 # Only runs when CC_API_KEY is set and WEBHOOK_BASE_URL is not already
 # provided (e.g. manually set for VPS deployments).
 #
-# SERVEO_SUBDOMAIN: set this to a fixed name (e.g. "zilong") so the URL
-# stays stable across Colab restarts — no need to re-register the webhook
-# in CloudConvert every time.  Leave blank for a random subdomain.
-SERVEO_SUBDOMAIN = "console"   # ← your fixed subdomain; change or blank-out as needed
+# SERVEO_SUBDOMAIN: set this to a fixed name so the URL stays stable across
+# Colab restarts — no need to re-register the webhook in CloudConvert every
+# time.  Leave blank for a random subdomain.
+#
+# ⚠️  NEVER use "console" — that is Serveo's own reserved dashboard subdomain.
+#     Requests to console.serveo.net hit Serveo's nginx directly (not your bot)
+#     and return 405 Method Not Allowed for every POST CloudConvert sends.
+SERVEO_SUBDOMAIN = "zilongbot"   # ← change to any unique name (not "console")
+
+_tunnel_proc: subprocess.Popen | None = None
 
 
 def _open_webhook_tunnel() -> str:
     """
     SSH reverse-tunnel: Serveo public HTTPS → localhost:8765
     Uses SERVEO_SUBDOMAIN for a stable URL that survives Colab restarts.
-    Returns the public base URL (e.g. https://console.serveo.net) or '' on failure.
+    Returns the public base URL (e.g. https://zilongbot.serveo.net) or '' on failure.
     """
     import re as _re2
+    global _tunnel_proc
     remote_spec = (
         f"{SERVEO_SUBDOMAIN}:80:localhost:8765"
         if SERVEO_SUBDOMAIN
@@ -262,6 +269,7 @@ def _open_webhook_tunnel() -> str:
                 "ssh", "-o", "StrictHostKeyChecking=no",
                 "-o", "ServerAliveInterval=30",
                 "-o", "ServerAliveCountMax=3",
+                "-o", "ExitOnForwardFailure=yes",
                 "-R", remote_spec,
                 "serveo.net",
             ],
@@ -269,7 +277,8 @@ def _open_webhook_tunnel() -> str:
             stderr=subprocess.STDOUT,
             text=True,
         )
-        deadline = time.time() + 30   # was 20 — give Serveo more time
+        _tunnel_proc = proc
+        deadline = time.time() + 30
         for line in proc.stdout:
             _log("INFO", f"[Serveo] {line.rstrip()}")
             m = _re2.search(r"(https://\S+\.serveo\.net)", line)
@@ -286,6 +295,51 @@ def _open_webhook_tunnel() -> str:
         return ""
 
 
+def _tunnel_watchdog(expected_url: str) -> None:
+    """
+    Background thread: restarts the Serveo tunnel if the SSH process dies.
+    CloudConvert will resume delivery automatically once the tunnel is back up
+    (CloudConvert retries failed webhooks for up to 3 days).
+    """
+    import re as _re2
+    global _tunnel_proc
+    remote_spec = (
+        f"{SERVEO_SUBDOMAIN}:80:localhost:8765"
+        if SERVEO_SUBDOMAIN
+        else "80:localhost:8765"
+    )
+    while True:
+        time.sleep(20)
+        proc = _tunnel_proc
+        if proc is None or proc.poll() is not None:
+            _log("WARN", "[Serveo] Tunnel dropped — reconnecting…")
+            try:
+                new_proc = subprocess.Popen(
+                    [
+                        "ssh", "-o", "StrictHostKeyChecking=no",
+                        "-o", "ServerAliveInterval=30",
+                        "-o", "ServerAliveCountMax=3",
+                        "-o", "ExitOnForwardFailure=yes",
+                        "-R", remote_spec,
+                        "serveo.net",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                deadline = time.time() + 30
+                for line in new_proc.stdout:
+                    m = _re2.search(r"(https://\S+\.serveo\.net)", line)
+                    if m:
+                        _log("OK", f"[Serveo] Tunnel restored: {m.group(1).rstrip('/')}")
+                        break
+                    if time.time() > deadline:
+                        break
+                _tunnel_proc = new_proc
+            except Exception as exc:
+                _log("WARN", f"[Serveo] Reconnect failed: {exc}")
+
+
 if CC_API_KEY and not WEBHOOK_BASE_URL:
     _log("STEP", "Opening Serveo tunnel for CloudConvert webhook (port 8765)…")
     WEBHOOK_BASE_URL = _open_webhook_tunnel()
@@ -298,6 +352,14 @@ if CC_API_KEY and not WEBHOOK_BASE_URL:
         ]
         with open(f"{BASE_DIR}/.env", "w") as _f:
             _f.write("\n".join(env_lines))
+        # Start watchdog — keeps tunnel alive for the entire Colab session
+        threading.Thread(
+            target=_tunnel_watchdog,
+            args=(WEBHOOK_BASE_URL,),
+            daemon=True,
+            name="serveo-watchdog",
+        ).start()
+        _log("OK", "Tunnel watchdog started (auto-reconnects on SSH drop)")
     else:
         _log("WARN", "No webhook URL — falling back to ccstatus poller (~5 s lag).")
 elif WEBHOOK_BASE_URL:
