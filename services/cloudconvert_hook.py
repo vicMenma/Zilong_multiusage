@@ -176,7 +176,7 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
             # Still wake the poller — it will poll CC directly and find the URL itself
             try:
                 from plugins.ccstatus import _ensure_poller
-                _ensure_poller()
+                # _ensure_poller()  # disabled by patch
                 log.info("[CC-Hook] Woke ccstatus poller (no URLs in payload)")
             except Exception as pe:
                 log.warning("[CC-Hook] Could not wake poller: %s", pe)
@@ -192,6 +192,21 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
                 if job and not job.notified:
                     export_url = files[0]["url"]
                     await cc_job_store.finish(job_id, export_url=export_url)
+
+        # 🚀 Immediate download trigger (patched)
+        files = []
+        for task in data["job"]["tasks"]:
+            if task.get("operation") == "export/url" and task.get("status") == "finished":
+                files.extend(task.get("result", {}).get("files", []))
+
+        for f in files:
+            url = f.get("url")
+            filename = f.get("filename", "file")
+
+            if url:
+                log.info("[CC-Hook] Triggering download: %s (%s)", filename, job_id)
+                asyncio.create_task(_safe_process_file(url, filename, cfg.owner_id, job_id))
+
                     log.info("[CC-Hook] Updated cc_job_store for job %s with export URL", job_id)
                 elif not job:
                     # Job was created directly on the CloudConvert website (not via the bot).
@@ -225,7 +240,7 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
         # Wake the poller — it will pick up the finished job and deliver it
         try:
             from plugins.ccstatus import _ensure_poller
-            _ensure_poller()
+            # _ensure_poller()  # disabled by patch
             log.info("[CC-Hook] Webhook received for %d file(s) — woke ccstatus poller", len(files))
         except Exception as pe:
             log.warning("[CC-Hook] Could not wake poller: %s", pe)
@@ -373,3 +388,12 @@ async def stop_webhook_server() -> None:
         await _site.stop()
     if _runner:
         await _runner.cleanup()
+
+
+async def _safe_process_file(url: str, filename: str, user_id: int, job_id: str):
+    try:
+        log.info("[CC-Download] Starting: %s (%s)", filename, job_id)
+        await _process_file(url, filename, user_id)
+        log.info("[CC-Download] Completed: %s (%s)", filename, job_id)
+    except Exception as e:
+        log.error("[CC-Download] FAILED for %s (%s): %s", filename, job_id, str(e), exc_info=True)
