@@ -98,6 +98,19 @@ def human_dur(secs: float) -> str:
     return f"{s}s"
 
 
+_KiB = 1024
+_MiB = 1024 * _KiB
+
+def speed_emoji(speed: float) -> str:
+    """Return an emoji that reflects the current transfer speed (bytes/s)."""
+    if speed <= 0:          return "🐌"   # stalled / no data yet
+    if speed < 512 * _KiB: return "🐢"   # < 512 KiB/s  — very slow
+    if speed < 2  * _MiB:  return "🔥"   # < 2 MiB/s    — normal
+    if speed < 10 * _MiB:  return "⚡"   # < 10 MiB/s   — fast
+    if speed < 50 * _MiB:  return "🚀"   # < 50 MiB/s   — very fast
+    return "🌪️"                           # ≥ 50 MiB/s   — blazing
+
+
 def fmt_hms(secs: float) -> str:
     s = int(max(0, secs))
     h, s = divmod(s, 3600)
@@ -188,6 +201,7 @@ def _progress_panel_b(
 
     m_icon, m_hdr, _ = _MODE_META.get(mode, ("📦", "PROCESSING", "🔧"))
     fname_s = (fname[:46] + "…") if len(fname) > 46 else fname
+    spd_icon = speed_emoji(speed)
 
     SEP = "──────────────────────"
     DOT = "· · · · · · · · · · · ·"
@@ -200,9 +214,11 @@ def _progress_panel_b(
         f"{bar}  <b>{pct:.1f}%</b>  ·  <i>{eng_s}</i>",
         "",
         SEP,
-        f"🔥 <b>Speed</b>  <i>{spd_s}</i>   ·   ⏳ <b>ETA</b>  <i>{eta_s}</i>   ·   🕰 <b>Elapsed</b>  <i>{el_s}</i>",
+        f"{spd_icon} <b>Speed</b>  <i>{spd_s}</i>   ·  ",
+        f"⏳ <b>ETA</b>  <i>{eta_s}</i>   ·  ",
+        f"🕰 <b>Elapsed</b>  <i>{el_s}</i>",
         DOT,
-        f"✅ <b>Done</b>  <i>{done_s}</i>        ·        📦 <b>Total</b>  <i>{tot_s}</i>",
+        f"✅ <b>Done</b>  <i>{done_s}</i> · 📦 <b>Total</b>  <i>{tot_s}</i>",
     ]
 
     if seeds:
@@ -272,6 +288,7 @@ def _progress_panel_c(
 
     m_icon, m_hdr, _ = _MODE_META.get(mode, ("📦", "PROCESSING", "🔧"))
     fname_s = (fname[:46] + "…") if len(fname) > 46 else fname
+    spd_icon = speed_emoji(speed)
 
     SEP = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
     DOT = "· · · · · · · · · · · ·"
@@ -284,9 +301,11 @@ def _progress_panel_c(
         f"{bar}  <b>{pct:.1f}%</b>  ·  <i>{eng_s}</i>",
         "",
         SEP,
-        f"🔥 <b>Speed</b>  <i>{spd_s}</i>   ·   ⏳ <b>ETA</b>  <i>{eta_s}</i>   ·   🕰 <b>Elapsed</b>  <i>{el_s}</i>",
+        f"{spd_icon} <b>Speed</b>  <i>{spd_s}</i>   ·  ",
+        f"⏳ <b>ETA</b>  <i>{eta_s}</i>   ·  ",
+        f"🕰 <b>Elapsed</b>  <i>{el_s}</i>",
         DOT,
-        f"✅ <b>Done</b>  <i>{done_s}</i>        ·        📦 <b>Total</b>  <i>{tot_s}</i>",
+        f"✅ <b>Done</b>  <i>{done_s}</i> · 📦 <b>Total</b>  <i>{tot_s}</i>",
     ]
 
     if seeds:
@@ -363,6 +382,7 @@ def progress_panel(
 
     m_icon, m_hdr, m_link_icon = _MODE_META.get(mode, ("📦", "PROCESSING", "🔧"))
     eng_s = engine_display(engine)
+    spd_icon = speed_emoji(speed)
 
     fname_s = (fname[:48] + "…") if len(fname) > 48 else fname
 
@@ -376,7 +396,7 @@ def progress_panel(
         f"<code>[{bar}]  {pct:.1f}%</code>",
         "",
         SEP,
-        f"<code>🔥  Speed     {spd_s}</code>",
+        f"<code>{spd_icon}  Speed     {spd_s}</code>",
         f"<code>⚙️  Engine    {eng_s}</code>",
         f"<code>⏳  ETA       {eta_s}</code>",
         f"<code>🕰  Elapsed   {el_s}</code>",
