@@ -287,6 +287,15 @@ async def _poll_loop() -> None:
                 else:
                     log.debug("[CCStatus] Panel edit uid=%d: %s", uid, err)
 
+        # Deliver any jobs resolved by the webhook (status=finished, export_url set, not yet notified).
+        # The webhook updates cc_job_store but never calls _deliver_job directly to avoid double-upload.
+        # The poller is the single authoritative delivery path — we must pick these up here.
+        for job in cc_job_store.undelivered_jobs():
+            log.info("[CCStatus] Delivering webhook-resolved job %s to uid=%d", job.job_id, job.uid)
+            # Mark notified immediately to prevent re-delivery on next poll cycle
+            await cc_job_store.mark_notified(job.job_id)
+            asyncio.create_task(_deliver_job(job))
+
         if not cc_job_store.active_jobs() and not cc_job_store.undelivered_jobs() and not _open_panels:
             consecutive_idle += 1
             if consecutive_idle >= 3:
