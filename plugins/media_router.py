@@ -13,8 +13,7 @@ from pyrogram.types import Message
 
 from core.config import cfg
 from core.session import sessions, settings, users
-from services.utils import human_size, make_tmp, safe_edit
-from services.tg_download import tg_download
+from services.utils import human_size, make_tmp
 
 log = logging.getLogger(__name__)
 

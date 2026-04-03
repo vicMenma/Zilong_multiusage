@@ -30,8 +30,6 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Optional
-
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
@@ -39,7 +37,7 @@ from pyrogram.types import (
 
 from core.config import cfg
 from core.session import settings
-from services.utils import human_size, fmt_hms, lang_flag, lang_name
+from services.utils import human_size, fmt_hms, lang_flag
 
 log = logging.getLogger(__name__)
 

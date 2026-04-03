@@ -22,14 +22,12 @@ from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
-from core.config import cfg
-from core.session import sessions, settings, FileSession
+from core.session import sessions, FileSession
 from services import ffmpeg as FF
 from services.tg_download import tg_download
 from services.uploader import upload_file
 from services.utils import (
-    cleanup, fmt_hms, human_size, lang_flag, lang_name,
-    make_tmp, safe_edit,
+    cleanup, fmt_hms, human_size, safe_edit,
 )
 
 log = logging.getLogger(__name__)

@@ -11,8 +11,6 @@ CHANGES vs original:
   • Welcome message redesigned to match zilong-leech's clean style
 ═══════════════════════════════════════════════════════════════════
 """
-import asyncio
-
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message, CallbackQuery,
@@ -592,7 +590,7 @@ async def cq_forward(client: Client, cb: CallbackQuery):
         try:
             await client.copy_message(chat_id=ch["id"], from_chat_id=src_cid, message_id=msg_id)
             ok += 1
-        except Exception as e:
+        except Exception:
             fail.append(ch.get("name", str(ch["id"])))
 
     result = f"✅ Forwarded to {ok} channel{'s' if ok != 1 else ''}."

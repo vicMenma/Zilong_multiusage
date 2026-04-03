@@ -15,7 +15,6 @@ from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
-from core.config import cfg
 from services.utils import human_size, human_dur
 
 # ── Session-level counters (reset on bot restart) ─────────────
@@ -40,17 +39,20 @@ def _build_text() -> str:
     uptime  = human_dur(int(time.time() - session.start_time))
     bot_name = get_bot_name().upper()
 
-    # Derive from completed tasks in tracker for accuracy
+    # Use persistent session counters (accumulated by task_runner on completion).
+    # tracker.all_tasks() only holds the last 60s of finished tasks — these
+    # counters survive the eviction window and reflect the full session lifetime.
+    bytes_ul = session.bytes_uploaded
+    bytes_dl = session.bytes_downloaded
+    files_ul = session.files_uploaded
+    files_dl = session.files_downloaded
+
+    # For average speeds, fall back to tracker for tasks still in window
     done = [t for t in tracker.all_tasks() if t.state.startswith("✅")]
     ul   = [t for t in done if t.mode == "ul"]
     dl   = [t for t in done if t.mode in ("dl", "magnet")]
-
-    bytes_ul = sum(t.total or t.done for t in ul)
-    bytes_dl = sum(t.total or t.done for t in dl)
-
-    # Speeds
-    avg_ul = (bytes_ul / max(sum(t.elapsed for t in ul), 1)) if ul else 0
-    avg_dl = (bytes_dl / max(sum(t.elapsed for t in dl), 1)) if dl else 0
+    avg_ul = (sum(t.total or t.done for t in ul) / max(sum(t.elapsed for t in ul), 1)) if ul else 0
+    avg_dl = (sum(t.total or t.done for t in dl) / max(sum(t.elapsed for t in dl), 1)) if dl else 0
 
     # System
     stats    = _stats_cache
@@ -71,27 +73,27 @@ def _build_text() -> str:
 
     lines = [
         f"📊 <b>{bot_name} — Usage Stats</b>",
-        f"──────────────────────────",
-        f"",
+        "──────────────────────────",
+        "",
         f"⏱  <b>Uptime</b>       <code>{uptime}</code>",
         f"🕐  <b>Since</b>        <code>{datetime.fromtimestamp(session.start_time).strftime('%Y-%m-%d %H:%M')}</code>",
-        f"",
-        f"📤  <b>Uploaded</b>",
-        f"    Files   <code>{len(ul)}</code>",
+        "",
+        "📤  <b>Uploaded</b>",
+        f"    Files   <code>{files_ul}</code>",
         f"    Data    <code>{human_size(bytes_ul)}</code>",
         f"    Avg     <code>{human_size(avg_ul)}/s</code>",
-        f"",
-        f"📥  <b>Downloaded</b>",
-        f"    Files   <code>{len(dl)}</code>",
+        "",
+        "📥  <b>Downloaded</b>",
+        f"    Files   <code>{files_dl}</code>",
         f"    Data    <code>{human_size(bytes_dl)}</code>",
         f"    Avg     <code>{human_size(avg_dl)}/s</code>",
-        f"",
-        f"☁️  <b>CloudConvert</b>",
+        "",
+        "☁️  <b>CloudConvert</b>",
         f"    Active  <code>{cc_active}</code>",
         f"    Done    <code>{cc_done}</code>",
         f"    Failed  <code>{cc_error}</code>",
-        f"",
-        f"──────────────────────────",
+        "",
+        "──────────────────────────",
         f"💻  <b>CPU</b>   <code>{cpu:.1f}%</code>",
         f"🧠  <b>RAM</b>   <code>{ram_pct:.1f}%</code>",
         f"💾  <b>Disk</b>  <code>{human_size(disk_free)} free</code>",

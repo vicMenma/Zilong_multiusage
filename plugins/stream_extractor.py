@@ -13,10 +13,9 @@ import json
 import logging
 import os
 import re
-import subprocess
 import time
 import urllib.parse as _urlparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import aiohttp
@@ -31,7 +30,6 @@ from core.config import cfg
 from core.session import sessions
 from services import ffmpeg as FF
 from services.downloader import classify, download_ytdlp, download_aria2
-from services.tg_download import tg_download
 from services.uploader import upload_file
 from services.utils import cleanup, human_size, lang_flag, lang_name, make_tmp, safe_edit
 

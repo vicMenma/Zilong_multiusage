@@ -19,9 +19,12 @@ import os
 import time
 
 from pyrogram import Client, enums
+from pyrogram.errors import FloodWait
 
 from core.config import cfg
+from core.session import settings
 from services.utils import human_size, progress_panel, safe_edit
+from plugins.caption_templates import build_caption, has_custom_template
 
 log = logging.getLogger(__name__)
 
@@ -222,14 +225,18 @@ async def _upload_single(
     caption:        str        = "",
     thumb:          str | None = None,
     force_document: bool       = False,
+    user_id:        int        = 0,
 ) -> None:
     from services.task_runner import _stats_cache
 
-    chat_id    = _chat_id(msg)
-    fname      = os.path.basename(path)
-    file_size  = os.path.getsize(path)
-    ftype      = _ftype(path, force_document)
-    cap        = caption or f"<code>{fname}</code>"
+    chat_id     = _chat_id(msg)
+    fname       = os.path.basename(path)
+    file_size   = os.path.getsize(path)
+    ftype       = _ftype(path, force_document)
+    cap         = caption or f"<code>{fname}</code>"
+
+    user_cfg    = await settings.get(user_id)
+    panel_style = user_cfg.get("progress_style", "B")
 
     # Video metadata + thumbnail
     meta:       dict = {"duration": 0, "width": 0, "height": 0}
@@ -252,11 +259,6 @@ async def _upload_single(
 
     start        = time.time()
     last_edit    = [start - 4.0]
-    _uid         = msg.chat.id if msg and msg.chat else 0
-
-    from core.session import settings as _settings
-    _user_s      = await _settings.get(_uid) if _uid else {}
-    _prog_style  = _user_s.get("progress_style", "B")
 
     async def progress(current: int, total: int) -> None:
         now = time.time()
@@ -280,7 +282,7 @@ async def _upload_single(
             cpu        = float(s.get("cpu", 0)),
             ram_used   = int(s.get("ram_used", 0)),
             disk_free  = int(s.get("disk_free", 0)),
-            style      = _prog_style,
+            style      = panel_style,
         )
         await safe_edit(status_msg, text, parse_mode=enums.ParseMode.HTML)
 
@@ -291,7 +293,7 @@ async def _upload_single(
             mode="ul", fname=fname,
             done=0, total=file_size,
             engine="telegram", link_label="Telegram",
-            style=_prog_style,
+            style=panel_style,
         ),
         parse_mode=enums.ParseMode.HTML,
     )
@@ -332,6 +334,10 @@ async def _upload_single(
                 )
             error = None
             break
+        except FloodWait as fw:
+            log.warning("FloodWait %ds on upload (attempt %d/4)", fw.value, attempt + 1)
+            await asyncio.sleep(fw.value + 2)
+            continue               # retry after waiting
         except Exception as exc:
             error = exc
             break
@@ -370,6 +376,26 @@ async def _upload_single(
         except Exception:
             pass
 
+    # Auto-forward to user's saved channels (if enabled in Settings)
+    if sent and user_id:
+        try:
+            s = await settings.get(user_id)
+            if s.get("auto_forward") and s.get("forward_channels"):
+                for ch in s["forward_channels"]:
+                    ch_id = ch.get("id")
+                    if not ch_id:
+                        continue
+                    try:
+                        if has_custom_template(ch_id):
+                            cap_fwd = await build_caption(path, ch_id)
+                            await sent.copy(ch_id, caption=cap_fwd, parse_mode=enums.ParseMode.HTML)
+                        else:
+                            await sent.copy(ch_id)
+                    except Exception as fwd_exc:
+                        log.warning("Auto-forward to %s failed: %s", ch_id, fwd_exc)
+        except Exception as af_exc:
+            log.warning("Auto-forward error: %s", af_exc)
+
     log.info("✅ %s  %s/s  %.1fs", fname, human_size(speed), elapsed)
 
 
@@ -386,6 +412,7 @@ async def upload_file(
     force_document: bool       = False,
     task_record                = None,   # kept for API compat, unused
     is_last:        bool       = False,
+    user_id:        int        = 0,
 ) -> None:
     if not os.path.isfile(path):
         await safe_edit(
@@ -403,7 +430,8 @@ async def upload_file(
     if file_size <= TG_MAX_BYTES:
         await _upload_single(client, msg, path,
                              caption=caption, thumb=thumb,
-                             force_document=force_document)
+                             force_document=force_document,
+                             user_id=user_id)
         return
 
     log.info("File %s (%s) > 1.9 GiB — splitting", original_fname, human_size(file_size))
@@ -450,7 +478,8 @@ async def upload_file(
             )
             try:
                 await _upload_single(client, ph, pp, caption=part_cap,
-                                     force_document=force_document)
+                                     force_document=force_document,
+                                     user_id=user_id)
             except Exception as exc:
                 log.error("Part %d/%d failed: %s", i, total_parts, exc)
                 try:

@@ -31,11 +31,11 @@ from pyrogram.types import (
 
 from core.config import cfg
 from core.session import users
-from services.downloader import classify, smart_download, download_ytdlp
+from services.downloader import classify, smart_download
 from services.tg_download import tg_download
 from services.uploader import upload_file
 from services.utils import (
-    all_video_files, cleanup, human_size, lang_flag, lang_name,
+    cleanup, human_size, lang_flag, lang_name,
     largest_file, make_tmp, progress_panel, safe_edit,
     smart_clean_filename,
 )
@@ -449,7 +449,6 @@ async def _hardsub_magnet_dl(st, url: str, uid: int, tmp: str, fname: str) -> No
             parse_mode=enums.ParseMode.HTML,
         )
     except Exception as exc:
-        from plugins.hardsub import _clear
         _clear(uid)
         await safe_edit(st, f"❌ Download failed: <code>{exc}</code>",
                         parse_mode=enums.ParseMode.HTML)

@@ -15,7 +15,6 @@ running it's a no-op, and if it stopped it restarts it.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
