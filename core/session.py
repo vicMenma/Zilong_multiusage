@@ -6,11 +6,13 @@ Thread-safe via asyncio.Lock per store.
 
 SessionStore  — file-processing sessions
 UserStore     — user registry
-SettingsStore — per-user upload preferences
+SettingsStore — per-user upload preferences (persisted to data/settings.json)
 """
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -183,10 +185,39 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
+_SETTINGS_DIR  = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "data")
+)
+_SETTINGS_PATH = os.path.join(_SETTINGS_DIR, "settings.json")
+
+
 class SettingsStore:
     def __init__(self):
         self._data: dict[int, dict] = {}
         self._lock = asyncio.Lock()
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(_SETTINGS_PATH, encoding="utf-8") as f:
+                raw = json.load(f)
+            # JSON keys are always strings; convert back to int
+            self._data = {int(k): v for k, v in raw.items()}
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("[Settings] Load error: %s", e)
+
+    def _save(self) -> None:
+        try:
+            os.makedirs(_SETTINGS_DIR, exist_ok=True)
+            with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump({str(k): v for k, v in self._data.items()}, f,
+                          indent=2, ensure_ascii=False)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("[Settings] Save error: %s", e)
 
     async def get(self, uid: int) -> dict:
         return {**_DEFAULTS, **self._data.get(uid, {})}
@@ -194,10 +225,12 @@ class SettingsStore:
     async def update(self, uid: int, patch: dict) -> None:
         async with self._lock:
             self._data.setdefault(uid, {}).update(patch)
+            self._save()
 
     async def reset(self, uid: int) -> None:
         async with self._lock:
             self._data.pop(uid, None)
+            self._save()
 
 
 # ── Singletons shared across all plugins ─────────────────────
