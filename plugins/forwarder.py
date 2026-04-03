@@ -6,7 +6,6 @@ import os
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from core.config import cfg
-from core.session import users
 from services.utils import make_tmp, cleanup
 
 _FWD_STATE: dict = {}
