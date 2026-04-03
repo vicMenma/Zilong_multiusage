@@ -607,7 +607,8 @@ async def _dispatch(
     try:
         return await download_direct(url, dest, progress=progress)
     except Exception as direct_exc:
-        _dlog.warning("[Downloader] direct failed (%s) — trying aria2c", direct_exc)
+        _direct_exc = direct_exc            # save before Python 3 deletes it at end of except block
+        _dlog.warning("[Downloader] direct failed (%s) — trying aria2c", _direct_exc)
 
     try:
         return await download_aria2(
@@ -618,7 +619,7 @@ async def _dispatch(
         _dlog.error("[Downloader] aria2c also failed: %s", aria2_exc)
         raise RuntimeError(
             f"All download methods failed.\n"
-            f"aiohttp: {direct_exc}\n"
+            f"aiohttp: {_direct_exc}\n"
             f"aria2c:  {aria2_exc}"
         ) from aria2_exc
 

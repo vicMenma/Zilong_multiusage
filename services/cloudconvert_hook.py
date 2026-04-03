@@ -30,8 +30,8 @@ from aiohttp import web
 log = logging.getLogger(__name__)
 
 WEBHOOK_SECRET: str = ""
-_runner = None
-_site = None
+_web_runner = None
+_web_site = None
 LISTEN_PORT = 8765
 
 
@@ -69,7 +69,6 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
     from core.session import get_client, settings as _settings
     from services.downloader import smart_download
     from services.uploader import upload_file
-    from services.task_runner import runner as _runner
     from services.utils import cleanup, make_tmp, smart_clean_filename, largest_file, human_size
 
     client = get_client()
@@ -119,15 +118,13 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             except OSError:
                 pass
 
-        sem = _runner._get_upload_sem()
-        async with sem:
-            from types import SimpleNamespace
-            dummy_msg = SimpleNamespace(
-                edit=lambda *a, **kw: asyncio.sleep(0),
-                delete=lambda: asyncio.sleep(0),
-                chat=SimpleNamespace(id=owner_id),
-            )
-            await upload_file(client, dummy_msg, path)
+        from types import SimpleNamespace
+        dummy_msg = SimpleNamespace(
+            edit=lambda *a, **kw: asyncio.sleep(0),
+            delete=lambda: asyncio.sleep(0),
+            chat=SimpleNamespace(id=owner_id),
+        )
+        await upload_file(client, dummy_msg, path, user_id=owner_id)
 
     except Exception as exc:
         log.error("[CC-Hook] Pipeline failed for %s: %s", filename, exc)
@@ -167,8 +164,6 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
             return web.json_response({"status": "no_urls"})
 
         from core.session import get_client
-        client = get_client()
-
         for f in files:
             asyncio.create_task(_process_file(f["url"], f["filename"], cfg.owner_id))
 
@@ -229,12 +224,12 @@ async def _register_webhook_with_cc(webhook_url: str, api_key: str, secret: str)
 
 
 async def start_webhook_server(port: int = LISTEN_PORT, serveo_subdomain: str = "") -> str:
-    global _runner, _site
+    global _web_runner, _web_site
     app = _build_app()
-    _runner = web.AppRunner(app)
-    await _runner.setup()
-    _site = web.TCPSite(_runner, "0.0.0.0", port)
-    await _site.start()
+    _web_runner = web.AppRunner(app)
+    await _web_runner.setup()
+    _web_site = web.TCPSite(_web_runner, "0.0.0.0", port)
+    await _web_site.start()
     log.info(f"[CC-Hook] Webhook server listening on port {port}")
 
     if not WEBHOOK_SECRET:
@@ -302,13 +297,12 @@ async def start_webhook_server(port: int = LISTEN_PORT, serveo_subdomain: str = 
 
 
 async def stop_webhook_server():
-    global _runner, _site
     try:
         # no ngrok to kill
         pass
     except Exception:
         pass
-    if _site:
-        await _site.stop()
-    if _runner:
-        await _runner.cleanup()
+    if _web_site:
+        await _web_site.stop()
+    if _web_runner:
+        await _web_runner.cleanup()

@@ -166,7 +166,7 @@ def _compact(n: float) -> str:
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
     from core.bot_name import get_bot_name
-    from services.utils import human_size, human_dur, pct_bar
+    from services.utils import human_size, human_dur
 
     tasks  = tracker.tasks_for_user(target_uid) if target_uid else tracker.all_tasks()
     active = [t for t in tasks if not t.is_terminal]
@@ -209,7 +209,7 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
 
             elif t.meta_phase:
                 lines.append(f"{arrow}  <code>{fname_s}</code>")
-                lines.append(f"   🔍 <i>Fetching metadata…</i>")
+                lines.append("   🔍 <i>Fetching metadata…</i>")
 
             elif t.state == "⏳ Queued":
                 lines.append(f"🕐  <code>{fname_s}</code>  <i>queued</i>")
@@ -369,6 +369,18 @@ class TaskRunner:
         except Exception as exc:
             log.error("Task %s failed: %s", record.tid, exc)
             record.update(state=f"❌ {str(exc)[:60]}")
+        else:
+            # Accumulate persistent session stats (survives tracker eviction)
+            try:
+                from plugins.usage import session as _us
+                if record.mode == "ul":
+                    _us.bytes_uploaded += record.total or record.done
+                    _us.files_uploaded += 1
+                elif record.mode in ("dl", "magnet"):
+                    _us.bytes_downloaded += record.total or record.done
+                    _us.files_downloaded += 1
+            except Exception:
+                pass
         finally:
             self._task_handles.pop(record.tid, None)
 

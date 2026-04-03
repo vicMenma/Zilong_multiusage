@@ -18,7 +18,6 @@ UptimeRobot setup (free):
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
@@ -26,6 +25,8 @@ import subprocess
 import threading
 import time
 from typing import Optional
+
+from aiohttp import web
 
 log = logging.getLogger(__name__)
 
@@ -37,8 +38,7 @@ _START_TIME  = time.time()
 
 # ── Health endpoints ──────────────────────────────────────────
 
-async def _handle_health(request) -> "web.Response":
-    from aiohttp import web
+async def _handle_health(request) -> web.Response:
     from services.utils import human_dur
     from core.bot_name import get_bot_name
     from services.task_runner import tracker
@@ -56,8 +56,7 @@ async def _handle_health(request) -> "web.Response":
     })
 
 
-async def _handle_root(request) -> "web.Response":
-    from aiohttp import web
+async def _handle_root(request) -> web.Response:
     from core.bot_name import get_bot_name
     bot_name = get_bot_name()
     html = f"""<!DOCTYPE html>

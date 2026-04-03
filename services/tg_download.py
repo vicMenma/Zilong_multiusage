@@ -15,7 +15,7 @@ import time
 
 from pyrogram import Client, enums
 
-from services.utils import human_size, progress_panel, safe_edit
+from services.utils import progress_panel, safe_edit
 from core.session import settings
 
 
