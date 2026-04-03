@@ -13,5 +13,4 @@ google-auth
 google-auth-httplib2
 psutil
 Pillow
-moviepy
 # pyngrok removed — keep-alive uses Serveo (SSH tunnel, no token needed) on EC2/VPS.

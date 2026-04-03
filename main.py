@@ -2,10 +2,6 @@
 Zilong Bot — main.py
 Entry point. Loads config, builds client, registers plugins, starts.
 """
-"""
-Zilong Bot — main.py
-Entry point. Loads config, builds client, registers plugins, starts.
-"""
 import asyncio
 import logging
 import os
