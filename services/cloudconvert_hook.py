@@ -3,6 +3,11 @@ services/cloudconvert_hook.py
 Receives CloudConvert webhooks and auto-downloads + uploads
 finished files through the existing Zilong pipeline.
 
+Tunnel priority (automatic, no config needed):
+  1. Cloudflare Tunnel (cloudflared) — preferred, no account required
+  2. ngrok                           — fallback if NGROK_TOKEN is set
+  3. localhost only                  — if both fail
+
 CRITICAL FIX: _process_file previously called smart_download() to retrieve
 CC export URLs. smart_download → _dispatch → download_parallel fires 8
 simultaneous Range requests. CC export URLs are single-use signed tokens —
@@ -32,7 +37,11 @@ log = logging.getLogger(__name__)
 WEBHOOK_SECRET: str = ""
 _web_runner = None
 _web_site = None
+_tunnel_proc: subprocess.Popen | None = None
 LISTEN_PORT = 8765
+
+# Tunnel detection timeout — short so bot never hangs on startup
+_TUNNEL_TIMEOUT = 30
 
 
 def _verify_signature(payload: bytes, signature: str) -> bool:
@@ -163,7 +172,6 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
             log.warning("[CC-Hook] No export URLs in payload")
             return web.json_response({"status": "no_urls"})
 
-        from core.session import get_client
         for f in files:
             asyncio.create_task(_process_file(f["url"], f["filename"], cfg.owner_id))
 
@@ -207,7 +215,6 @@ async def _register_webhook_with_cc(webhook_url: str, api_key: str, secret: str)
                             await sess.delete(f"{CC_API}/webhooks/{wh_id}", headers=headers)
                             log.info("[CC-Hook] Deleted old webhook id=%s", wh_id)
 
-            # register new webhook
             async with sess.post(f"{CC_API}/webhooks", json=payload, headers=headers) as resp:
                 data = await resp.json()
                 if resp.status in (200, 201):
@@ -223,85 +230,253 @@ async def _register_webhook_with_cc(webhook_url: str, api_key: str, secret: str)
         return False
 
 
-async def start_webhook_server(port: int = LISTEN_PORT, serveo_subdomain: str = "") -> str:
+# ── Tunnel backends ───────────────────────────────────────────────────────────
+
+def _install_cloudflared() -> bool:
+    """Download cloudflared binary if not already present."""
+    if subprocess.run(["which", "cloudflared"], capture_output=True).returncode == 0:
+        return True
+    log.info("[CC-Hook] Installing cloudflared…")
+    r = subprocess.run(
+        "curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest"
+        "/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared"
+        " && chmod +x /usr/local/bin/cloudflared",
+        shell=True, capture_output=True,
+    )
+    return r.returncode == 0
+
+
+async def _open_cloudflare_tunnel(port: int) -> str:
+    """
+    Start cloudflared tunnel to localhost:port.
+    Returns public HTTPS URL or '' on failure.
+    Never blocks longer than _TUNNEL_TIMEOUT seconds.
+    """
+    global _tunnel_proc
+
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(None, _install_cloudflared)
+    if not ok:
+        log.warning("[CC-Hook] cloudflared install failed")
+        return ""
+
+    try:
+        proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", f"http://localhost:{port}", "--no-autoupdate"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True,
+        )
+        _tunnel_proc = proc
+        atexit.register(lambda: proc.terminate())
+
+        deadline = loop.time() + _TUNNEL_TIMEOUT
+
+        while loop.time() < deadline:
+            try:
+                line = await asyncio.wait_for(
+                    loop.run_in_executor(None, proc.stdout.readline),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                if proc.poll() is not None:
+                    break
+                continue
+
+            if not line:
+                break
+
+            log.debug("[cloudflared] %s", line.rstrip())
+            m = re.search(r"(https://[a-z0-9\-]+\.trycloudflare\.com)", line)
+            if m:
+                url = m.group(1).rstrip("/")
+                log.info("[CC-Hook] Cloudflare tunnel active: %s", url)
+                return url
+
+        log.warning("[CC-Hook] cloudflared timed out after %ds", _TUNNEL_TIMEOUT)
+        return ""
+
+    except Exception as exc:
+        log.warning("[CC-Hook] cloudflared error: %s", exc)
+        return ""
+
+
+async def _open_ngrok_tunnel(port: int, token: str) -> str:
+    """
+    Open ngrok tunnel to localhost:port.
+    Tries pyngrok library first, then ngrok CLI.
+    Returns public HTTPS URL or '' on failure.
+    """
+    global _tunnel_proc
+
+    # Try pyngrok
+    try:
+        from pyngrok import ngrok as _ngrok, conf as _conf
+        _conf.get_default().auth_token = token
+        loop = asyncio.get_event_loop()
+        tunnel = await loop.run_in_executor(None, lambda: _ngrok.connect(port, "http"))
+        url = tunnel.public_url
+        if url.startswith("http://"):
+            url = "https://" + url[7:]
+        log.info("[CC-Hook] ngrok tunnel (pyngrok) active: %s", url)
+        return url.rstrip("/")
+    except ImportError:
+        log.info("[CC-Hook] pyngrok not installed — trying ngrok CLI")
+    except Exception as exc:
+        log.warning("[CC-Hook] pyngrok failed: %s — trying CLI", exc)
+
+    # Try ngrok CLI
+    try:
+        proc = subprocess.Popen(
+            ["ngrok", "http", str(port), "--log=stdout", f"--authtoken={token}"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        _tunnel_proc = proc
+        atexit.register(lambda: proc.terminate())
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + _TUNNEL_TIMEOUT
+
+        while loop.time() < deadline:
+            try:
+                line = await asyncio.wait_for(
+                    loop.run_in_executor(None, proc.stdout.readline),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                # Poll ngrok local API as fallback
+                try:
+                    import aiohttp as _ah
+                    async with _ah.ClientSession() as s:
+                        async with s.get(
+                            "http://localhost:4040/api/tunnels",
+                            timeout=_ah.ClientTimeout(total=2),
+                        ) as r:
+                            if r.status == 200:
+                                data = await r.json()
+                                for t in data.get("tunnels", []):
+                                    pu = t.get("public_url", "")
+                                    if pu.startswith("https://"):
+                                        log.info("[CC-Hook] ngrok (API): %s", pu)
+                                        return pu.rstrip("/")
+                except Exception:
+                    pass
+                if proc.poll() is not None:
+                    break
+                continue
+
+            if not line:
+                break
+
+            log.debug("[ngrok] %s", line.rstrip())
+            m = re.search(r"(https://[a-z0-9\-]+\.ngrok[\-a-z\.io]+)", line)
+            if m:
+                url = m.group(1).rstrip("/")
+                log.info("[CC-Hook] ngrok tunnel (CLI) active: %s", url)
+                return url
+
+        log.warning("[CC-Hook] ngrok CLI timed out after %ds", _TUNNEL_TIMEOUT)
+        return ""
+
+    except FileNotFoundError:
+        log.warning("[CC-Hook] ngrok CLI not found")
+        return ""
+    except Exception as exc:
+        log.warning("[CC-Hook] ngrok CLI error: %s", exc)
+        return ""
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+async def start_webhook_server(port: int = LISTEN_PORT) -> str:
+    """
+    Start the aiohttp webhook server, then open a public tunnel.
+    Tunnel priority: preset URL → Cloudflare → ngrok → localhost-only.
+    Never blocks longer than _TUNNEL_TIMEOUT seconds per tunnel attempt.
+    Returns the full public webhook URL.
+    """
     global _web_runner, _web_site
+
+    # 1. Start local HTTP server
     app = _build_app()
     _web_runner = web.AppRunner(app)
     await _web_runner.setup()
     _web_site = web.TCPSite(_web_runner, "0.0.0.0", port)
     await _web_site.start()
-    log.info(f"[CC-Hook] Webhook server listening on port {port}")
+    log.info("[CC-Hook] Webhook server listening on port %d", port)
 
     if not WEBHOOK_SECRET:
         log.warning("[CC-Hook] ⚠️  No CC_WEBHOOK_SECRET set — webhook accepts ALL POST requests.")
 
-    public_url = ""
-    webhook_url = ""
+    from core.config import cfg
+    api_key = cfg.cc_api_key or os.environ.get("CC_API_KEY", "").strip()
+    ngrok_token = cfg.ngrok_token or os.environ.get("NGROK_TOKEN", "").strip()
 
-    try:
-        # Serveo SSH command
-        cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-R"]
-        if serveo_subdomain:
-            cmd.append(f"{serveo_subdomain}.serveo.net:80:localhost:{port}")
-        else:
-            cmd.append(f"0:localhost:{port}")
-        cmd.append("serveo.net")
-
-        serveo_proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True
-        )
-        atexit.register(lambda: serveo_proc.terminate())
-
-        # wait for URL to appear
-        await asyncio.sleep(3)
-        output = serveo_proc.stderr.read() or ""
-        match = re.search(r'Forwarding HTTP traffic from (https?://[^\s]+)', output)
-        if match:
-            public_url = match.group(1)
-            webhook_url = f"{public_url}/webhook/cloudconvert"
-            log.info(f"[CC-Hook] Serveo public URL: {public_url}")
-        else:
-            log.warning("[CC-Hook] Could not detect Serveo public URL, defaulting to localhost")
-            webhook_url = f"http://localhost:{port}/webhook/cloudconvert"
-
-        # auto-register webhook
-        from core.config import cfg
-        api_key = cfg.cc_api_key or os.environ.get("CC_API_KEY", "").strip()
+    # 2. Use preset URL if provided (VPS / EC2 / manual)
+    preset_url = os.environ.get("WEBHOOK_BASE_URL", "").strip().rstrip("/")
+    if preset_url:
+        webhook_url = f"{preset_url}/webhook/cloudconvert"
+        log.info("[CC-Hook] Using preset WEBHOOK_BASE_URL: %s", webhook_url)
         if api_key:
-            registered = await _register_webhook_with_cc(webhook_url, api_key, WEBHOOK_SECRET)
-            reg_status = "✅ auto-registered with CloudConvert" if registered else "⚠️ auto-registration failed — set manually in CC dashboard"
+            await _register_webhook_with_cc(webhook_url, api_key, WEBHOOK_SECRET)
+        return webhook_url
+
+    # 3. Try Cloudflare tunnel (no account needed, always first)
+    log.info("[CC-Hook] Opening Cloudflare tunnel (timeout: %ds)…", _TUNNEL_TIMEOUT)
+    public_url = await _open_cloudflare_tunnel(port)
+
+    # 4. Fallback to ngrok
+    if not public_url:
+        if ngrok_token:
+            log.info("[CC-Hook] Cloudflare unavailable — trying ngrok…")
+            public_url = await _open_ngrok_tunnel(port, ngrok_token)
         else:
-            reg_status = "⚠️ No CC_API_KEY — cannot auto-register webhook"
+            log.info("[CC-Hook] No NGROK_TOKEN set — skipping ngrok fallback")
 
-        # notify owner via Telegram
-        try:
-            from core.session import get_client
-            client = get_client()
-            await client.send_message(
-                cfg.owner_id,
-                f"🌐 <b>Serveo Webhook Active</b>\n"
-                f"──────────────────────\n\n"
-                f"<code>{webhook_url}</code>\n\n"
-                f"{reg_status}\n\n"
-                "<i>Auto-registration handles it automatically.</i>",
-                parse_mode="html",
-                disable_web_page_preview=True,
-            )
-        except Exception as notify_exc:
-            log.warning("[CC-Hook] Could not notify owner: %s", notify_exc)
+    if not public_url:
+        log.warning("[CC-Hook] No tunnel available — webhook is localhost-only (no external delivery).")
+        return f"http://localhost:{port}/webhook/cloudconvert"
 
-    except Exception as e:
-        log.error("[CC-Hook] Serveo tunnel error: %s", e)
+    webhook_url = f"{public_url}/webhook/cloudconvert"
+
+    # 5. Auto-register with CloudConvert
+    reg_status = "⚠️ No CC_API_KEY — cannot auto-register webhook"
+    if api_key:
+        registered = await _register_webhook_with_cc(webhook_url, api_key, WEBHOOK_SECRET)
+        reg_status = (
+            "✅ Auto-registered with CloudConvert"
+            if registered
+            else "⚠️ Auto-registration failed — set manually in CC dashboard"
+        )
+
+    # 6. Notify owner via Telegram
+    try:
+        from core.session import get_client
+        client = get_client()
+        tunnel_type = "Cloudflare" if "trycloudflare" in public_url else "ngrok"
+        await client.send_message(
+            cfg.owner_id,
+            f"🌐 <b>{tunnel_type} Webhook Active</b>\n"
+            f"──────────────────────\n\n"
+            f"<code>{webhook_url}</code>\n\n"
+            f"{reg_status}\n\n"
+            "<i>Auto-registration handles it automatically.</i>",
+            parse_mode="html",
+            disable_web_page_preview=True,
+        )
+    except Exception as notify_exc:
+        log.warning("[CC-Hook] Could not notify owner: %s", notify_exc)
 
     return webhook_url
 
 
 async def stop_webhook_server():
-    try:
-        # no ngrok to kill
-        pass
-    except Exception:
-        pass
+    global _tunnel_proc
+    if _tunnel_proc is not None:
+        try:
+            _tunnel_proc.terminate()
+        except Exception:
+            pass
+        _tunnel_proc = None
     if _web_site:
         await _web_site.stop()
     if _web_runner:
