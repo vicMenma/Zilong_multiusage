@@ -96,7 +96,7 @@ if errors:
 
 _log("OK", f"API_ID={API_ID}  OWNER_ID={OWNER_ID}")
 if WEBHOOK_BASE_URL: _log("OK", f"CloudConvert webhook URL set: {WEBHOOK_BASE_URL}")
-elif NGROK_TOKEN:    _log("OK", "NGROK_TOKEN set (legacy — Serveo tunnel preferred)")
+elif NGROK_TOKEN:    _log("OK", "NGROK_TOKEN set (ngrok fallback enabled)")
 if CC_API_KEY:       _log("OK", "CloudConvert hardsub enabled (CC_API_KEY set)")
 if GITHUB_TOKEN:     _log("OK", "GitHub token set — will clone private repo")
 
@@ -234,134 +234,142 @@ try:
 except Exception as _ke:
     _log("WARN", f"Could not clean up stale PID: {_ke}")
 
-# ── Open Serveo tunnel for CloudConvert webhook (port 8765) ──────────────
-# Only runs when CC_API_KEY is set and WEBHOOK_BASE_URL is not already
-# provided (e.g. manually set for VPS deployments).
-#
-# SERVEO_SUBDOMAIN: set this to a fixed name so the URL stays stable across
-# Colab restarts — no need to re-register the webhook in CloudConvert every
-# time.  Leave blank for a random subdomain.
-#
-# ⚠️  NEVER use "console" — that is Serveo's own reserved dashboard subdomain.
-#     Requests to console.serveo.net hit Serveo's nginx directly (not your bot)
-#     and return 405 Method Not Allowed for every POST CloudConvert sends.
-SERVEO_SUBDOMAIN = "zilongbot"   # ← change to any unique name (not "console")
+# ── Open public tunnel for CloudConvert webhook (port 8765) ──────────────
+# Priority: Cloudflare Tunnel (no account) → ngrok (needs NGROK_TOKEN)
+# The tunnel is opened here in the launcher so WEBHOOK_BASE_URL is injected
+# into the bot's .env before it starts. The bot's cloudconvert_hook.py will
+# see a preset WEBHOOK_BASE_URL and skip opening its own tunnel.
+# Only runs when CC_API_KEY is set and WEBHOOK_BASE_URL not already provided.
+
+import re as _re2
 
 _tunnel_proc: subprocess.Popen | None = None
+_TUNNEL_TIMEOUT = 30  # seconds — never blocks startup longer than this
 
 
-def _open_webhook_tunnel() -> str:
-    """
-    SSH reverse-tunnel: Serveo public HTTPS → localhost:8765
-    Uses SERVEO_SUBDOMAIN for a stable URL that survives Colab restarts.
-    Returns the public base URL (e.g. https://zilongbot.serveo.net) or '' on failure.
-    """
-    import re as _re2
-    global _tunnel_proc
-    remote_spec = (
-        f"{SERVEO_SUBDOMAIN}:80:localhost:8765"
-        if SERVEO_SUBDOMAIN
-        else "80:localhost:8765"
+def _install_cloudflared() -> bool:
+    if subprocess.run(["which", "cloudflared"], capture_output=True).returncode == 0:
+        return True
+    _log("INFO", "Installing cloudflared…")
+    r = subprocess.run(
+        "curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest"
+        "/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared"
+        " && chmod +x /usr/local/bin/cloudflared",
+        shell=True, capture_output=True,
     )
+    return r.returncode == 0
+
+
+def _open_cloudflare_tunnel() -> str:
+    """Start cloudflared → localhost:8765. Returns public URL or ''."""
+    global _tunnel_proc
+    if not _install_cloudflared():
+        _log("WARN", "cloudflared install failed")
+        return ""
     try:
         proc = subprocess.Popen(
-            [
-                "ssh", "-o", "StrictHostKeyChecking=no",
-                "-o", "ServerAliveInterval=30",
-                "-o", "ServerAliveCountMax=3",
-                "-o", "ExitOnForwardFailure=yes",
-                "-R", remote_spec,
-                "serveo.net",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            ["cloudflared", "tunnel", "--url", "http://localhost:8765", "--no-autoupdate"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
         _tunnel_proc = proc
-        deadline = time.time() + 30
+        deadline = time.time() + _TUNNEL_TIMEOUT
         for line in proc.stdout:
-            _log("INFO", f"[Serveo] {line.rstrip()}")
-            m = _re2.search(r"(https://\S+\.serveo\.net)", line)
+            _log("INFO", f"[cloudflared] {line.rstrip()}")
+            m = _re2.search(r"(https://[a-z0-9\-]+\.trycloudflare\.com)", line)
             if m:
                 url = m.group(1).rstrip("/")
-                _log("OK", f"Serveo tunnel established: {url}")
+                _log("OK", f"Cloudflare tunnel active: {url}")
                 return url
             if time.time() > deadline:
                 break
-        _log("WARN", "Serveo webhook tunnel timed out — webhook unavailable.")
+        _log("WARN", f"cloudflared timed out after {_TUNNEL_TIMEOUT}s")
         return ""
     except Exception as exc:
-        _log("WARN", f"Serveo webhook tunnel failed: {exc}")
+        _log("WARN", f"cloudflared error: {exc}")
         return ""
 
 
-def _tunnel_watchdog(expected_url: str) -> None:
-    """
-    Background thread: restarts the Serveo tunnel if the SSH process dies.
-    CloudConvert will resume delivery automatically once the tunnel is back up
-    (CloudConvert retries failed webhooks for up to 3 days).
-    """
-    import re as _re2
+def _open_ngrok_tunnel() -> str:
+    """Start ngrok → localhost:8765 using NGROK_TOKEN. Returns public URL or ''."""
     global _tunnel_proc
-    remote_spec = (
-        f"{SERVEO_SUBDOMAIN}:80:localhost:8765"
-        if SERVEO_SUBDOMAIN
-        else "80:localhost:8765"
-    )
+    if not NGROK_TOKEN:
+        return ""
+    # Try pyngrok first
+    try:
+        from pyngrok import ngrok as _ngrok, conf as _conf
+        _conf.get_default().auth_token = NGROK_TOKEN
+        tunnel = _ngrok.connect(8765, "http")
+        url = tunnel.public_url
+        if url.startswith("http://"):
+            url = "https://" + url[7:]
+        _log("OK", f"ngrok tunnel (pyngrok) active: {url}")
+        return url.rstrip("/")
+    except ImportError:
+        _log("INFO", "pyngrok not installed — trying ngrok CLI")
+    except Exception as exc:
+        _log("WARN", f"pyngrok failed: {exc} — trying ngrok CLI")
+    # Try ngrok CLI
+    try:
+        proc = subprocess.Popen(
+            ["ngrok", "http", "8765", "--log=stdout", f"--authtoken={NGROK_TOKEN}"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        _tunnel_proc = proc
+        deadline = time.time() + _TUNNEL_TIMEOUT
+        for line in proc.stdout:
+            _log("INFO", f"[ngrok] {line.rstrip()}")
+            m = _re2.search(r"(https://[a-z0-9\-]+\.ngrok[\-a-z\.io]+)", line)
+            if m:
+                url = m.group(1).rstrip("/")
+                _log("OK", f"ngrok tunnel (CLI) active: {url}")
+                return url
+            if time.time() > deadline:
+                break
+        _log("WARN", f"ngrok CLI timed out after {_TUNNEL_TIMEOUT}s")
+        return ""
+    except FileNotFoundError:
+        _log("WARN", "ngrok CLI not found — install ngrok or set NGROK_TOKEN with pyngrok")
+        return ""
+    except Exception as exc:
+        _log("WARN", f"ngrok CLI error: {exc}")
+        return ""
+
+
+def _tunnel_watchdog() -> None:
+    """Background thread: restarts tunnel if it dies. CloudConvert retries for 3 days."""
+    global _tunnel_proc
     while True:
         time.sleep(20)
         proc = _tunnel_proc
         if proc is None or proc.poll() is not None:
-            _log("WARN", "[Serveo] Tunnel dropped — reconnecting…")
-            try:
-                new_proc = subprocess.Popen(
-                    [
-                        "ssh", "-o", "StrictHostKeyChecking=no",
-                        "-o", "ServerAliveInterval=30",
-                        "-o", "ServerAliveCountMax=3",
-                        "-o", "ExitOnForwardFailure=yes",
-                        "-R", remote_spec,
-                        "serveo.net",
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-                deadline = time.time() + 30
-                for line in new_proc.stdout:
-                    m = _re2.search(r"(https://\S+\.serveo\.net)", line)
-                    if m:
-                        _log("OK", f"[Serveo] Tunnel restored: {m.group(1).rstrip('/')}")
-                        break
-                    if time.time() > deadline:
-                        break
-                _tunnel_proc = new_proc
-            except Exception as exc:
-                _log("WARN", f"[Serveo] Reconnect failed: {exc}")
+            _log("WARN", "[Tunnel] Dropped — reconnecting…")
+            url = _open_cloudflare_tunnel() or (NGROK_TOKEN and _open_ngrok_tunnel()) or ""
+            if url:
+                _log("OK", f"[Tunnel] Restored: {url}")
+            else:
+                _log("WARN", "[Tunnel] Reconnect failed — will retry in 20s")
 
 
 if CC_API_KEY and not WEBHOOK_BASE_URL:
-    _log("STEP", "Opening Serveo tunnel for CloudConvert webhook (port 8765)…")
-    WEBHOOK_BASE_URL = _open_webhook_tunnel()
+    _log("STEP", "Opening Cloudflare tunnel for CloudConvert webhook (port 8765)…")
+    WEBHOOK_BASE_URL = _open_cloudflare_tunnel()
+
+    if not WEBHOOK_BASE_URL and NGROK_TOKEN:
+        _log("STEP", "Cloudflare unavailable — trying ngrok…")
+        WEBHOOK_BASE_URL = _open_ngrok_tunnel()
+
     if WEBHOOK_BASE_URL:
         _log("OK", f"Webhook tunnel active: {WEBHOOK_BASE_URL}/webhook/cloudconvert")
-        # Patch env_lines and .env so the bot picks it up
         env_lines = [
             ln if not ln.startswith("WEBHOOK_BASE_URL=") else f"WEBHOOK_BASE_URL={WEBHOOK_BASE_URL}"
             for ln in env_lines
         ]
         with open(f"{BASE_DIR}/.env", "w") as _f:
             _f.write("\n".join(env_lines))
-        # Start watchdog — keeps tunnel alive for the entire Colab session
-        threading.Thread(
-            target=_tunnel_watchdog,
-            args=(WEBHOOK_BASE_URL,),
-            daemon=True,
-            name="serveo-watchdog",
-        ).start()
-        _log("OK", "Tunnel watchdog started (auto-reconnects on SSH drop)")
+        threading.Thread(target=_tunnel_watchdog, daemon=True, name="tunnel-watchdog").start()
+        _log("OK", "Tunnel watchdog started (auto-reconnects on drop)")
     else:
-        _log("WARN", "No webhook URL — falling back to ccstatus poller (~5 s lag).")
+        _log("WARN", "No tunnel available — webhook localhost-only (ccstatus poller active).")
 elif WEBHOOK_BASE_URL:
     _log("OK", f"Using provided WEBHOOK_BASE_URL: {WEBHOOK_BASE_URL}")
 

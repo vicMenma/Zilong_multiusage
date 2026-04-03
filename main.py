@@ -206,10 +206,7 @@ async def main() -> None:
         if cfg.cc_webhook_secret:
             cc_hook.WEBHOOK_SECRET = cfg.cc_webhook_secret
 
-        # ✂️ Remove ngrok_token – we use Serveo instead
-        webhook_url = await cc_hook.start_webhook_server(
-            port=8765
-        )
+        webhook_url = await cc_hook.start_webhook_server(port=8765)
 
         if webhook_url:
             log.info("☁️  CloudConvert webhook active: %s", webhook_url)
