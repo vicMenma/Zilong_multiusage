@@ -124,13 +124,20 @@ async def _video_meta(path: str) -> dict:
 
 
 async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
-    """Extract a thumbnail at 20% of video duration.
+    """Extract a crisp thumbnail from a video file.
 
-    Thumbnail is capped at 320×320 (Telegram's hard limit for the `thumb`
-    parameter).  Sending a larger image causes Telegram's server to
-    downscale it with a low-quality algorithm, which produces the blurry
-    thumbnails seen in the chat.  Generating at the correct size means
-    Telegram uses it as-is → crisp result.
+    Two-stage seek strategy:
+      1. Fast pre-seek (-ss before -i) jumps quickly to the keyframe
+         just before the target timestamp.
+      2. Accurate post-seek (-ss after -i) then decodes frame-accurately
+         to the exact target, avoiding the blurry partial-decode frames
+         that result from stopping at a keyframe that doesn't match the
+         requested timestamp.
+
+    Thumbnail is capped at 320×320 — Telegram's hard limit for the
+    `thumb` parameter.  Larger images get downscaled by Telegram's server
+    using a cheap algorithm (blurry result).  At 320px ffmpeg uses its
+    own Lanczos scaler → crisp output.
     """
     out = path + "_zt.jpg"
     candidates = (
@@ -141,13 +148,15 @@ async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y",
-                "-ss", str(ts), "-i", path,
+                # Stage 1: fast keyframe seek (within a few seconds of ts)
+                "-ss", str(max(0, ts - 3)),
+                "-i", path,
+                # Stage 2: accurate frame-level seek from that keyframe
+                "-ss", "3",
                 "-frames:v", "1",
-                # Fit within 320×320 while keeping aspect ratio.
-                # force_original_aspect_ratio=decrease never upscales and
-                # never exceeds 320 on either axis → Telegram-safe.
+                # Fit within 320×320, maintain aspect ratio, never upscale
                 "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
-                "-q:v", "2",   # 1-31; 2 = near-lossless, ~40-80 KB at 320px
+                "-q:v", "2",   # JPEG quality 2/31 — near-lossless at 320px
                 out,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,

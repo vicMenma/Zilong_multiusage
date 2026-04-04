@@ -291,9 +291,12 @@ async def get_thumb(path: str, out_path: str) -> Optional[str]:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y",
-                "-ss", str(ts), "-i", path,
+                # Two-stage seek: fast keyframe jump, then accurate frame decode
+                "-ss", str(max(0, ts - 3)),
+                "-i", path,
+                "-ss", "3",
                 "-frames:v", "1",
-                # 320×320 max — Telegram rejects / blurs larger thumbs.
+                # 320×320 max — Telegram blurs anything larger.
                 "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
                 "-q:v", "2",
                 out_path,
