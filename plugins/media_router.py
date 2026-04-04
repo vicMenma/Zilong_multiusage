@@ -157,7 +157,7 @@ async def _open_audio_session(client, msg, media, fname, fsize, ext, uid):
         f"<b>{fname}</b>\n<code>{human_size(fsize)}</code>",
         parse_mode=enums.ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎵 Convert Audio", callback_data=f"vaud|mp3|{key}"),
+            [InlineKeyboardButton("🟡 Convert Audio", callback_data=f"vaud|mp3|{key}"),
              InlineKeyboardButton("📊 Media Info",    callback_data=f"vid|mediainfo|{key}")],
             [InlineKeyboardButton("🎵 Extract Audio", callback_data=f"vid|to_audio|{key}"),
              InlineKeyboardButton("❌ Cancel",        callback_data=f"vid|cancel|{key}")],

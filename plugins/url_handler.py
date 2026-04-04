@@ -95,45 +95,53 @@ def _evict_magnet_probes() -> None:
 # ─────────────────────────────────────────────────────────────
 
 def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
-    rows: list = []
+    """
+    Every row is a pair — no orphaned single buttons.
+    Color legend:  🟢 download  🔵 info/stream  🟡 convert  🔥 hardsub  ❌ cancel
+    """
     if kind == "ytdlp":
-        rows += [
-            [InlineKeyboardButton("🎬 Download Video",   callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("🎵 Download Audio",   callback_data=f"dl|audio|{token}")],
-            [InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}"),
-             InlineKeyboardButton("📊 Media Info",       callback_data=f"dl|info|{token}")],
-            [InlineKeyboardButton("🖼️ Thumbnail",         callback_data=f"dl|thumb|{token}")],
-        ]
-    elif kind in ("magnet", "torrent"):
-        rows += [
-            [InlineKeyboardButton("🧲 Download",         callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("📊 Media Info",       callback_data=f"dl|info|{token}")],
-            [InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|magnet_stream|{token}")],
-        ]
-    elif kind == "gdrive":
-        rows += [
-            [InlineKeyboardButton("☁️ Download",         callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("🎵 Audio Only",       callback_data=f"dl|audio|{token}")],
-            [InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}")],
-        ]
-    elif kind == "mediafire":
-        rows += [
-            [InlineKeyboardButton("📁 Download", callback_data=f"dl|video|{token}")],
-        ]
-    else:
-        rows += [
-            [InlineKeyboardButton("🎬 Download File",    callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("📊 Media Info",       callback_data=f"dl|info|{token}")],
-            [InlineKeyboardButton("📡 Stream Extractor", callback_data=f"dl|stream|{token}")],
-        ]
-
-    if kind != "mediafire":
-        rows.append([
-            InlineKeyboardButton("🔥 Hardsub",  callback_data=f"dl|hardsub|{token}"),
-            InlineKeyboardButton("🔄 Convert",  callback_data=f"dl|convert|{token}"),
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟢 Download Video",    callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("🎵 Download Audio",    callback_data=f"dl|audio|{token}")],
+            [InlineKeyboardButton("🔵 Stream Extractor",  callback_data=f"dl|stream|{token}"),
+             InlineKeyboardButton("🖼️ Thumbnail",          callback_data=f"dl|thumb|{token}")],
+            [InlineKeyboardButton("📊 Media Info",         callback_data=f"dl|info|{token}"),
+             InlineKeyboardButton("🟡 Convert",            callback_data=f"dl|convert|{token}")],
+            [InlineKeyboardButton("🔥 Hardsub",           callback_data=f"dl|hardsub|{token}"),
+             InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
         ])
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"dl|cancel|{token}")])
-    return InlineKeyboardMarkup(rows)
+    elif kind in ("magnet", "torrent"):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟢 Download",           callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("🔵 Stream Extractor",   callback_data=f"dl|magnet_stream|{token}")],
+            [InlineKeyboardButton("📊 Media Info",         callback_data=f"dl|info|{token}"),
+             InlineKeyboardButton("🔥 Hardsub",           callback_data=f"dl|hardsub|{token}")],
+            [InlineKeyboardButton("🟡 Convert",            callback_data=f"dl|convert|{token}"),
+             InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
+        ])
+    elif kind == "gdrive":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟢 Download",           callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("🎵 Audio Only",         callback_data=f"dl|audio|{token}")],
+            [InlineKeyboardButton("🔵 Stream Extractor",   callback_data=f"dl|stream|{token}"),
+             InlineKeyboardButton("🔥 Hardsub",           callback_data=f"dl|hardsub|{token}")],
+            [InlineKeyboardButton("🟡 Convert",            callback_data=f"dl|convert|{token}"),
+             InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
+        ])
+    elif kind == "mediafire":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟢 Download",           callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
+        ])
+    else:  # direct / http
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟢 Download File",      callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("🔵 Stream Extractor",   callback_data=f"dl|stream|{token}")],
+            [InlineKeyboardButton("📊 Media Info",         callback_data=f"dl|info|{token}"),
+             InlineKeyboardButton("🔥 Hardsub",           callback_data=f"dl|hardsub|{token}")],
+            [InlineKeyboardButton("🟡 Convert",            callback_data=f"dl|convert|{token}"),
+             InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
+        ])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1004,8 +1012,8 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
     except Exception:
         pass
     kb_rows += [
-        [InlineKeyboardButton("🧲 Download File", callback_data=f"dl|video|{token}")],
-        [InlineKeyboardButton("❌ Close",         callback_data=f"dl|cancel|{token}")],
+        [InlineKeyboardButton("🟢 Download File", callback_data=f"dl|video|{token}"),
+         InlineKeyboardButton("❌ Close",         callback_data=f"dl|cancel|{token}")],
     ]
     cleanup(tmp)
     await safe_edit(st, "\n".join(lines),
@@ -1338,7 +1346,7 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
             await safe_edit(st, "\n".join(lines),
                 parse_mode=enums.ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎬 Download Video", callback_data=f"dl|video|{token}"),
+                    [InlineKeyboardButton("🟢 Download Video", callback_data=f"dl|video|{token}"),
                      InlineKeyboardButton("🎵 Download Audio", callback_data=f"dl|audio|{token}")],
                     [InlineKeyboardButton("❌ Close",          callback_data=f"dl|cancel|{token}")],
                 ]))
@@ -1433,8 +1441,8 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
             lines.append("⚠️ <i>ffprobe could not read streams.</i>")
 
         kb = [
-            [InlineKeyboardButton("🎬 Download", callback_data=f"dl|video|{token}")],
-            [InlineKeyboardButton("❌ Close",    callback_data=f"dl|cancel|{token}")],
+            [InlineKeyboardButton("🟢 Download", callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("❌ Close",    callback_data=f"dl|cancel|{token}")],
         ]
         try:
             from services.telegraph import post_mediainfo
@@ -1465,6 +1473,6 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
         await safe_edit(st, f"❌ Could not probe: <code>{exc}</code>",
                         parse_mode=enums.ParseMode.HTML,
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🎬 Download", callback_data=f"dl|video|{token}")],
-                            [InlineKeyboardButton("❌ Close",    callback_data=f"dl|cancel|{token}")],
+                            [InlineKeyboardButton("🟢 Download", callback_data=f"dl|video|{token}"),
+                             InlineKeyboardButton("❌ Close",    callback_data=f"dl|cancel|{token}")],
                         ]))

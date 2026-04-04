@@ -159,8 +159,8 @@ async def create_archive(paths: list, out: str, fmt: str = "zip") -> None:
 
 def _arc_kb(key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📂 Extract All",       callback_data=f"arc|extract|{key}"),
-         InlineKeyboardButton("📦 Extract → Re-ZIP", callback_data=f"arc|rezip|{key}")],
+        [InlineKeyboardButton("🟢 Extract All",       callback_data=f"arc|extract|{key}"),
+         InlineKeyboardButton("🟡 Extract → Re-ZIP", callback_data=f"arc|rezip|{key}")],
         [InlineKeyboardButton("❌ Cancel",             callback_data=f"arc|cancel|{key}")],
     ])
 
@@ -276,9 +276,9 @@ async def cmd_archiveddone(client: Client, msg: Message):
     await msg.reply(
         f"📦 {len(state['files'])} file(s) collected. Choose format:",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗜 ZIP",    callback_data=f"carc|zip|{uid}"),
-             InlineKeyboardButton("🗜 7Z",     callback_data=f"carc|7z|{uid}"),
-             InlineKeyboardButton("🗜 TAR.GZ", callback_data=f"carc|tar.gz|{uid}")],
+            [InlineKeyboardButton("🟢 ZIP",    callback_data=f"carc|zip|{uid}"),
+             InlineKeyboardButton("🟡 7Z",     callback_data=f"carc|7z|{uid}"),
+             InlineKeyboardButton("🔵 TAR.GZ", callback_data=f"carc|tar.gz|{uid}")],
             [InlineKeyboardButton("❌ Cancel", callback_data=f"carc|cancel|{uid}")],
         ]),
     )

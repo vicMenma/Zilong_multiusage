@@ -238,7 +238,7 @@ def _manage_kb(channels: list[dict]) -> InlineKeyboardMarkup:
                 callback_data=f"ctpl|reset|{ch_id}",
             ),
         ])
-    rows.append([InlineKeyboardButton("✖ Close", callback_data="ctpl|close|0")])
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="ctpl|close|0")])
     return InlineKeyboardMarkup(rows)
 
 

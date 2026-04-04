@@ -103,7 +103,7 @@ def _build_text() -> str:
 
 _USAGE_KB = InlineKeyboardMarkup([[
     InlineKeyboardButton("🔄 Refresh", callback_data="usage|refresh"),
-    InlineKeyboardButton("✖ Close",   callback_data="usage|close"),
+    InlineKeyboardButton("❌ Close",   callback_data="usage|close"),
 ]])
 
 

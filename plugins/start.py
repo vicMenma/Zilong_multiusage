@@ -78,16 +78,16 @@ def _settings_kb(s: dict) -> InlineKeyboardMarkup:
 
     rows = [
         [InlineKeyboardButton(prefix_lbl,               callback_data="st_prefix"),
-         InlineKeyboardButton("🗑", callback_data="st_clrprefix")],
+         InlineKeyboardButton("🗑",                     callback_data="st_clrprefix")],
         [InlineKeyboardButton(suffix_lbl,               callback_data="st_suffix"),
-         InlineKeyboardButton("🗑", callback_data="st_clrsuffix")],
+         InlineKeyboardButton("🗑",                     callback_data="st_clrsuffix")],
         [InlineKeyboardButton(f"📤 Upload Mode: {mode}", callback_data="st_mode")],
         [InlineKeyboardButton("🖼️ Set Thumbnail",         callback_data="st_thumb"),
          InlineKeyboardButton("🗑️ Clear Thumbnail",       callback_data="st_clearthumb")],
         [InlineKeyboardButton(af_lbl,                    callback_data="st_af_toggle"),
          InlineKeyboardButton("⚙️ Channels",              callback_data="st_af_manage")],
-        [InlineKeyboardButton(f"✏️ Caption: {s.get('caption_style', 'Monospace')}", callback_data="st_caption")],
-        [InlineKeyboardButton(ps_lbl,                    callback_data="st_progress_style")],
+        [InlineKeyboardButton(f"✏️ Caption: {s.get('caption_style', 'Monospace')[:12]}", callback_data="st_caption"),
+         InlineKeyboardButton(ps_lbl,                    callback_data="st_progress_style")],
         [InlineKeyboardButton("❌ Close",                  callback_data="st_close")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -299,8 +299,8 @@ def _caption_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("Bold",       callback_data="st_cap|Bold")],
         [InlineKeyboardButton("Italic",     callback_data="st_cap|Italic"),
          InlineKeyboardButton("Plain",      callback_data="st_cap|Plain")],
-        [InlineKeyboardButton("Bold Italic",callback_data="st_cap|Bold Italic")],
-        [InlineKeyboardButton("🔙 Back",    callback_data="cb_settings")],
+        [InlineKeyboardButton("Bold Italic",callback_data="st_cap|Bold Italic"),
+         InlineKeyboardButton("🔙 Back",    callback_data="cb_settings")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -444,10 +444,12 @@ def _af_manage_kb(channels: list) -> InlineKeyboardMarkup:
         name = ch.get("name", str(ch["id"]))[:28]
         rows.append([
             InlineKeyboardButton(f"📢 {name}", callback_data=f"af_info|{i}"),
-            InlineKeyboardButton("🗑", callback_data=f"af_del|{i}"),
+            InlineKeyboardButton("🗑",         callback_data=f"af_del|{i}"),
         ])
-    rows.append([InlineKeyboardButton("➕ Add channel", callback_data="af_add")])
-    rows.append([InlineKeyboardButton("🔙 Back to Settings", callback_data="cb_settings")])
+    rows.append([
+        InlineKeyboardButton("➕ Add channel",       callback_data="af_add"),
+        InlineKeyboardButton("🔙 Back to Settings",  callback_data="cb_settings"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 

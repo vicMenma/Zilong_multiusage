@@ -530,11 +530,11 @@ async def _show_playlist(
         )])
     if total > 20:
         lines.append(f"\n<i>Showing first 20 of {total}</i>")
-    rows.append([InlineKeyboardButton(
-        "⬇️ Download All (best quality)",
-        callback_data=f"se_url|dl_all|{pl_tok}|{uid}",
-    )])
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"se_url|cancel||{uid}")])
+    rows.append([
+        InlineKeyboardButton("🟢 Download All (best quality)",
+                             callback_data=f"se_url|dl_all|{pl_tok}|{uid}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"se_url|cancel||{uid}"),
+    ])
 
     await safe_edit(st, "\n".join(l for l in lines if l),
         parse_mode=enums.ParseMode.HTML,
@@ -589,11 +589,13 @@ async def _show_url_streams(client, st, url, info, uid):
             label, callback_data=f"se_url|bucket|{url_tok}|{bucket}",
         )])
     if subs:
-        rows.append([InlineKeyboardButton(
-            f"💬 Subtitles ({len(subs)} lang)",
-            callback_data=f"se_url|subs|{url_tok}|{uid}",
-        )])
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"se_url|cancel||{uid}")])
+        rows.append([
+            InlineKeyboardButton(f"💬 Subtitles ({len(subs)} lang)",
+                                 callback_data=f"se_url|subs|{url_tok}|{uid}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"se_url|cancel||{uid}"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"se_url|cancel||{uid}")])
 
     await safe_edit(st, "\n".join(l for l in lines if l),
         parse_mode=enums.ParseMode.HTML,
@@ -656,9 +658,9 @@ async def extract_magnet_streams(client, st, magnet: str, uid: int) -> None:
         await safe_edit(st, "\n".join(lines),
             parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬇️ Download whole torrent",
-                                     callback_data=f"se_mag|all|{mg_tok}|{uid}")],
-                [InlineKeyboardButton("❌ Cancel", callback_data=f"se_mag|cancel||{uid}")],
+                [InlineKeyboardButton("🟢 Download whole torrent",
+                                     callback_data=f"se_mag|all|{mg_tok}|{uid}"),
+                 InlineKeyboardButton("❌ Cancel", callback_data=f"se_mag|cancel||{uid}")],
             ]))
         return
 
@@ -736,9 +738,9 @@ async def _show_magnet_files(client, st, magnet, name, files, uid):
     if len(files) > 20:
         lines.append(f"\n<i>Showing first 20 of {len(files)} files</i>")
     rows += [
-        [InlineKeyboardButton("⬇️ Download ALL files",
-                              callback_data=f"se_mag|all|{mg_tok}|{uid}")],
-        [InlineKeyboardButton("❌ Cancel",
+        [InlineKeyboardButton("🟢 Download ALL files",
+                              callback_data=f"se_mag|all|{mg_tok}|{uid}"),
+         InlineKeyboardButton("❌ Cancel",
                               callback_data=f"se_mag|cancel||{uid}")],
     ]
     await safe_edit(st, "\n".join(lines),
@@ -1168,8 +1170,8 @@ async def _show_bucket_formats(client, msg, url, url_tok, info, bucket, uid):
         )])
     rows += [
         [InlineKeyboardButton("🔙 Back to qualities",
-                              callback_data=f"se_url|back_main|{url_tok}|{uid}")],
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"se_url|cancel||{uid}")],
+                              callback_data=f"se_url|back_main|{url_tok}|{uid}"),
+         InlineKeyboardButton("❌ Cancel", callback_data=f"se_url|cancel||{uid}")],
     ]
     await safe_edit(msg, "\n".join(lines),
         parse_mode=enums.ParseMode.HTML,

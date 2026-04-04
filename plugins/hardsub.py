@@ -91,7 +91,7 @@ async def start_hardsub_for_url(
 def _more_or_done_kb(uid: int, count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add another video",      callback_data=f"hs_more|{uid}"),
-         InlineKeyboardButton(f"✅ Done ({count}) → Sub",  callback_data=f"hs_done|{uid}")],
+         InlineKeyboardButton(f"🟢 Done ({count}) → Sub",  callback_data=f"hs_done|{uid}")],
         [InlineKeyboardButton("❌ Cancel",                  callback_data=f"hs_cancel|{uid}")],
     ])
 

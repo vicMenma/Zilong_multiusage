@@ -51,7 +51,7 @@ def video_menu_kb(key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Media Info",        callback_data=f"vid|mediainfo|{key}"),
          InlineKeyboardButton("🖼️ Thumbnail",          callback_data=f"vid|thumb|{key}")],
-        [InlineKeyboardButton("📡 Stream Extractor",  callback_data=f"se_file|{key}"),
+        [InlineKeyboardButton("🔵 Stream Extractor",  callback_data=f"se_file|{key}"),
          InlineKeyboardButton("🗺️ Stream Mapper",      callback_data=f"vid|smap_menu|{key}")],
         [InlineKeyboardButton("🗑️ Stream Remover",    callback_data=f"vid|srem_menu|{key}"),
          InlineKeyboardButton("🔇 Remove Audio",      callback_data=f"vid|rm_audio|{key}")],
@@ -65,7 +65,7 @@ def video_menu_kb(key: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("📸 Screenshots",       callback_data=f"vid|shots|{key}")],
         [InlineKeyboardButton("🖊️ Manual Shots",      callback_data=f"vid|manual_shots|{key}"),
          InlineKeyboardButton("🎞️ Sample Clip",       callback_data=f"vid|sample|{key}")],
-        [InlineKeyboardButton("🔄 Convert",           callback_data=f"vid|convert|{key}"),
+        [InlineKeyboardButton("🟡 Convert",           callback_data=f"vid|convert|{key}"),
          InlineKeyboardButton("⚡ Optimize",          callback_data=f"vid|optimize|{key}")],
         [InlineKeyboardButton("🏷️ Metadata",          callback_data=f"vid|metadata|{key}"),
          InlineKeyboardButton("✏️ Rename",            callback_data=f"vid|rename|{key}")],
@@ -95,9 +95,9 @@ def _video_fmt_kb(key: str) -> InlineKeyboardMarkup:
 
 def _opt_kb(key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔥 High (CRF 18)",   callback_data=f"vopt|18|{key}"),
-         InlineKeyboardButton("⚡ Medium (CRF 23)", callback_data=f"vopt|23|{key}")],
-        [InlineKeyboardButton("💾 Low (CRF 28)",    callback_data=f"vopt|28|{key}"),
+        [InlineKeyboardButton("🟢 High (CRF 18)",   callback_data=f"vopt|18|{key}"),
+         InlineKeyboardButton("🟡 Medium (CRF 23)", callback_data=f"vopt|23|{key}")],
+        [InlineKeyboardButton("🟠 Low (CRF 28)",    callback_data=f"vopt|28|{key}"),
          InlineKeyboardButton("🔙 Back",            callback_data=f"vid|back|{key}")],
     ])
 

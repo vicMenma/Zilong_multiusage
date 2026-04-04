@@ -85,10 +85,8 @@ def _render_panel(uid: int) -> str:
 
 def _panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="ccs|refresh"),
-            InlineKeyboardButton("❌ Close",   callback_data="ccs|close"),
-        ],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="ccs|refresh"),
+         InlineKeyboardButton("❌ Close",   callback_data="ccs|close")],
     ])
 
 
