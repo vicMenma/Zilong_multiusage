@@ -267,7 +267,7 @@ def render_panel_kb(uid: int):
     else:
         rows.append([
             InlineKeyboardButton("🔄 Refresh", callback_data=f"panel|refresh|{uid}"),
-            InlineKeyboardButton("✖ Close",    callback_data=f"panel|close|{uid}"),
+            InlineKeyboardButton("❌ Close",    callback_data=f"panel|close|{uid}"),
         ])
 
     return InlineKeyboardMarkup(rows)
