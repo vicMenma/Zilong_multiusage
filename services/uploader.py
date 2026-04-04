@@ -124,7 +124,14 @@ async def _video_meta(path: str) -> dict:
 
 
 async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
-    """Extract a thumbnail at 20% of video duration."""
+    """Extract a thumbnail at 20% of video duration.
+
+    Thumbnail is capped at 320×320 (Telegram's hard limit for the `thumb`
+    parameter).  Sending a larger image causes Telegram's server to
+    downscale it with a low-quality algorithm, which produces the blurry
+    thumbnails seen in the chat.  Generating at the correct size means
+    Telegram uses it as-is → crisp result.
+    """
     out = path + "_zt.jpg"
     candidates = (
         [max(1, int(duration * p)) for p in (0.20, 0.30, 0.10)]
@@ -136,8 +143,11 @@ async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
                 "ffmpeg", "-y",
                 "-ss", str(ts), "-i", path,
                 "-frames:v", "1",
-                "-vf", "scale='min(1280,iw)':-2",
-                "-q:v", "1",
+                # Fit within 320×320 while keeping aspect ratio.
+                # force_original_aspect_ratio=decrease never upscales and
+                # never exceeds 320 on either axis → Telegram-safe.
+                "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+                "-q:v", "2",   # 1-31; 2 = near-lossless, ~40-80 KB at 320px
                 out,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
