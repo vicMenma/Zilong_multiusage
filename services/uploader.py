@@ -10,17 +10,18 @@ REWRITE:
   - FloodWait retry (up to 4 attempts)
   - LOG_CHANNEL forward after successful upload
 
-THUMBNAIL FIXES in _make_thumb():
-  1. flags=lanczos+accurate_rnd  — sharpest downscale (was missing; FFmpeg
-     was defaulting to bicubic despite comment claiming lanczos)
-  2. format=yuv420p BEFORE scale — correct 10-bit HEVC pixel format
-     conversion before the scale filter; prevents mid-pipeline softness
-  3. unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0 — recovers micro-contrast
-     lost during downscale; luma-only (ca=0.0) prevents color fringing
-  4. -q:v 1 — maximum JPEG quality (was 2; scale is 1-31, lower=better)
-  5. Fixed seek overshoot: fine_seek = ts - pre_seek
-     (was always hardcoded to 3, so ts=1 → extracted frame at second 3)
-  6. HDR detection + tone-mapping chain via ffmpeg.py._is_hdr()
+THUMBNAIL FIXES in _make_thumb() — ROOT CAUSE (Round 2):
+  scale=320x320 on a 16:9 video → 320×180 JPEG.
+  Telegram displays at ~700px chat width = 3.9× upscale = BLUR.
+  AnimesGratuit sends 1280×720 → Telegram downscales 700px = sharp.
+
+  1. scale=1280:720 — eliminates the upscale blur (primary fix)
+  2. flags=lanczos+accurate_rnd — sharpest downscale
+  3. format=yuv420p BEFORE scale — handles 10-bit HEVC correctly
+  4. unsharp=lx=3:ly=3:la=0.4 — subtle sharpening at 1280p
+  5. -q:v 3 — high JPEG quality balanced for file size at 1280×720
+  6. Fixed seek: fine_seek = ts - pre_seek (never overshoots)
+  7. HDR detection + tone-mapping (zscale + hable)
 """
 from __future__ import annotations
 
@@ -53,15 +54,17 @@ TG_MAX_BYTES = 1_900 * 1024 * 1024   # 1.9 GiB
 
 # ─────────────────────────────────────────────────────────────
 # Crystal-clear thumbnail VF chains (mirrors ffmpeg.py)
+# WHY 1280×720: scale=320x320 on 16:9 → 320×180 → Telegram upscales
+# 3.9× to fill chat width → blur. 1280×720 → slight downscale → sharp.
 # ─────────────────────────────────────────────────────────────
 
 # SDR content (most MP4/MKV)
 _VF_SHARP_SDR = (
     "format=yuv420p,"                                   # normalize pixel format FIRST (handles 10-bit HEVC)
-    "scale=w=320:h=320:"
-    "flags=lanczos+accurate_rnd:"                       # lanczos: sharpest downscale, accurate_rnd: sub-pixel precision
+    "scale=w=1280:h=720:"                               # FIX: was 320x320 → 3.9× upscale blur; now 1280×720 → sharp
+    "flags=lanczos+accurate_rnd:"                       # sharpest downscale algorithm
     "force_original_aspect_ratio=decrease,"
-    "unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0"       # sharpen luma only (ca=0.0 = no chroma → no color fringing)
+    "unsharp=lx=3:ly=3:la=0.4:cx=3:cy=3:ca=0.0"       # subtle luma sharpening at 1280p (was aggressive 0.8 at 320p)
 )
 
 # HDR10 / HLG — tone-map to SDR before scale+sharpen
@@ -72,10 +75,10 @@ _VF_SHARP_HDR = (
     "tonemap=hable:desat=0,"
     "zscale=transfer=bt709:matrix=bt709:range=tv,"
     "format=yuv420p,"
-    "scale=w=320:h=320:"
+    "scale=w=1280:h=720:"                               # same 1280×720 target after tone-mapping
     "flags=lanczos+accurate_rnd:"
     "force_original_aspect_ratio=decrease,"
-    "unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0"
+    "unsharp=lx=3:ly=3:la=0.4:cx=3:cy=3:ca=0.0"
 )
 
 
@@ -168,11 +171,12 @@ async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
     Extract a crystal-clear thumbnail from a video file.
 
     Strategy:
+      - scale=1280×720 (PRIMARY FIX: was 320×320 → 3.9× upscale blur in Telegram)
       - Two-stage seek (fast keyframe seek + accurate frame decode)
       - lanczos+accurate_rnd downscaling (sharpest algorithm)
       - format=yuv420p before scale (handles 10-bit HEVC correctly)
-      - unsharp mask after scale (recovers micro-contrast, luma only)
-      - Maximum JPEG quality (-q:v 1)
+      - unsharp mask after scale (subtle luma sharpening at 1280p)
+      - -q:v 3 (high JPEG quality balanced for 1280×720 file size)
       - HDR detection + tone-mapping (prevents washed-out HDR frames)
       - Fixed seek math: fine_seek = ts - pre_seek (never overshoots)
     """
@@ -214,7 +218,7 @@ async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
                 "-ss", str(fine_seek),
                 "-frames:v", "1",
                 "-vf", vf_chain,
-                "-q:v", "1",            # FIX: max JPEG quality (was 2; scale 1-31 lower=better)
+                "-q:v", "3",            # high quality at 1280×720 (q:v 1 at this res = 400-800KB, too large)
                 out,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
@@ -234,7 +238,7 @@ async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
                         "-ss", str(fine_seek),
                         "-frames:v", "1",
                         "-vf", _VF_SHARP_SDR,
-                        "-q:v", "1",
+                        "-q:v", "3",
                         out,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,

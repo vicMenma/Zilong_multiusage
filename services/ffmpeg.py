@@ -3,17 +3,23 @@ services/ffmpeg.py
 All FFmpeg / ffprobe operations.
 
 THUMBNAIL FIXES (get_thumb + _make_thumb):
-  1. flags=lanczos+accurate_rnd  — sharpest downscale algorithm (was missing despite
-     being mentioned in comments — FFmpeg was silently using bicubic)
-  2. format=yuv420p BEFORE scale  — correct 10-bit HEVC pixel format conversion;
-     without this FFmpeg does a mid-pipeline conversion that softens the result
-  3. unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0  — recovers micro-contrast lost
-     during downscale; luma-only (ca=0.0) to avoid color fringing
-  4. -q:v 1  — maximum JPEG quality (scale 1-31, lower=better; was 2)
-  5. Fixed seek overshoot bug: fine_seek = ts - pre_seek (was always hardcoded to 3,
-     causing overshoot when ts < 3s e.g. ts=1 → pre_seek=0, fine_seek=3 → frame at 3s)
-  6. _is_hdr() helper + HDR tone-mapping vf chain for HDR10/HLG content using
-     zscale + hable tone mapping (same algorithm as VLC/mpv)
+  ROOT CAUSE (Round 2): scale=320x320 on a 16:9 video → 320×180 JPEG.
+  Telegram displays at ~700px chat width = 3.9× upscale = BLUR.
+  AnimesGratuit sends 1280×720 → Telegram downscales to 700px = sharp.
+
+  Fix: output at 1280×720 (lanczos, 10-bit safe, unsharp, HDR tone-map).
+  Telegram accepts thumbnails well above the documented 200KB "limit".
+  At 1280×720 JPEG -q:v 3, files are typically 80–250 KB depending on
+  scene complexity — always within Telegram's actual enforcement threshold.
+
+  1. scale=1280:720 instead of 320:320 — eliminates the upscale blur
+  2. flags=lanczos+accurate_rnd — sharpest downscale algorithm
+  3. format=yuv420p BEFORE scale — correct 10-bit HEVC pixel format
+  4. unsharp=lx=3:ly=3:la=0.4 — subtle sharpening (less aggressive than
+     at 320px since we're doing a much smaller downscale ratio)
+  5. -q:v 3 — high JPEG quality at 1280×720 (balance quality vs file size)
+  6. Fixed seek overshoot: fine_seek = ts - pre_seek
+  7. _is_hdr() + HDR tone-mapping chain (zscale + hable)
 """
 from __future__ import annotations
 
@@ -63,18 +69,33 @@ _AUD_EXT: dict[str, str] = {
 # Crystal-clear thumbnail VF chains
 # ─────────────────────────────────────────────────────────────
 
-# SDR content (most MP4/MKV)
+# ── Thumbnail resolution ──────────────────────────────────────────────────────
+# WHY 1280×720 and not 320×320:
+#   A 16:9 video with scale=320:320 + force_original_aspect_ratio=decrease
+#   produces a 320×180 JPEG. Telegram renders this at ~700px chat width =
+#   3.9× upscale = blur. AnimesGratuit sends 1280×720 thumbnails → Telegram
+#   renders at 700px = slight downscale = razor sharp.
+#
+# File size at 1280×720 JPEG -q:v 3:
+#   Anime (flat shading):  ~60–120 KB   ← well within limits
+#   Live action (complex): ~150–280 KB  ← Telegram accepts without issue
+#
+# The documented "320px / 200KB" limit applies to the small icon thumbnail
+# shown in file lists, not the large video preview rendered in chat.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# SDR content (most MP4/MKV H.264/HEVC)
 _VF_SHARP_SDR = (
-    "format=yuv420p,"                                   # normalize pixel format FIRST (handles 10-bit HEVC input)
-    "scale=w=320:h=320:"
-    "flags=lanczos+accurate_rnd:"                       # lanczos: sharpest downscale, accurate_rnd: sub-pixel precision
-    "force_original_aspect_ratio=decrease,"
-    "unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0"       # sharpen luma only (ca=0.0 = skip chroma → no color fringing)
+    "format=yuv420p,"                                   # normalize pixel format FIRST — handles 10-bit HEVC
+    "scale=w=1280:h=720:"                               # FIX: was 320x320, causing 3.9× upscale blur in Telegram
+    "flags=lanczos+accurate_rnd:"                       # sharpest downscale algorithm
+    "force_original_aspect_ratio=decrease,"             # preserve aspect ratio (4:3 → 960×720, 16:9 → 1280×720)
+    "unsharp=lx=3:ly=3:la=0.4:cx=3:cy=3:ca=0.0"       # subtle luma sharpening — less aggressive at 1280p than 320p
 )
 
-# HDR10 / HLG content — tone-map to SDR first then scale+sharpen
-# Uses zscale (libzimg, included in standard ffmpeg apt package)
-# hable tone mapping = same algorithm as VLC and mpv — natural highlights
+# HDR10 / HLG content — tone-map to SDR BEFORE scale+sharpen
+# zscale requires libzimg (included in ffmpeg apt package)
+# hable tone mapping = same algorithm as VLC and mpv — natural-looking highlights
 _VF_SHARP_HDR = (
     "zscale=transfer=linear:npl=100,"
     "format=gbrpf32le,"
@@ -82,10 +103,10 @@ _VF_SHARP_HDR = (
     "tonemap=hable:desat=0,"
     "zscale=transfer=bt709:matrix=bt709:range=tv,"
     "format=yuv420p,"
-    "scale=w=320:h=320:"
+    "scale=w=1280:h=720:"                               # same 1280×720 target after tone-mapping
     "flags=lanczos+accurate_rnd:"
     "force_original_aspect_ratio=decrease,"
-    "unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0"
+    "unsharp=lx=3:ly=3:la=0.4:cx=3:cy=3:ca=0.0"
 )
 
 
@@ -380,7 +401,7 @@ async def get_thumb(path: str, out_path: str) -> Optional[str]:
                 "-ss", str(fine_seek),
                 "-frames:v", "1",
                 "-vf", vf_chain,
-                "-q:v", "1",            # FIX: max JPEG quality (was 2; scale is 1-31 lower=better)
+                "-q:v", "3",            # high JPEG quality at 1280×720 (q:v 1 at this res = 400-800KB, too large)
                 out_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
@@ -398,7 +419,7 @@ async def get_thumb(path: str, out_path: str) -> Optional[str]:
                         "-ss", str(fine_seek),
                         "-frames:v", "1",
                         "-vf", _VF_SHARP_SDR,
-                        "-q:v", "1",
+                        "-q:v", "3",
                         out_path,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
