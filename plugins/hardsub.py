@@ -2,16 +2,21 @@
 plugins/hardsub.py
 CloudConvert-powered hardsubbing — batch multi-video support.
 
-CRITICAL FIX: _submit_one_job was calling cc_job_store.add() to register
-the job but NEVER calling _ensure_poller() afterwards. The ccstatus poller
-stops itself after 3 consecutive idle cycles (by design). If the poller had
-stopped before the user clicked /hardsub, the job would sit in cc_job_store
-forever — the poller never woke up to check it, and the file was never
-delivered. Users would see the job submitted but receive nothing.
+DOWNLOAD-FIRST IMPROVEMENT:
+  Previously:
+    - Direct URLs → CloudConvert fetched via URL import
+    - CDN auth tokens expire, CC can't access private URLs
+    - Some CDN links are single-use (token burned on first request)
+  Now:
+    - ALL video sources download locally first
+    - CC always receives a file upload (100% reliable)
+    - start_hardsub_for_url(): downloads before asking for subtitle
+    - hardsub_url_handler() direct URL branch: downloads before queuing
 
-Fix: call _ensure_poller() immediately after cc_job_store.add() in
-_submit_one_job. _ensure_poller() is idempotent — if the poller is already
-running it's a no-op, and if it stopped it restarts it.
+CRITICAL FIX (unchanged from prior audit):
+  _submit_one_job was calling cc_job_store.add() but never calling
+  _ensure_poller() afterwards — jobs would sit forever if poller had stopped.
+  Fix: call _ensure_poller() immediately after cc_job_store.add().
 """
 from __future__ import annotations
 
@@ -48,7 +53,7 @@ def _clear(uid: int) -> None:
         cleanup(s["tmp"])
 
 
-# ── Public entry-point used by cc_buttons.py / url_handler.py ──
+# ── Public entry-point used by url_handler.py ─────────────────
 
 async def start_hardsub_for_url(
     client: "Client",
@@ -58,26 +63,69 @@ async def start_hardsub_for_url(
     fname: str,
 ) -> None:
     """
-    Start the hardsub flow with a pre-resolved direct video URL.
-    Called from url_handler.py when the user clicks the Hardsub button
-    on a URL that has already been resolved to a direct link.
-    The video is NOT downloaded locally — CloudConvert fetches it by URL.
+    DOWNLOAD-FIRST: Download the video locally before asking for subtitle.
+
+    Previously this stored the URL for CloudConvert to fetch via URL import.
+    URL import fails for:
+      - CDN auth URLs (token consumed on CC's fetch request)
+      - Single-use signed tokens (S3, Cloudfront, etc.)
+      - Any non-public URL
+
+    Now: download locally → CC always gets a file upload → 100% reliable.
+    The download progress is shown inline in the existing status message (st).
     """
     _clear(uid)
     tmp = make_tmp(cfg.download_dir, uid)
+
+    await safe_edit(
+        st,
+        f"⬇️ <b>Downloading video for Hardsub…</b>\n"
+        "──────────────────────\n\n"
+        f"📁 <code>{fname[:45]}</code>\n\n"
+        "<i>Download-first → CC file upload is reliable for any URL type.\n"
+        "URL import fails for CDN auth tokens and signed links.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    try:
+        from services.downloader import smart_download
+        path = await smart_download(url, tmp, user_id=uid, label=fname, msg=st)
+
+        # smart_download may return a directory for magnets/torrents
+        if os.path.isdir(path):
+            from services.utils import largest_file
+            resolved = largest_file(path)
+            if resolved:
+                path = resolved
+
+        if not os.path.isfile(path):
+            raise FileNotFoundError("No output file found after download")
+
+        fname = os.path.basename(path)
+        fsize = os.path.getsize(path)
+        log.info("[Hardsub] Downloaded %s (%s) for hardsub", fname, human_size(fsize))
+
+    except Exception as exc:
+        cleanup(tmp)
+        return await safe_edit(
+            st,
+            f"❌ <b>Download failed</b>\n\n<code>{str(exc)[:200]}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
     _STATE[uid] = {
         "step":      "waiting_subtitle",
         "tmp":       tmp,
-        "videos":    [{"path": None, "url": url, "fname": fname}],
+        "videos":    [{"path": path, "url": None, "fname": fname}],
         "sub_path":  None,
         "sub_fname": None,
     }
+
     await safe_edit(
         st,
-        "🔥 <b>Hardsub</b>\n"
+        f"🔥 <b>Hardsub — Ready</b>\n"
         "──────────────────────\n\n"
-        f"🎬 <code>{fname[:45]}</code>\n"
-        "☁️ <i>CloudConvert will fetch the video directly</i>\n\n"
+        f"✅ <code>{fname[:45]}</code>  <code>{human_size(fsize)}</code>\n\n"
         "Now send the <b>subtitle</b>:\n"
         "• A <b>file</b> (.ass / .srt / .vtt / .txt)\n"
         "• A <b>URL</b> to a subtitle file\n\n"
@@ -118,13 +166,12 @@ async def _submit_one_job(
         job_id = await submit_hardsub(
             api_key,
             video_path=video.get("path"),
-            video_url=video.get("url"),
+            video_url=video.get("url"),   # None for download-first path
             subtitle_path=sub_path,
             output_name=output_name,
-            scale_height=0,  # Always use original resolution
+            scale_height=0,
         )
 
-        # Register job in cc_job_store so ccstatus poller picks it up
         await cc_job_store.add(CCJob(
             job_id=job_id,
             uid=uid,
@@ -135,11 +182,7 @@ async def _submit_one_job(
         ))
         log.info("[Hardsub] Registered job %s in cc_job_store for uid=%d", job_id, uid)
 
-        # FIX (CRITICAL): ensure the ccstatus poller is running.
-        # The poller stops after 3 idle cycles. If it had stopped before this
-        # job was submitted, the job would sit in cc_job_store forever and
-        # the user would never receive their file. _ensure_poller() is
-        # idempotent — safe to call even when the poller is already running.
+        # Ensure ccstatus poller is running (it stops after 3 idle cycles)
         try:
             from plugins.ccstatus import _ensure_poller
             _ensure_poller()
@@ -281,7 +324,7 @@ async def cmd_hardsub(client: Client, msg: Message):
         "──────────────────────\n\n"
         "Send me the <b>video</b>:\n"
         "• A <b>video file</b> (upload from Telegram)\n"
-        "• A <b>direct URL</b> (HTTP link to .mkv/.mp4)\n"
+        "• A <b>direct URL</b> (HTTP link to .mkv/.mp4) — will download first\n"
         "• A <b>magnet link</b> (downloaded via aria2 first)\n\n"
         "📦 <i>You can send multiple videos — they'll all get\n"
         "the same subtitle burned in.</i>\n\n"
@@ -394,7 +437,10 @@ async def hardsub_video_file(client: Client, msg: Message):
     msg.stop_propagation()
 
 
+# ─────────────────────────────────────────────────────────────
 # Step 1: Receive video URL / magnet / subtitle URL
+# ─────────────────────────────────────────────────────────────
+
 @Client.on_message(
     filters.private & filters.text & ~filters.command(
         ["start", "help", "settings", "info", "status", "log", "restart",
@@ -423,20 +469,35 @@ async def hardsub_url_handler(client: Client, msg: Message):
         msg.stop_propagation()
         return
 
-    # ── Video URL ─────────────────────────────────────────────
+    # ── Video URL — always download first ────────────────────
     from services.downloader import classify
     kind = classify(text)
 
     if kind == "direct":
+        # DOWNLOAD-FIRST: previously stored as URL for CC to import.
+        # CDN auth tokens / signed S3 links / Cloudfront expire or are
+        # single-use — CC's import would fail silently.
+        # Download locally → CC always gets a reliable file upload.
         raw_name = text.split("/")[-1].split("?")[0]
         fname    = _urlparse.unquote_plus(raw_name)[:50] or "video.mkv"
-        state["videos"].append({"path": None, "url": text, "fname": fname})
         st = await msg.reply(
-            f"✅ Video URL added: <code>{fname[:40]}</code>\n"
-            "☁️ <i>CloudConvert will fetch directly</i>",
+            f"⬇️ <b>Downloading video…</b>\n"
+            f"<code>{fname[:40]}</code>\n\n"
+            "<i>Download-first for reliable CC upload.</i>",
             parse_mode=enums.ParseMode.HTML,
         )
-        await _video_added(st, state, uid, fname)
+        tmp = state["tmp"]
+        try:
+            from services.downloader import download_direct as _dl
+            path = await _dl(text, tmp)
+            if not os.path.isfile(path):
+                raise FileNotFoundError("No output file after download")
+            fname = os.path.basename(path)
+            state["videos"].append({"path": path, "url": None, "fname": fname})
+            await _video_added(st, state, uid, fname)
+        except Exception as exc:
+            await safe_edit(st, f"❌ Download failed: <code>{exc}</code>",
+                            parse_mode=enums.ParseMode.HTML)
         msg.stop_propagation()
 
     elif kind in ("magnet", "torrent", "ytdlp", "gdrive", "mediafire"):

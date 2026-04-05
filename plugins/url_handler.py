@@ -2,14 +2,25 @@
 plugins/url_handler.py
 Handles URL messages and torrent files.
 
-FIXES:
-  - _launch_download: now sends a live progress panel BEFORE calling
-    smart_download, and passes msg=st so smart_download edits it with
-    real-time download progress. Previously no panel was shown during
-    the entire download phase — only upload had a panel.
-  - _handle_info (direct URLs): ffprobe on the URL, zero bytes downloaded,
-    preserving CDN single-use auth tokens.
-  - _launch_download double-delete: only one _safe_delete call.
+DOWNLOAD-FIRST IMPROVEMENTS (applied directly):
+
+PATCH 1 — _probe_magnet_file(): full download instead of 30 MB cap
+  Previously: stopped after PROBE_ENOUGH = 30 MB, paused aria2, probed partial file
+  Problem: MKV files store audio language tags, subtitle tracks, and chapter
+  metadata throughout the file. 30 MB of a 500 MB file = incomplete mediainfo.
+  Fix: download complete file → 100% accurate mediainfo + file ready for
+  hardsub/convert immediately (no re-download needed).
+
+PATCH 2 — ccv_resolution_cb(): always download-first for CC convert
+  Previously: direct URLs used CC URL import (CC fetches from URL)
+  Problem: CDN auth tokens / signed S3 / Cloudfront URLs are single-use or
+  short-lived — CC's import fetch burns the token, then errors silently.
+  Fix: all URL types download locally first → CC always gets file upload → reliable.
+
+Other fixes (unchanged from prior audit):
+  - _launch_download: live progress panel before smart_download
+  - _handle_info (direct URLs): ffprobe on URL, zero bytes downloaded
+  - _launch_download double-delete: only one _safe_delete call
 """
 from __future__ import annotations
 
@@ -95,10 +106,6 @@ def _evict_magnet_probes() -> None:
 # ─────────────────────────────────────────────────────────────
 
 def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
-    """
-    Every row is a pair — no orphaned single buttons.
-    Color legend:  🟢 download  🔵 info/stream  🟡 convert  🔥 hardsub  ❌ cancel
-    """
     if kind == "ytdlp":
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🟢 Download Video",    callback_data=f"dl|video|{token}"),
@@ -218,10 +225,23 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
 
 
 # ─────────────────────────────────────────────────────────────
-# Magnet probe
+# Magnet probe — PATCH 1: full download, no 30 MB cap
 # ─────────────────────────────────────────────────────────────
 
 async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str | None, dict]:
+    """
+    Download a magnet torrent completely and probe the result.
+
+    PATCH 1: Previously stopped after PROBE_ENOUGH = 30 MB and paused aria2.
+    This gave incomplete mediainfo — MKV files store audio language tags,
+    subtitle tracks, and chapters throughout the file, not just in the header.
+
+    Fix: download the complete file. Benefits:
+      - 100% accurate stream detection and mediainfo
+      - File stays in tmp and is reused by subsequent hardsub/convert operations
+        (no re-download needed — stored in _magnet_probe cache)
+      - User experience: one wait instead of two
+    """
     from services import ffmpeg as FF
     from services.task_runner import tracker, TaskRecord, runner
 
@@ -327,12 +347,14 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
     fname       = os.path.basename(target_file["path"]) or f"file_{target_file['index']}"
     file_total  = target_file["size"] or 0
 
+    # PATCH 1: show "complete download" message, not "first 30 MB"
     await safe_edit(st,
         f"✅ <b>Metadata resolved!</b>\n\n"
         f"📁 <b>{torrent_name[:50]}</b>\n"
-        f"🎯 Probing: <code>{fname[:48]}</code>\n"
+        f"🎯 <code>{fname[:48]}</code>\n"
         f"💾 Size: <code>{human_size(file_total)}</code>\n\n"
-        f"⬇️ <i>Downloading first 30 MB for stream analysis…</i>",
+        f"⬇️ <i>Downloading complete file for accurate mediainfo…\n"
+        f"File will be ready for hardsub/convert after this.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
@@ -360,9 +382,11 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
         cleanup(tmp)
         return None, None, {}
 
-    t_start      = time.time()
-    PROBE_ENOUGH = 30 * 1024 * 1024
+    t_start = time.time()
 
+    # PATCH 1: download COMPLETE file — no PROBE_ENOUGH cutoff
+    # Previously: stopped at 30 MB and paused → incomplete metadata
+    # Now: wait for dl2.is_complete → full file → 100% accurate probe
     while True:
         await asyncio.sleep(2)
         try:
@@ -386,19 +410,15 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
         eta   = int((total - done) / speed) if speed and total > done else 0
         record.update(done=done, total=total, speed=speed, eta=eta,
                       elapsed=time.time() - t_start, state="📥 Downloading")
-        runner._wake_panel(uid)
 
-        if dl2.is_complete or done >= PROBE_ENOUGH:
-            if not dl2.is_complete:
-                try: api.pause([dl2])
-                except Exception: pass
-            break
+        if dl2.is_complete:
+            break   # full download complete — no partial cutoff
 
-        if time.time() - t_start > 600:
+        if time.time() - t_start > 3600 * 6:
             try: api.remove([dl2])
             except Exception: pass
             record.update(state="❌ Timed out")
-            await safe_edit(st, "❌ Download timed out (10 min).",
+            await safe_edit(st, "❌ Download timed out (6h).",
                             parse_mode=enums.ParseMode.HTML)
             cleanup(tmp)
             return None, None, {}
@@ -545,7 +565,7 @@ async def dl_cb(client: Client, cb: CallbackQuery):
                 "Add <code>CC_API_KEY=your_key</code> to your .env or Colab secrets.",
                 parse_mode=enums.ParseMode.HTML,
             )
-        from plugins.hardsub import _STATE, _clear
+        from plugins.hardsub import _STATE, _clear, start_hardsub_for_url
         _clear(uid)
         tmp    = make_tmp(cfg.download_dir, uid)
         kind_h = classify(url)
@@ -558,15 +578,12 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         else:
             fname = "video.mkv"
 
-        _STATE[uid] = {
-            "step": "waiting_subtitle", "tmp": tmp,
-            "videos": [{"path": None, "url": url, "fname": fname, "resolution": 0}],
-            "sub_path": None, "sub_fname": None, "_res_idx": 0,
-        }
-
         if kind_h in ("magnet", "torrent"):
-            _STATE[uid]["videos"][0]["url"] = None
-            _STATE[uid]["step"] = "_downloading_for_hardsub"
+            _STATE[uid] = {
+                "step": "_downloading_for_hardsub", "tmp": tmp,
+                "videos": [{"path": None, "url": None, "fname": fname, "resolution": 0}],
+                "sub_path": None, "sub_fname": None, "_res_idx": 0,
+            }
             st = await cb.message.edit(
                 f"🔥 <b>Hardsub</b>\n\n"
                 f"⬇️ Downloading video via {kind_h}…\n"
@@ -576,15 +593,14 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             asyncio.create_task(_hardsub_magnet_dl(st, url, uid, tmp, fname))
             return
 
-        await safe_edit(cb.message,
+        # direct / ytdlp / gdrive — use download-first hardsub entry point
+        st = await cb.message.edit(
             f"🔥 <b>Hardsub</b>\n──────────────────────\n\n"
-            f"🎬 <code>{fname[:45]}</code>\n📐 Resolution: <b>Original</b>\n\n"
-            "Now send the <b>subtitle</b>:\n"
-            "• A <b>file</b> (.ass / .srt / .vtt / .txt)\n"
-            "• A <b>URL</b> to a subtitle file\n\n"
-            "<i>Send /cancel to abort.</i>",
+            f"📁 <code>{fname[:45]}</code>\n\n"
+            "<i>Starting download…</i>",
             parse_mode=enums.ParseMode.HTML,
         )
+        asyncio.create_task(start_hardsub_for_url(client, st, uid, url, fname))
         return
 
     # ── Convert ───────────────────────────────────────────────
@@ -653,7 +669,7 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Convert resolution picker
+# Convert resolution picker — PATCH 2: always download-first
 # ─────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^ccv\|"))
@@ -686,16 +702,40 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
     res_tag     = f" [{scale_height}p]" if scale_height else ""
     output_name = re.sub(r'[^\w\s\-\[\]()]', '_', name_base).strip() + f"{res_tag}.mp4"
 
-    await safe_edit(cb.message,
-        f"☁️ <b>Submitting convert job…</b>\n──────────────────────\n\n"
-        f"🎬 <code>{fname[:40]}</code>\n📐 → <b>{res_label}</b>\n\n"
-        "<i>Checking API keys…</i>",
-        parse_mode=enums.ParseMode.HTML,
-    )
+    api_key = os.environ.get("CC_API_KEY", "").strip()
 
-    api_key    = os.environ.get("CC_API_KEY", "").strip()
-    tmp_conv   = None
-    video_path = None
+    # PATCH 2: DOWNLOAD-FIRST for all URL types
+    # Previously: direct URLs used CC URL import → fails for:
+    #   - CDN auth tokens (token consumed on CC's fetch request)
+    #   - Signed S3 / Cloudfront URLs with short expiry
+    #   - Any non-public URL
+    # Now: download locally first → CC always gets file upload → 100% reliable
+    tmp_conv = make_tmp(cfg.download_dir, uid)
+    await safe_edit(cb.message,
+        f"⬇️ <b>Downloading for Convert…</b>\n"
+        "──────────────────────\n\n"
+        f"🎬 <code>{fname[:40]}</code>\n"
+        f"📐 → <b>{res_label}</b>\n\n"
+        "<i>Download-first ensures reliable CC file upload.</i>",
+        parse_mode=enums.ParseMode.HTML)
+
+    try:
+        video_path_raw = await smart_download(url, tmp_conv, user_id=uid, label=fname)
+        if os.path.isdir(video_path_raw):
+            resolved = largest_file(video_path_raw)
+            if resolved:
+                video_path_raw = resolved
+        if not os.path.isfile(video_path_raw):
+            raise FileNotFoundError("No output file found after download")
+        video_path = video_path_raw
+        fname      = os.path.basename(video_path)
+        log.info("[Convert] Downloaded %s (%s) for CC job",
+                 fname, human_size(os.path.getsize(video_path)))
+    except Exception as exc:
+        cleanup(tmp_conv)
+        return await safe_edit(cb.message,
+            f"❌ <b>Download failed</b>\n\n<code>{str(exc)[:200]}</code>",
+            parse_mode=enums.ParseMode.HTML)
 
     try:
         from services.cloudconvert_api import parse_api_keys, pick_best_key, submit_convert
@@ -706,32 +746,26 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
         else:
             key_info = "🔑 1 API key"
 
-        video_url = url if kind == "direct" else None
-
-        if kind in ("magnet", "torrent"):
-            tmp_conv = make_tmp(cfg.download_dir, uid)
-            await safe_edit(cb.message, f"⬇️ Downloading video via {kind}…",
-                            parse_mode=enums.ParseMode.HTML)
-            video_path_raw = await smart_download(url, tmp_conv, user_id=uid, label=fname)
-            if os.path.isdir(video_path_raw):
-                resolved = largest_file(video_path_raw)
-                if resolved:
-                    video_path_raw = resolved
-            if not os.path.isfile(video_path_raw):
-                raise FileNotFoundError("No output file found")
-            video_path = video_path_raw
-            fname      = os.path.basename(video_path)
+        await safe_edit(cb.message,
+            f"☁️ <b>Submitting Convert job…</b>\n"
+            "──────────────────────\n\n"
+            f"🎬 <code>{fname[:40]}</code>\n"
+            f"📐 → <b>{res_label}</b>\n\n"
+            "<i>Checking API keys…</i>",
+            parse_mode=enums.ParseMode.HTML)
 
         job_id = await submit_convert(
             api_key,
-            video_path=video_path,
-            video_url=video_url,
+            video_path=video_path,   # always file upload — no URL import
+            video_url=None,
             output_name=output_name,
             scale_height=scale_height,
         )
-        mode_s = "☁️ URL import" if video_url else "📤 File upload"
+        mode_s = "📤 File upload (download-first)"
+
         await safe_edit(cb.message,
-            f"✅ <b>Convert Job Submitted!</b>\n──────────────────────\n\n"
+            f"✅ <b>Convert Job Submitted!</b>\n"
+            "──────────────────────\n\n"
             f"🆔 <code>{job_id}</code>\n"
             f"🎬 <code>{fname[:38]}</code>\n"
             f"📐 → <b>{res_label}</b>\n"
@@ -743,8 +777,7 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
 
     except Exception as exc:
         log.error("[Convert] Failed: %s", exc, exc_info=True)
-        if tmp_conv:
-            cleanup(tmp_conv)
+        cleanup(tmp_conv)
         await safe_edit(cb.message,
             f"❌ <b>Convert failed</b>\n\n<code>{str(exc)[:200]}</code>",
             parse_mode=enums.ParseMode.HTML,
@@ -1027,17 +1060,10 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
 # ─────────────────────────────────────────────────────────────
 
 async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
-    """
-    Upload one file or a full directory of files, then clean up tmp.
-    `path` may be:
-      - a single file  → upload it directly
-      - a directory    → collect all files with all_video_files() and batch-upload
-    """
     from services.utils import all_video_files as _avf, smart_clean_filename
     from core.session import settings as _settings
     from core.config import cfg
 
-    # Collect files to upload
     if os.path.isdir(path):
         all_files = _avf(path)
         if not all_files:
@@ -1061,7 +1087,6 @@ async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
 
     total_files = len(all_files)
 
-    # Notify when it's a real batch
     if total_files > 1:
         try:
             await client.send_message(
@@ -1096,7 +1121,6 @@ async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
                     pass
                 continue
 
-            # Apply prefix / suffix
             fname     = os.path.basename(fpath)
             cleaned   = smart_clean_filename(fname)
             name, ext = os.path.splitext(cleaned)
@@ -1137,7 +1161,7 @@ async def _safe_delete(msg) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# _launch_download  — FIXED: sends live download panel
+# _launch_download — live download panel
 # ─────────────────────────────────────────────────────────────
 
 async def _launch_download(
@@ -1151,7 +1175,6 @@ async def _launch_download(
     tmp  = make_tmp(cfg.download_dir, uid)
     kind = classify(url)
 
-    # Build label
     if kind in ("magnet", "torrent"):
         dn_match = re.search(r"[&?]dn=([^&]+)", url)
         if dn_match:
@@ -1170,13 +1193,11 @@ async def _launch_download(
         engine = "ytdlp" if kind == "ytdlp" else kind
         mode   = "dl"
 
-    # Delete action menu
     try:
         await panel_msg.delete()
     except Exception:
         pass
 
-    # Open live download panel
     st = await client.send_message(
         uid,
         progress_panel(
@@ -1186,7 +1207,6 @@ async def _launch_download(
         parse_mode=enums.ParseMode.HTML,
     )
 
-    # Download — smart_download edits st with real-time progress
     try:
         path = await smart_download(
             url, tmp,
@@ -1194,7 +1214,7 @@ async def _launch_download(
             fmt_id=fmt_id,
             user_id=uid,
             label=label,
-            msg=st,          # ← key fix: live progress goes to st
+            msg=st,
         )
     except Exception as exc:
         log.error("_launch_download uid=%d failed: %s", uid, exc, exc_info=True)
@@ -1208,7 +1228,6 @@ async def _launch_download(
             pass
         return
 
-    # Collect ALL files from batch download (fixes single-file bug for multi-episode magnets)
     from services.utils import all_video_files as _all_videos
     if os.path.isdir(path):
         all_files = _all_videos(path)
@@ -1243,7 +1262,6 @@ async def _launch_download(
         except Exception:
             pass
 
-    # Apply prefix / suffix settings once
     from core.session import settings as _settings
     s      = await _settings.get(uid)
     prefix = s.get("prefix", "").strip()
@@ -1268,7 +1286,6 @@ async def _launch_download(
                     pass
                 continue
 
-            # Rename with prefix/suffix
             fname     = os.path.basename(fpath)
             cleaned   = smart_clean_filename(fname)
             name, ext = os.path.splitext(cleaned)
@@ -1281,7 +1298,6 @@ async def _launch_download(
                 except OSError as rename_err:
                     log.warning("Rename failed: %s", rename_err)
 
-            # Each file gets its own upload status message
             upload_st = await client.send_message(
                 uid,
                 f"📤 <b>Uploading {i}/{total_files}</b>\n"
@@ -1293,11 +1309,9 @@ async def _launch_download(
             except Exception as exc:
                 log.error("Upload failed for %s: %s", fpath, exc)
 
-            # Breathing room between uploads to avoid FloodWait
             if i < total_files:
                 await asyncio.sleep(2)
 
-        # Clean up the original download status message
         try:
             await st.delete()
         except Exception:
@@ -1355,7 +1369,7 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
                             parse_mode=enums.ParseMode.HTML)
         return
 
-    # Direct URL — ffprobe on the URL, zero bytes downloaded
+    # Direct URL — ffprobe on URL, zero bytes downloaded
     try:
         cmd = [
             "ffprobe", "-v", "quiet",

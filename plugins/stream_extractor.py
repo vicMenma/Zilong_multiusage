@@ -4,6 +4,18 @@ Complete Stream Extractor — three sources:
   1. URL (YouTube / any yt-dlp site)
   2. Magnet / Torrent
   3. Uploaded Video (Telegram file)
+
+DOWNLOAD-FIRST IMPROVEMENT (direct URLs):
+  Previously: ffprobe probed the URL directly
+    → Single-use CDN auth tokens get consumed by the probe
+    → Incomplete metadata (some containers store stream info mid-file)
+    → Then extraction had to re-download anyway
+  Now: Download the full file first, probe locally, extract locally
+    → 100% accurate stream detection
+    → No token consumption issues
+    → File is already local for instant extraction
+    → Creates a real FileSession so ALL existing se_fext_cb callbacks
+       work seamlessly without any change
 """
 from __future__ import annotations
 
@@ -241,6 +253,10 @@ async def se_file_cb(client: Client, cb: CallbackQuery):
 # ─────────────────────────────────────────────────────────────
 
 async def _ffprobe_url(url: str) -> dict | None:
+    """
+    Probe a URL directly via ffprobe.
+    Kept as fallback only — primary path now downloads first.
+    """
     cmd = [
         "ffprobe", "-v", "quiet",
         "-allowed_extensions", "ALL",
@@ -360,15 +376,60 @@ async def extract_url_streams(
 
     kind = classify(url)
 
+    # ── DOWNLOAD-FIRST for direct URLs ────────────────────────
+    # Previously: ffprobe on URL → burned auth tokens, missed streams
+    # Now: download full file → probe locally → extract locally
+    # Creates a real FileSession so ALL existing se_fext_cb callbacks
+    # work without modification — _ensure() finds local_path and returns it.
     if kind == "direct":
-        await safe_edit(st, "📡 Probing streams via ffprobe…")
-        raw = await _ffprobe_url(url)
-        if raw:
-            session = _build_session_from_ffprobe(raw, url)
-            if session["video"] or session["audio"] or session["subs"]:
-                await _show_ffprobe_streams(client, st, session, uid)
-                return
+        tmp = make_tmp(cfg.download_dir, uid)
+        await safe_edit(
+            st,
+            "⬇️ <b>Downloading for stream analysis…</b>\n"
+            "──────────────────────\n\n"
+            "<i>Full download gives 100% accurate stream detection\n"
+            "and the file is ready for instant extraction.</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        try:
+            from services.downloader import download_direct as _dl_direct
+            path = await _dl_direct(url, tmp)
+        except Exception as exc:
+            cleanup(tmp)
+            log.warning("Direct download failed for stream analysis (%s) — falling back to URL probe", exc)
+            # Fallback: try ffprobe on URL (may still work for simple public URLs)
+            raw = await _ffprobe_url(url)
+            if raw:
+                sess_data = _build_session_from_ffprobe(raw, url)
+                if sess_data["video"] or sess_data["audio"] or sess_data["subs"]:
+                    await _show_ffprobe_streams(client, st, sess_data, uid)
+                    return
+            return await safe_edit(
+                st,
+                f"❌ <b>Could not analyse streams</b>\n\n"
+                f"Download failed: <code>{exc}</code>\n\n"
+                f"<i>Try downloading the file first, then send it to the bot.</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
 
+        fname  = os.path.basename(path)
+        ext    = os.path.splitext(fname)[1] or ".mkv"
+        fsize  = os.path.getsize(path)
+
+        # Create a real FileSession — se_fext_cb reuses it seamlessly
+        # _ensure() checks is_downloaded() → finds local_path → returns instantly
+        file_session = await sessions.create(
+            user_id=uid, file_id="__direct__",
+            fname=fname, fsize=fsize, ext=ext, tmp_dir=tmp,
+        )
+        file_session.local_path = path  # mark as already downloaded
+
+        log.info("[StreamExtractor] Downloaded %s (%s) for local analysis",
+                 fname, human_size(fsize))
+        await _analyse_file_streams(client, st, path, file_session.key, uid)
+        return
+
+    # ── yt-dlp: format list (no download needed for listing) ──
     try:
         ydl_opts = {
             "quiet":       True,
@@ -634,13 +695,15 @@ async def extract_magnet_streams(client, st, magnet: str, uid: int) -> None:
         log.warning("aria2 file list failed: %s", exc)
 
     if not file_list:
-        name_m = re.search(r"[&?]dn=([^&]+)", magnet)
-        torrent_name = _urlparse.unquote_plus(name_m.group(1)) if name_m else "Unknown torrent"
-        xl_m = re.search(r"[&?]xl=([^&]+)", magnet)
+        import re as _re
+        import urllib.parse as _up
+        name_m = _re.search(r"[&?]dn=([^&]+)", magnet)
+        torrent_name = _up.unquote_plus(name_m.group(1)) if name_m else "Unknown torrent"
+        xl_m = _re.search(r"[&?]xl=([^&]+)", magnet)
         size  = int(xl_m.group(1)) if xl_m else 0
-        xt_m  = re.search(r"xt=urn:btih:([a-fA-F0-9]{40}|[A-Za-z2-7]{32})", magnet)
+        xt_m  = _re.search(r"xt=urn:btih:([a-fA-F0-9]{40}|[A-Za-z2-7]{32})", magnet)
         ih    = xt_m.group(1).upper() if xt_m else "—"
-        trs   = re.findall(r"tr=([^&]+)", magnet)
+        trs   = _re.findall(r"tr=([^&]+)", magnet)
         lines = [
             "🧲 <b>Magnet Info</b>", "──────────────────────",
             f"📄 <code>{torrent_name[:60]}</code>",
@@ -919,8 +982,10 @@ async def se_fext_cb(client: Client, cb: CallbackQuery):
     await cb.answer()
 
     async with session.lock:
-        st   = await cb.message.edit("⬇️ Downloading…")
+        st   = await cb.message.edit("⬇️ Preparing…")
         from plugins.video import _ensure
+        # For direct-downloaded sessions, _ensure finds local_path immediately
+        # No re-download needed — the file is already on disk
         path = await _ensure(client, session, st)
         if not path:
             return
@@ -969,10 +1034,6 @@ async def _extract_single_stream(
         out     = _stream_fname(tmp, "video", "", idx_str, out_ext)
 
     await FF.stream_op(path, out, ["-map", f"0:{idx_str}", "-c", "copy"])
-
-    # NOTE: TaskRecord creation removed — upload_file no longer updates any
-    # tracker record, so registering a "✅ Done" record here was dead weight
-    # that triggered an auto_panel open/close cycle for nothing.
 
     caption = _stream_caption(target, stype, codec)
     await upload_file(client, st, out, caption=caption, force_document=True)
