@@ -9,6 +9,18 @@ REWRITE:
   - Auto-split for files > 1.9 GB
   - FloodWait retry (up to 4 attempts)
   - LOG_CHANNEL forward after successful upload
+
+THUMBNAIL FIXES in _make_thumb():
+  1. flags=lanczos+accurate_rnd  — sharpest downscale (was missing; FFmpeg
+     was defaulting to bicubic despite comment claiming lanczos)
+  2. format=yuv420p BEFORE scale — correct 10-bit HEVC pixel format
+     conversion before the scale filter; prevents mid-pipeline softness
+  3. unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0 — recovers micro-contrast
+     lost during downscale; luma-only (ca=0.0) prevents color fringing
+  4. -q:v 1 — maximum JPEG quality (was 2; scale is 1-31, lower=better)
+  5. Fixed seek overshoot: fine_seek = ts - pre_seek
+     (was always hardcoded to 3, so ts=1 → extracted frame at second 3)
+  6. HDR detection + tone-mapping chain via ffmpeg.py._is_hdr()
 """
 from __future__ import annotations
 
@@ -19,6 +31,7 @@ import os
 import time
 
 from pyrogram import Client, enums
+from pyrogram.errors import FloodWait
 
 from core.config import cfg
 from core.session import settings
@@ -37,6 +50,33 @@ _VIDEO_EXTS = frozenset({
 _PHOTO_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"})
 
 TG_MAX_BYTES = 1_900 * 1024 * 1024   # 1.9 GiB
+
+# ─────────────────────────────────────────────────────────────
+# Crystal-clear thumbnail VF chains (mirrors ffmpeg.py)
+# ─────────────────────────────────────────────────────────────
+
+# SDR content (most MP4/MKV)
+_VF_SHARP_SDR = (
+    "format=yuv420p,"                                   # normalize pixel format FIRST (handles 10-bit HEVC)
+    "scale=w=320:h=320:"
+    "flags=lanczos+accurate_rnd:"                       # lanczos: sharpest downscale, accurate_rnd: sub-pixel precision
+    "force_original_aspect_ratio=decrease,"
+    "unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0"       # sharpen luma only (ca=0.0 = no chroma → no color fringing)
+)
+
+# HDR10 / HLG — tone-map to SDR before scale+sharpen
+_VF_SHARP_HDR = (
+    "zscale=transfer=linear:npl=100,"
+    "format=gbrpf32le,"
+    "zscale=primaries=bt709,"
+    "tonemap=hable:desat=0,"
+    "zscale=transfer=bt709:matrix=bt709:range=tv,"
+    "format=yuv420p,"
+    "scale=w=320:h=320:"
+    "flags=lanczos+accurate_rnd:"
+    "force_original_aspect_ratio=decrease,"
+    "unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0"
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -124,48 +164,89 @@ async def _video_meta(path: str) -> dict:
 
 
 async def _make_thumb(path: str, duration: int) -> tuple[str | None, bool]:
-    """Extract a crisp thumbnail from a video file.
+    """
+    Extract a crystal-clear thumbnail from a video file.
 
-    Two-stage seek strategy:
-      1. Fast pre-seek (-ss before -i) jumps quickly to the keyframe
-         just before the target timestamp.
-      2. Accurate post-seek (-ss after -i) then decodes frame-accurately
-         to the exact target, avoiding the blurry partial-decode frames
-         that result from stopping at a keyframe that doesn't match the
-         requested timestamp.
-
-    Thumbnail is capped at 320×320 — Telegram's hard limit for the
-    `thumb` parameter.  Larger images get downscaled by Telegram's server
-    using a cheap algorithm (blurry result).  At 320px ffmpeg uses its
-    own Lanczos scaler → crisp output.
+    Strategy:
+      - Two-stage seek (fast keyframe seek + accurate frame decode)
+      - lanczos+accurate_rnd downscaling (sharpest algorithm)
+      - format=yuv420p before scale (handles 10-bit HEVC correctly)
+      - unsharp mask after scale (recovers micro-contrast, luma only)
+      - Maximum JPEG quality (-q:v 1)
+      - HDR detection + tone-mapping (prevents washed-out HDR frames)
+      - Fixed seek math: fine_seek = ts - pre_seek (never overshoots)
     """
     out = path + "_zt.jpg"
+
     candidates = (
         [max(1, int(duration * p)) for p in (0.20, 0.30, 0.10)]
         if duration > 5 else [1]
     )
+
+    # Detect HDR once — avoids re-probing on every candidate timestamp
+    hdr = False
+    try:
+        from services.ffmpeg import _is_hdr
+        hdr = await _is_hdr(path)
+        if hdr:
+            log.debug("_make_thumb: HDR detected for %s — using tone-map chain",
+                      os.path.basename(path))
+    except Exception:
+        pass  # _is_hdr failure is non-fatal — fall back to SDR chain
+
+    vf_chain = _VF_SHARP_HDR if hdr else _VF_SHARP_SDR
+
     for ts in candidates:
+        # FIX: correct two-stage seek math
+        # Old code had fine_seek hardcoded to 3, causing:
+        #   ts=1 → pre_seek=0, fine_seek=3 → extracted frame at second 3 (wrong!)
+        # New code: fine_seek = ts - pre_seek, always in [0, 3], never overshoots
+        pre_seek  = max(0, ts - 3)
+        fine_seek = ts - pre_seek   # = min(3, ts)
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y",
-                # Stage 1: fast keyframe seek (within a few seconds of ts)
-                "-ss", str(max(0, ts - 3)),
+                # Stage 1: fast keyframe seek (lands within a few frames of ts)
+                "-ss", str(pre_seek),
                 "-i", path,
-                # Stage 2: accurate frame-level seek from that keyframe
-                "-ss", "3",
+                # Stage 2: accurate frame-level decode from that keyframe
+                "-ss", str(fine_seek),
                 "-frames:v", "1",
-                # Fit within 320×320, maintain aspect ratio, never upscale
-                "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
-                "-q:v", "2",   # JPEG quality 2/31 — near-lossless at 320px
+                "-vf", vf_chain,
+                "-q:v", "1",            # FIX: max JPEG quality (was 2; scale 1-31 lower=better)
                 out,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
-            await proc.communicate()
+            _, stderr = await proc.communicate()
+
+            # HDR fallback: if zscale/libzimg not available, retry with SDR chain
+            if hdr and (not os.path.exists(out) or os.path.getsize(out) < 1000):
+                err_txt = stderr.decode(errors="replace")
+                if "zscale" in err_txt or "libzimg" in err_txt:
+                    log.warning(
+                        "_make_thumb: zscale unavailable — falling back to SDR chain"
+                    )
+                    proc2 = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-y",
+                        "-ss", str(pre_seek), "-i", path,
+                        "-ss", str(fine_seek),
+                        "-frames:v", "1",
+                        "-vf", _VF_SHARP_SDR,
+                        "-q:v", "1",
+                        out,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc2.communicate()
+
             if os.path.exists(out) and os.path.getsize(out) > 1000:
                 return out, True
+
         except Exception as exc:
             log.debug("_make_thumb ts=%d: %s", ts, exc)
+
     return None, False
 
 
@@ -351,6 +432,10 @@ async def _upload_single(
                 )
             error = None
             break
+        except FloodWait as fw:
+            log.warning("FloodWait %ds on upload (attempt %d/4)", fw.value, attempt + 1)
+            await asyncio.sleep(fw.value + 2)
+            continue
         except Exception as exc:
             error = exc
             break
@@ -360,7 +445,6 @@ async def _upload_single(
 
     try:
         if error is None:
-            # Progress message served its purpose — delete it cleanly
             await status_msg.delete()
         else:
             await status_msg.edit(
@@ -399,7 +483,15 @@ async def _upload_single(
                     if not ch_id:
                         continue
                     try:
-                        await sent.copy(ch_id)
+                        from plugins.caption_templates import (
+                            build_caption, has_custom_template,
+                        )
+                        if has_custom_template(ch_id):
+                            cap_fwd = await build_caption(path, ch_id)
+                            await sent.copy(ch_id, caption=cap_fwd,
+                                            parse_mode=enums.ParseMode.HTML)
+                        else:
+                            await sent.copy(ch_id)
                     except Exception as fwd_exc:
                         log.warning("Auto-forward to %s failed: %s", ch_id, fwd_exc)
         except Exception as af_exc:
@@ -479,7 +571,7 @@ async def upload_file(
                 f"<code>{original_fname}</code>\n"
                 f"📦 <b>Part {i}/{total_parts}</b>  <code>{human_size(part_size)}</code>"
             )
-            await asyncio.sleep(1.5)   # avoid burst of send_message calls
+            await asyncio.sleep(1.5)
             ph = await client.send_message(
                 chat_id,
                 f"📤 Part {i}/{total_parts}…\n<code>{os.path.basename(pp)}</code>",

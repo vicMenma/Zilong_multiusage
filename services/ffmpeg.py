@@ -1,6 +1,19 @@
 """
 services/ffmpeg.py
 All FFmpeg / ffprobe operations.
+
+THUMBNAIL FIXES (get_thumb + _make_thumb):
+  1. flags=lanczos+accurate_rnd  — sharpest downscale algorithm (was missing despite
+     being mentioned in comments — FFmpeg was silently using bicubic)
+  2. format=yuv420p BEFORE scale  — correct 10-bit HEVC pixel format conversion;
+     without this FFmpeg does a mid-pipeline conversion that softens the result
+  3. unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0  — recovers micro-contrast lost
+     during downscale; luma-only (ca=0.0) to avoid color fringing
+  4. -q:v 1  — maximum JPEG quality (scale 1-31, lower=better; was 2)
+  5. Fixed seek overshoot bug: fine_seek = ts - pre_seek (was always hardcoded to 3,
+     causing overshoot when ts < 3s e.g. ts=1 → pre_seek=0, fine_seek=3 → frame at 3s)
+  6. _is_hdr() helper + HDR tone-mapping vf chain for HDR10/HLG content using
+     zscale + hable tone mapping (same algorithm as VLC/mpv)
 """
 from __future__ import annotations
 
@@ -45,6 +58,35 @@ _AUD_EXT: dict[str, str] = {
     "pcm_s16le": ".wav",
     "pcm_s24le": ".wav",
 }
+
+# ─────────────────────────────────────────────────────────────
+# Crystal-clear thumbnail VF chains
+# ─────────────────────────────────────────────────────────────
+
+# SDR content (most MP4/MKV)
+_VF_SHARP_SDR = (
+    "format=yuv420p,"                                   # normalize pixel format FIRST (handles 10-bit HEVC input)
+    "scale=w=320:h=320:"
+    "flags=lanczos+accurate_rnd:"                       # lanczos: sharpest downscale, accurate_rnd: sub-pixel precision
+    "force_original_aspect_ratio=decrease,"
+    "unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0"       # sharpen luma only (ca=0.0 = skip chroma → no color fringing)
+)
+
+# HDR10 / HLG content — tone-map to SDR first then scale+sharpen
+# Uses zscale (libzimg, included in standard ffmpeg apt package)
+# hable tone mapping = same algorithm as VLC and mpv — natural highlights
+_VF_SHARP_HDR = (
+    "zscale=transfer=linear:npl=100,"
+    "format=gbrpf32le,"
+    "zscale=primaries=bt709,"
+    "tonemap=hable:desat=0,"
+    "zscale=transfer=bt709:matrix=bt709:range=tv,"
+    "format=yuv420p,"
+    "scale=w=320:h=320:"
+    "flags=lanczos+accurate_rnd:"
+    "force_original_aspect_ratio=decrease,"
+    "unsharp=lx=5:ly=5:la=0.8:cx=5:cy=5:ca=0.0"
+)
 
 
 async def _run(cmd: list, label: str = "FFmpeg") -> None:
@@ -247,7 +289,35 @@ async def probe_duration(path: str) -> int:
 
 
 # ─────────────────────────────────────────────────────────────
-# Thumbnail extraction — PATCHED for high quality
+# HDR detection
+# ─────────────────────────────────────────────────────────────
+
+async def _is_hdr(path: str) -> bool:
+    """
+    Detect HDR10 or HLG content by checking the video stream's
+    color_transfer metadata via ffprobe.
+
+    HDR thumbnails extracted without tone-mapping look washed out
+    because the color values are outside SDR range. When this returns
+    True, get_thumb() switches to the HDR vf chain which applies
+    zscale + hable tone mapping before scaling.
+    """
+    data = await _probe_json(["-show_streams", path])
+    for s in (data or {}).get("streams", []):
+        if s.get("codec_type") == "video":
+            transfer = s.get("color_transfer", "")
+            is_hdr = transfer in (
+                "smpte2084",      # HDR10 / PQ
+                "arib-std-b67",   # HLG
+            )
+            if is_hdr:
+                log.debug("HDR detected (%s) for %s", transfer, os.path.basename(path))
+            return is_hdr
+    return False
+
+
+# ─────────────────────────────────────────────────────────────
+# Thumbnail extraction — FULLY FIXED
 # ─────────────────────────────────────────────────────────────
 
 def _jpeg_brightness(path: str) -> float:
@@ -285,31 +355,64 @@ async def get_thumb(path: str, out_path: str) -> Optional[str]:
             seen.add(c)
             unique.append(c)
 
+    # Detect HDR once for this file — avoids re-probing on every candidate
+    hdr = await _is_hdr(path)
+    vf_chain = _VF_SHARP_HDR if hdr else _VF_SHARP_SDR
+    if hdr:
+        log.info("get_thumb: using HDR tone-map chain for %s", os.path.basename(path))
+
     last: Optional[str] = None
 
     for ts in unique:
+        # FIX: correct two-stage seek math — pre_seek + fine_seek always == ts
+        # Old code: fine_seek was hardcoded to 3, causing overshoot when ts < 3s
+        # (e.g. ts=1 → pre_seek=0, fine_seek=3 → extracted frame was at second 3, not 1)
+        pre_seek  = max(0, ts - 3)
+        fine_seek = ts - pre_seek   # always in [0, 3], never overshoots
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y",
-                # Two-stage seek: fast keyframe jump, then accurate frame decode
-                "-ss", str(max(0, ts - 3)),
+                # Stage 1: fast keyframe seek to just before target
+                "-ss", str(pre_seek),
                 "-i", path,
-                "-ss", "3",
+                # Stage 2: accurate frame-level decode from that keyframe
+                "-ss", str(fine_seek),
                 "-frames:v", "1",
-                # 320×320 max — Telegram blurs anything larger.
-                "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
-                "-q:v", "2",
+                "-vf", vf_chain,
+                "-q:v", "1",            # FIX: max JPEG quality (was 2; scale is 1-31 lower=better)
                 out_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, _ = await proc.communicate()
+            _, stderr = await proc.communicate()
+
+            # HDR fallback: if zscale not available, retry with SDR chain
+            if hdr and (not os.path.exists(out_path) or os.path.getsize(out_path) < 500):
+                err_txt = stderr.decode(errors="replace")
+                if "zscale" in err_txt or "libzimg" in err_txt:
+                    log.warning("get_thumb: zscale unavailable — falling back to SDR chain for HDR file")
+                    proc2 = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-y",
+                        "-ss", str(pre_seek), "-i", path,
+                        "-ss", str(fine_seek),
+                        "-frames:v", "1",
+                        "-vf", _VF_SHARP_SDR,
+                        "-q:v", "1",
+                        out_path,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc2.communicate()
+
             if not os.path.exists(out_path) or os.path.getsize(out_path) < 500:
                 continue
+
             last = out_path
             if _jpeg_brightness(out_path) >= 15.0:
                 return out_path
             log.debug("Dark frame at %ds — retrying", ts)
+
         except Exception as exc:
             log.debug("Thumb error ts=%d: %s", ts, exc)
 
@@ -437,6 +540,10 @@ async def _ffprobe_mediainfo_text(path: str) -> str:
                 lines.append(f"FPS     : {float(fn2)/max(float(fd2),1):.3f}")
             except Exception:
                 pass
+            # Show HDR info if present
+            transfer = s.get("color_transfer", "")
+            if transfer in ("smpte2084", "arib-std-b67"):
+                lines.append(f"HDR     : {'HDR10/PQ' if transfer == 'smpte2084' else 'HLG'}")
         elif stype == "audio":
             tags = s.get("tags", {})
             lang = tags.get("language", "und")
@@ -728,7 +835,6 @@ async def compress_to_size(inp: str, out: str, target_mb: float) -> None:
     dur = await probe_duration(inp)
 
     if not dur:
-        # Fallback: CRF 28 gives roughly 60-70% size reduction for most videos
         log.warning("compress_to_size: unknown duration — using CRF 28 fallback")
         await _run([
             "ffmpeg", "-y", "-i", inp,
