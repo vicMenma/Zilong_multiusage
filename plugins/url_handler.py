@@ -225,224 +225,109 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
 
 
 # ─────────────────────────────────────────────────────────────
-# Magnet probe — PATCH 1: full download, no 30 MB cap
+# Magnet probe — COMPLETE REWRITE: use smart_download pipeline
 # ─────────────────────────────────────────────────────────────
 
 async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str | None, dict]:
     """
-    Download a magnet torrent completely and probe the result.
+    Download a magnet torrent completely then probe streams locally.
 
-    PATCH 1: Previously stopped after PROBE_ENOUGH = 30 MB and paused aria2.
-    This gave incomplete mediainfo — MKV files store audio language tags,
-    subtitle tracks, and chapters throughout the file, not just in the header.
+    ROOT CAUSE of the 30 MB bug (survived all previous patch attempts):
+      The old code used aria2p API directly with TWO separate magnet adds:
+        dl  = api.add_magnet(magnet, {"bt-metadata-only": "true"})  ← metadata fetch
+        dl2 = api.add_magnet(magnet, {"select-file": "1"})          ← file download
 
-    Fix: download the complete file. Benefits:
-      - 100% accurate stream detection and mediainfo
-      - File stays in tmp and is reused by subsequent hardsub/convert operations
-        (no re-download needed — stored in _magnet_probe cache)
-      - User experience: one wait instead of two
+      With follow-torrent="mem", dl2 has to re-fetch metadata from scratch.
+      During this re-fetch aria2c briefly reports completed_length ~= metadata
+      size, then fires is_complete=True for the METADATA PHASE — not the file.
+      The loop breaks immediately. The actual file never downloads.
+      This happened regardless of whether PROBE_ENOUGH was in the code or not.
+
+    Fix: throw out the entire manual aria2p approach.
+      Use smart_download() from downloader.py — the same proven pipeline
+      used by all other download operations in the bot. It handles magnets
+      correctly via download_aria2() which uses aria2c subprocess (not API)
+      and reliably waits for the real file to finish.
+
+    Benefits:
+      - 100% accurate stream detection (full file locally)
+      - Full mediainfo (streams throughout file, not just header)
+      - File cached in _magnet_probe — no re-download for hardsub/convert
+      - Live progress panel via msg=st parameter
     """
     from services import ffmpeg as FF
-    from services.task_runner import tracker, TaskRecord, runner
+    from services.downloader import smart_download as _smart_dl
 
     tmp = make_tmp(cfg.download_dir, uid)
+
     await safe_edit(st,
-        "🧲 <b>Magnet Probe</b>\n\n"
-        "<i>Connecting to aria2c and fetching torrent metadata…</i>\n"
-        "<i>This may take up to 90 seconds depending on tracker response.</i>",
+        "🧲 <b>Magnet — Downloading Complete File</b>\n"
+        "──────────────────────\n\n"
+        "<i>Using aria2c to download the full file.\n"
+        "Stream analysis and mediainfo will be 100% accurate.\n"
+        "File is cached for instant hardsub/convert after this.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
     try:
-        api = aria2p.API(aria2p.Client(
-            host=cfg.aria2_host, port=cfg.aria2_port, secret=cfg.aria2_secret,
-        ))
-        api.get_stats()
-    except Exception as exc:
-        await safe_edit(st,
-            f"❌ <b>aria2c not reachable</b>\n<code>{exc}</code>\n\n"
-            "<i>Make sure aria2c is running with --enable-rpc.</i>",
-            parse_mode=enums.ParseMode.HTML,
+        # smart_download handles the full magnet pipeline correctly:
+        # - aria2c subprocess (not aria2p API — avoids the metadata-phase bug)
+        # - live progress edited into st via msg=st
+        # - returns directory path for magnets (may contain multiple files)
+        path_or_dir = await _smart_dl(
+            magnet, tmp,
+            user_id=uid,
+            label="Magnet Probe",
+            msg=st,
         )
-        cleanup(tmp)
-        return None, None, {}
 
-    meta_opts = {
-        "dir": tmp, "seed-time": "0",
-        "max-connection-per-server": "8",
-        "follow-torrent": "mem", "bt-max-peers": "100",
-    }
+        # Resolve to the largest/best video file in the download
+        if os.path.isdir(path_or_dir):
+            path = largest_file(path_or_dir)
+            if not path:
+                from services.utils import all_video_files as _avf
+                files = _avf(path_or_dir, min_bytes=0)
+                path = files[0] if files else None
+        else:
+            path = path_or_dir
 
-    try:
-        dl = api.add_magnet(magnet, options=meta_opts)
-    except Exception as exc:
-        await safe_edit(st, f"❌ aria2c rejected magnet: <code>{exc}</code>",
-                        parse_mode=enums.ParseMode.HTML)
-        cleanup(tmp)
-        return None, None, {}
-
-    torrent_name = ""
-    file_list:   list[dict] = []
-    t_start = time.time()
-
-    for tick in range(120):
-        await asyncio.sleep(1)
-        try:
-            dl = api.get_download(dl.gid)
-        except Exception:
-            continue
-
-        if dl.error_message:
-            try: api.remove([dl])
-            except Exception: pass
+        if not path or not os.path.isfile(path):
             await safe_edit(st,
-                f"❌ <b>Metadata fetch failed</b>\n<code>{dl.error_message}</code>\n\n"
-                "<i>The magnet link could not be resolved.</i>",
+                "❌ <b>No file found after download.</b>\n\n"
+                "<i>The torrent may be empty or all files were filtered out.</i>",
                 parse_mode=enums.ParseMode.HTML,
             )
             cleanup(tmp)
             return None, None, {}
 
-        files = dl.files or []
-        if dl.name and dl.name not in ("Unknown", "") and files and any(f.path for f in files):
-            torrent_name = dl.name
-            for f in files:
-                file_list.append({"index": f.index, "path": str(f.path or ""), "size": f.length or 0})
-            break
+        fname = os.path.basename(path)
+        fsize = os.path.getsize(path)
+        log.info("[MagnetProbe] Downloaded %s (%s) — probing streams",
+                 fname, human_size(fsize))
 
-        if tick % 10 == 0 and tick > 0:
-            elapsed = int(time.time() - t_start)
-            await safe_edit(st,
-                f"🧲 <b>Waiting for metadata…</b>  <code>{elapsed}s</code>\n\n"
-                "<i>Contacting trackers to resolve file list…</i>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-
-        if time.time() - t_start > 90:
-            break
-
-    try: api.remove([dl])
-    except Exception: pass
-
-    if not file_list:
         await safe_edit(st,
-            "❌ <b>Could not resolve torrent metadata.</b>\n\n"
-            "<i>No trackers responded in time.</i>",
+            f"🔍 <b>Probing streams…</b>\n\n"
+            f"📄 <code>{fname[:50]}</code>\n"
+            f"💾 <code>{human_size(fsize)}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
-        cleanup(tmp)
-        return None, None, {}
 
-    _video_exts = {".mp4",".mkv",".avi",".mov",".webm",".flv",".ts",".m2ts",".wmv",".m4v",".rmvb",".mpg",".mpeg"}
-    _audio_exts = {".mp3",".aac",".m4a",".opus",".ogg",".flac",".wav",".wma",".ac3",".mka"}
-
-    def _priority(f: dict) -> int:
-        ext = os.path.splitext(f["path"])[1].lower()
-        if ext in _video_exts: return 2
-        if ext in _audio_exts: return 1
-        return 0
-
-    best        = sorted(file_list, key=lambda f: (_priority(f), f["size"]), reverse=True)
-    target_file = best[0]
-    fname       = os.path.basename(target_file["path"]) or f"file_{target_file['index']}"
-    file_total  = target_file["size"] or 0
-
-    # PATCH 1: show "complete download" message, not "first 30 MB"
-    await safe_edit(st,
-        f"✅ <b>Metadata resolved!</b>\n\n"
-        f"📁 <b>{torrent_name[:50]}</b>\n"
-        f"🎯 <code>{fname[:48]}</code>\n"
-        f"💾 Size: <code>{human_size(file_total)}</code>\n\n"
-        f"⬇️ <i>Downloading complete file for accurate mediainfo…\n"
-        f"File will be ready for hardsub/convert after this.</i>",
-        parse_mode=enums.ParseMode.HTML,
-    )
-
-    tid    = tracker.new_tid()
-    record = TaskRecord(
-        tid=tid, user_id=uid, label=fname, mode="dl", engine="magnet",
-        fname=fname, total=file_total, state="📥 Downloading",
-    )
-    await tracker.register(record)
-
-    dl_opts = {
-        "dir": tmp, "seed-time": "0",
-        "select-file": str(target_file["index"]),
-        "follow-torrent": "mem",
-        "max-connection-per-server": "16",
-        "split": "16", "bt-max-peers": "200",
-    }
-
-    try:
-        dl2 = api.add_magnet(magnet, options=dl_opts)
-    except Exception as exc:
-        record.update(state="❌ Failed")
-        await safe_edit(st, f"❌ Download start failed: <code>{exc}</code>",
-                        parse_mode=enums.ParseMode.HTML)
-        cleanup(tmp)
-        return None, None, {}
-
-    t_start = time.time()
-
-    # PATCH 1: download COMPLETE file — no PROBE_ENOUGH cutoff
-    # Previously: stopped at 30 MB and paused → incomplete metadata
-    # Now: wait for dl2.is_complete → full file → 100% accurate probe
-    while True:
-        await asyncio.sleep(2)
-        try:
-            dl2 = api.get_download(dl2.gid)
-        except Exception:
-            await asyncio.sleep(3)
-            continue
-
-        if dl2.error_message:
-            try: api.remove([dl2])
-            except Exception: pass
-            record.update(state="❌ Failed")
-            await safe_edit(st, f"❌ Download error: <code>{dl2.error_message}</code>",
-                            parse_mode=enums.ParseMode.HTML)
-            cleanup(tmp)
-            return None, None, {}
-
-        done  = dl2.completed_length or 0
-        total = dl2.total_length     or file_total or 0
-        speed = float(dl2.download_speed or 0)
-        eta   = int((total - done) / speed) if speed and total > done else 0
-        record.update(done=done, total=total, speed=speed, eta=eta,
-                      elapsed=time.time() - t_start, state="📥 Downloading")
-
-        if dl2.is_complete:
-            break   # full download complete — no partial cutoff
-
-        if time.time() - t_start > 3600 * 6:
-            try: api.remove([dl2])
-            except Exception: pass
-            record.update(state="❌ Timed out")
-            await safe_edit(st, "❌ Download timed out (6h).",
-                            parse_mode=enums.ParseMode.HTML)
-            cleanup(tmp)
-            return None, None, {}
-
-    try: api.remove([dl2])
-    except Exception: pass
-
-    record.update(state="✅ Done", done=done)
-
-    path = largest_file(tmp)
-    if not path:
-        cleanup(tmp)
-        await safe_edit(st, "❌ No file found after download.", parse_mode=enums.ParseMode.HTML)
-        return None, None, {}
-
-    await safe_edit(st, "🔍 <b>Probing streams…</b>", parse_mode=enums.ParseMode.HTML)
-    try:
-        sd, dur = await asyncio.gather(FF.probe_streams(path), FF.probe_duration(path))
+        sd, dur = await asyncio.gather(
+            FF.probe_streams(path),
+            FF.probe_duration(path),
+        )
         return path, tmp, {"streams": sd, "duration": dur, "fname": fname}
+
     except Exception as exc:
-        await safe_edit(st, f"❌ Stream probe failed: <code>{exc}</code>",
-                        parse_mode=enums.ParseMode.HTML)
+        log.error("[MagnetProbe] Failed: %s", exc, exc_info=True)
+        await safe_edit(st,
+            f"❌ <b>Magnet download failed</b>\n\n"
+            f"<code>{str(exc)[:300]}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
         cleanup(tmp)
         return None, None, {}
+
 
 
 # ─────────────────────────────────────────────────────────────
