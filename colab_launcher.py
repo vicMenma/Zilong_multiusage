@@ -128,6 +128,221 @@ if r.returncode != 0:
     raise SystemExit(f"❌ Clone failed:\n{err_clean[:300]}")
 _log("OK", f"Cloned {REPO_NAME} → {BASE_DIR}")
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# POST-CLONE PATCHES — applied every run after clone
+#
+# WHY: The git clone gets the latest GitHub commit. These patches fix bugs
+# that are structural (aria2p API misuse) and must be applied regardless
+# of what's in the repo.
+#
+# PATCH A — url_handler.py: _probe_magnet_file
+#   Root cause of the 30 MB bug:
+#   Old code used aria2p API with TWO separate magnet adds:
+#     dl  = api.add_magnet(magnet, {"bt-metadata-only": "true"})  ← metadata fetch
+#     dl2 = api.add_magnet(magnet, {"select-file": "1",
+#                                    "follow-torrent": "mem"})    ← file download
+#   With follow-torrent=mem, dl2 had no cached metadata → re-fetched trackers.
+#   aria2c fired is_complete=True after metadata phase (~30 MB) → loop broke.
+#   The actual file NEVER downloaded. PROBE_ENOUGH was irrelevant.
+#   Fix: smart_download uses aria2c subprocess which handles metadata
+#   transparently and waits for the real file to complete.
+#
+# PATCH B — stream_extractor.py: se_mag_cb action="file"
+#   Same broken aria2p pattern — same fix.
+# ════════════════════════════════════════════════════════════════════════════
+
+import re as _patch_re
+import ast as _patch_ast
+
+_log("STEP", "Applying post-clone patches…")
+
+# ── PATCH A: url_handler.py ───────────────────────────────────────────────
+
+_URL_HANDLER = os.path.join(BASE_DIR, "plugins", "url_handler.py")
+
+_NEW_PROBE_FUNC = '''async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple:
+    """
+    Download complete magnet file then probe streams locally.
+    Uses smart_download (aria2c subprocess) — NOT aria2p API.
+
+    Root cause of 30 MB bug: aria2p 2-add pattern fires is_complete=True
+    after metadata phase (~30 MB), never downloading the actual file.
+    """
+    from services import ffmpeg as FF
+    from services.downloader import smart_download as _smart_dl
+    from services.utils import largest_file, all_video_files, make_tmp, cleanup, human_size
+
+    tmp = make_tmp(cfg.download_dir, uid)
+
+    await safe_edit(st,
+        "🧲 <b>Magnet — Downloading Complete File</b>\\n"
+        "──────────────────────\\n\\n"
+        "<i>Using aria2c subprocess for reliable full download.\\n"
+        "Stream analysis will be 100% accurate.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    try:
+        path_or_dir = await _smart_dl(
+            magnet, tmp,
+            user_id=uid,
+            label="Magnet Probe",
+            msg=st,
+        )
+
+        if os.path.isdir(path_or_dir):
+            path = largest_file(path_or_dir)
+            if not path:
+                files = all_video_files(path_or_dir, min_bytes=0)
+                path = files[0] if files else None
+        else:
+            path = path_or_dir
+
+        if not path or not os.path.isfile(path):
+            await safe_edit(st,
+                "❌ <b>No file found after download.</b>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            cleanup(tmp)
+            return None, None, {}
+
+        fname = os.path.basename(path)
+        fsize = os.path.getsize(path)
+
+        await safe_edit(st,
+            f"🔍 <b>Probing streams…</b>\\n\\n"
+            f"📄 <code>{fname[:50]}</code>\\n"
+            f"💾 <code>{human_size(fsize)}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+        sd, dur = await asyncio.gather(
+            FF.probe_streams(path),
+            FF.probe_duration(path),
+        )
+        return path, tmp, {"streams": sd, "duration": dur, "fname": fname}
+
+    except Exception as exc:
+        import logging as _lg
+        _lg.getLogger(__name__).error("[MagnetProbe] %s", exc, exc_info=True)
+        await safe_edit(st,
+            f"❌ <b>Magnet download failed</b>\\n\\n<code>{str(exc)[:300]}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        cleanup(tmp)
+        return None, None, {}
+'''
+
+try:
+    with open(_URL_HANDLER, "r", encoding="utf-8") as _f:
+        _uh_src = _f.read()
+
+    # Replace the entire _probe_magnet_file function
+    # Pattern: from "async def _probe_magnet_file" to next top-level async def
+    _fn_pat = _patch_re.compile(
+        r"async def _probe_magnet_file\(.*?(?=\n(?:async def |def |class |# ─{10}))",
+        _patch_re.DOTALL,
+    )
+
+    if _fn_pat.search(_uh_src):
+        _uh_patched = _fn_pat.sub(_NEW_PROBE_FUNC.strip(), _uh_src, count=1)
+    else:
+        # Fallback: insert before _hardsub_magnet_dl
+        _marker = "\nasync def _hardsub_magnet_dl("
+        if _marker in _uh_src:
+            _uh_patched = _uh_src.replace(
+                _marker,
+                "\n\n" + _NEW_PROBE_FUNC.strip() + "\n" + _marker,
+                1,
+            )
+        else:
+            _uh_patched = _uh_src
+            _log("WARN", "PATCH A: _probe_magnet_file insertion point not found")
+
+    # Verify syntax before writing
+    try:
+        _patch_ast.parse(_uh_patched)
+        with open(_URL_HANDLER, "w", encoding="utf-8") as _f:
+            _f.write(_uh_patched)
+        _log("OK", "PATCH A: url_handler.py — _probe_magnet_file → smart_download ✅")
+    except SyntaxError as _se:
+        _log("ERR", f"PATCH A: syntax error, skipping — {_se}")
+
+except Exception as _pe:
+    _log("ERR", f"PATCH A failed: {_pe}")
+
+
+# ── PATCH B: stream_extractor.py se_mag_cb action="file" ─────────────────
+
+_STREAM_EXT = os.path.join(BASE_DIR, "plugins", "stream_extractor.py")
+
+_NEW_SE_FILE_ACTION = '''        # PATCHED: use smart_download instead of broken aria2p select-file
+        # Old code: api.add_magnet + follow-torrent=mem → stops at 30 MB (metadata phase)
+        st = await cb.message.edit(
+            f"🧲 Downloading <code>{fname[:50]}</code>…\\n"
+            "<i>Full download — no 30 MB limit.</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        tmp = make_tmp(cfg.download_dir, uid)
+        try:
+            from services.downloader import smart_download as _se_dl
+            _dl_path = await _se_dl(magnet, tmp, user_id=uid, label=fname, msg=st)
+            if os.path.isdir(_dl_path):
+                _resolved = largest_file(_dl_path)
+                if not _resolved:
+                    raise FileNotFoundError("No output file found in torrent download")
+                _dl_path = _resolved
+            elif not os.path.isfile(_dl_path):
+                raise FileNotFoundError("No output file found")
+        except Exception as exc:
+            cleanup(tmp)
+            return await safe_edit(st,
+                f"❌ Download failed: <code>{exc}</code>",
+                parse_mode=enums.ParseMode.HTML)
+
+        await upload_file(client, st, _dl_path)
+        cleanup(tmp)
+        return'''
+
+try:
+    with open(_STREAM_EXT, "r", encoding="utf-8") as _f:
+        _se_src = _f.read()
+
+    # Find the broken aria2p block inside se_mag_cb action=="file"
+    # It starts after the file_idx/fname lines and contains api.add_magnet
+    _broken_marker = 'api.add_magnet(magnet, options'
+    if _broken_marker in _se_src:
+        # Find the action=="file" block containing it
+        _block_pat = _patch_re.compile(
+            r'(        st\s+=\s+await cb\.message\.edit\(\s*\n'
+            r'.*?'
+            r'api\.add_magnet\(magnet.*?'
+            r'cleanup\(tmp\)\s*\n)',
+            _patch_re.DOTALL,
+        )
+        _se_patched = _block_pat.sub(_NEW_SE_FILE_ACTION + "\n", _se_src, count=1)
+        if _se_patched != _se_src:
+            try:
+                _patch_ast.parse(_se_patched)
+                with open(_STREAM_EXT, "w", encoding="utf-8") as _f:
+                    _f.write(_se_patched)
+                _log("OK", "PATCH B: stream_extractor.py — se_mag_cb file action → smart_download ✅")
+            except SyntaxError as _se2:
+                _log("WARN", f"PATCH B: syntax error after patch, skipping — {_se2}")
+        else:
+            _log("INFO", "PATCH B: stream_extractor.py — pattern not found, may already be patched")
+    else:
+        _log("INFO", "PATCH B: stream_extractor.py — no aria2p pattern found (already patched or different version)")
+
+except Exception as _pe:
+    _log("ERR", f"PATCH B failed: {_pe}")
+
+
+_log("OK", "Post-clone patches complete ✅")
+# ════════════════════════════════════════════════════════════════════════════
+
+
 # ── Python packages ───────────────────────────────────────────────────────
 _log("STEP", "Installing Python packages…")
 subprocess.run(
@@ -235,16 +450,10 @@ except Exception as _ke:
     _log("WARN", f"Could not clean up stale PID: {_ke}")
 
 # ── Open public tunnel for CloudConvert webhook (port 8765) ──────────────
-# Priority: Cloudflare Tunnel (no account) → ngrok (needs NGROK_TOKEN)
-# The tunnel is opened here in the launcher so WEBHOOK_BASE_URL is injected
-# into the bot's .env before it starts. The bot's cloudconvert_hook.py will
-# see a preset WEBHOOK_BASE_URL and skip opening its own tunnel.
-# Only runs when CC_API_KEY is set and WEBHOOK_BASE_URL not already provided.
-
 import re as _re2
 
-_tunnel_proc: subprocess.Popen | None = None
-_TUNNEL_TIMEOUT = 30  # seconds — never blocks startup longer than this
+_tunnel_proc = None
+_TUNNEL_TIMEOUT = 30
 
 
 def _install_cloudflared() -> bool:
@@ -261,7 +470,6 @@ def _install_cloudflared() -> bool:
 
 
 def _open_cloudflare_tunnel() -> str:
-    """Start cloudflared → localhost:8765. Returns public URL or ''."""
     global _tunnel_proc
     if not _install_cloudflared():
         _log("WARN", "cloudflared install failed")
@@ -290,11 +498,9 @@ def _open_cloudflare_tunnel() -> str:
 
 
 def _open_ngrok_tunnel() -> str:
-    """Start ngrok → localhost:8765 using NGROK_TOKEN. Returns public URL or ''."""
     global _tunnel_proc
     if not NGROK_TOKEN:
         return ""
-    # Try pyngrok first
     try:
         from pyngrok import ngrok as _ngrok, conf as _conf
         _conf.get_default().auth_token = NGROK_TOKEN
@@ -308,7 +514,6 @@ def _open_ngrok_tunnel() -> str:
         _log("INFO", "pyngrok not installed — trying ngrok CLI")
     except Exception as exc:
         _log("WARN", f"pyngrok failed: {exc} — trying ngrok CLI")
-    # Try ngrok CLI
     try:
         proc = subprocess.Popen(
             ["ngrok", "http", "8765", "--log=stdout", f"--authtoken={NGROK_TOKEN}"],
@@ -328,7 +533,7 @@ def _open_ngrok_tunnel() -> str:
         _log("WARN", f"ngrok CLI timed out after {_TUNNEL_TIMEOUT}s")
         return ""
     except FileNotFoundError:
-        _log("WARN", "ngrok CLI not found — install ngrok or set NGROK_TOKEN with pyngrok")
+        _log("WARN", "ngrok CLI not found")
         return ""
     except Exception as exc:
         _log("WARN", f"ngrok CLI error: {exc}")
@@ -336,7 +541,6 @@ def _open_ngrok_tunnel() -> str:
 
 
 def _tunnel_watchdog() -> None:
-    """Background thread: restarts tunnel if it dies. CloudConvert retries for 3 days."""
     global _tunnel_proc
     while True:
         time.sleep(20)
