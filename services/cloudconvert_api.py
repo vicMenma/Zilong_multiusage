@@ -2,23 +2,10 @@
 services/cloudconvert_api.py
 CloudConvert API v2 client — hardsubbing + conversion with multi-key rotation.
 
-Multi-API key support:
-  Set CC_API_KEY to a comma-separated list of keys:
-    CC_API_KEY=eyJ...key1,eyJ...key2,eyJ...key3
-  The bot checks remaining credits on each key via GET /v2/users/me
-  and picks the one with the most minutes available.
-
-Flows:
-  1. submit_hardsub  — burn subtitles into video
-  2. submit_convert  — resolution/format conversion (no subtitles)
-
-FIXES:
-  - upload_file_to_task() now polls until the import task is in "waiting"
-    state with a valid S3 form URL before uploading. Without this the CC
-    task is still in "pending" and the upload instantly returns ERROR.
-  - upload_file_to_task() uses a context manager for the file handle so
-    it is always closed even if the upload raises — fixes FD leak.
-  - _wait_for_task_ready() added as a proper polling helper.
+PATCH: sanitize_for_cc() applied to all filenames passed into CloudConvert.
+  Old code used .replace("'","\\'").replace(" ","_") which only handled two
+  characters. CloudConvert jobs silently fail on: [] () : & | accented chars.
+  sanitize_for_cc() reduces filenames to [a-zA-Z0-9._-] — guaranteed safe.
 """
 from __future__ import annotations
 
@@ -30,6 +17,8 @@ from typing import Optional
 
 import aiohttp
 
+from services.cc_sanitize import sanitize_for_cc
+
 log = logging.getLogger(__name__)
 
 CC_API = "https://api.cloudconvert.com/v2"
@@ -40,15 +29,10 @@ CC_API = "https://api.cloudconvert.com/v2"
 # ─────────────────────────────────────────────────────────────
 
 def parse_api_keys(raw: str) -> list[str]:
-    """Parse comma-separated API keys from env var."""
     return [k.strip() for k in raw.split(",") if k.strip()]
 
 
 async def check_credits(api_key: str) -> int:
-    """
-    Check remaining conversion credits for a single API key.
-    Returns credits (minutes) remaining, or -1 on error.
-    """
     headers = {"Authorization": f"Bearer {api_key}"}
     try:
         async with aiohttp.ClientSession() as sess:
@@ -65,10 +49,6 @@ async def check_credits(api_key: str) -> int:
 
 
 async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
-    """
-    Check credits on all keys concurrently, return the one with most credits.
-    Returns (best_key, credits). Raises RuntimeError if all keys exhausted.
-    """
     if len(api_keys) == 1:
         credits = await check_credits(api_keys[0])
         if credits == 0:
@@ -78,10 +58,10 @@ async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
             )
         return api_keys[0], max(credits, 0)
 
-    tasks = [check_credits(key) for key in api_keys]
+    tasks   = [check_credits(key) for key in api_keys]
     results = await asyncio.gather(*tasks)
 
-    best_key = ""
+    best_key     = ""
     best_credits = -1
     status_lines = []
 
@@ -90,7 +70,7 @@ async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
         status_lines.append(f"  ...{short}: {credits} credits")
         if credits > best_credits:
             best_credits = credits
-            best_key = key
+            best_key     = key
 
     log.info("[CC-API] Key rotation — %d keys checked:\n%s",
              len(api_keys), "\n".join(status_lines))
@@ -110,9 +90,8 @@ async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
 # ─────────────────────────────────────────────────────────────
 
 async def check_job_status(api_key: str, job_id: str) -> dict:
-    """Check the status of a CloudConvert job."""
     keys = parse_api_keys(api_key)
-    key = keys[0] if keys else api_key
+    key  = keys[0] if keys else api_key
     headers = {"Authorization": f"Bearer {key}"}
     async with aiohttp.ClientSession() as sess:
         async with sess.get(f"{CC_API}/jobs/{job_id}", headers=headers) as resp:
@@ -124,17 +103,11 @@ async def _wait_for_task_ready(
     api_key: str, job_id: str, task_name: str, timeout: int = 120
 ) -> dict:
     """
-    Poll GET /v2/jobs/{job_id} until the named task reaches 'waiting' status
-    and its result.form.url is populated (i.e. the S3 upload endpoint is ready).
-
-    This is mandatory before calling upload_file_to_task — firing the upload
-    while the task is still 'pending' causes an instant ERROR from CC.
-
-    Returns the task dict with a valid form URL.
-    Raises RuntimeError if the task never becomes ready within `timeout` seconds.
+    Poll until the named import/upload task reaches 'waiting' state
+    with a valid S3 form URL. Uploading before this causes instant ERROR.
     """
-    keys = parse_api_keys(api_key)
-    key  = keys[0] if keys else api_key
+    keys     = parse_api_keys(api_key)
+    key      = keys[0] if keys else api_key
     headers  = {"Authorization": f"Bearer {key}"}
     deadline = time.time() + timeout
 
@@ -157,20 +130,17 @@ async def _wait_for_task_ready(
             if url:
                 log.debug("[CC-API] Task '%s' ready (waiting) with S3 URL", task_name)
                 return task
-            # status is waiting but form URL not populated yet — keep polling
-        elif status in ("error",):
+        elif status == "error":
             err = task.get("message") or f"Task '{task_name}' failed"
             raise RuntimeError(f"[CC-API] Task '{task_name}' error: {err}")
         elif status == "finished":
-            # Shouldn't happen for import tasks but handle gracefully
             log.warning("[CC-API] Task '%s' already finished — skipping upload poll", task_name)
             return task
 
         await asyncio.sleep(3)
 
     raise RuntimeError(
-        f"Task '{task_name}' never reached 'waiting' state after {timeout}s. "
-        "Check CloudConvert dashboard for job details."
+        f"Task '{task_name}' never reached 'waiting' state after {timeout}s."
     )
 
 
@@ -189,27 +159,31 @@ async def create_hardsub_job(
     preset: str = "medium",
     scale_height: int = 0,
 ) -> dict:
-    v_safe = video_filename.replace("'", "\\'").replace(" ", "_")
-    s_safe = subtitle_filename.replace("'", "\\'").replace(" ", "_")
-    o_safe = output_filename.replace("'", "\\'").replace(" ", "_")
+    # PATCH: sanitize_for_cc() replaces the old .replace() chain.
+    # Old code only handled apostrophes and spaces; CC silently fails on
+    # brackets, colons, accented chars, and Unicode — all now stripped.
+    v_safe = sanitize_for_cc(video_filename)
+    s_safe = sanitize_for_cc(subtitle_filename)
+    o_safe = sanitize_for_cc(output_filename)
+
+    log.debug("[CC-API] Sanitized names: video=%s sub=%s out=%s", v_safe, s_safe, o_safe)
 
     tasks: dict = {}
 
     if video_url:
         tasks["import-video"] = {
             "operation": "import/url",
-            "url": video_url,
-            "filename": v_safe,
+            "url":       video_url,
+            "filename":  v_safe,
         }
     else:
-        tasks["import-video"] = {
-            "operation": "import/upload",
-        }
+        tasks["import-video"] = {"operation": "import/upload"}
 
-    tasks["import-sub"] = {
-        "operation": "import/upload",
-    }
+    tasks["import-sub"] = {"operation": "import/upload"}
 
+    # Build the subtitles filter path. With sanitize_for_cc() the filename
+    # is already [a-zA-Z0-9._-] only, so colon-escaping is a safety net
+    # rather than the primary defence.
     sub_path    = f"/input/import-sub/{s_safe}"
     sub_escaped = sub_path.replace("\\", "\\\\").replace(":", "\\:")
 
@@ -273,8 +247,11 @@ async def create_convert_job(
     preset: str = "medium",
     scale_height: int = 0,
 ) -> dict:
-    v_safe = video_filename.replace("'", "\\'").replace(" ", "_")
-    o_safe = output_filename.replace("'", "\\'").replace(" ", "_")
+    # PATCH: same sanitize_for_cc() treatment as create_hardsub_job
+    v_safe = sanitize_for_cc(video_filename)
+    o_safe = sanitize_for_cc(output_filename)
+
+    log.debug("[CC-API] Sanitized names: video=%s out=%s", v_safe, o_safe)
 
     tasks: dict = {}
 
@@ -368,14 +345,9 @@ async def upload_file_to_task(
 ) -> None:
     """
     Upload a local file to a CloudConvert import/upload task.
-
-    FIX 1: Polls _wait_for_task_ready() before uploading so we never hit
-            the instant-ERROR caused by uploading while the task is still
-            in 'pending' state.
-    FIX 2: Opens the file with a context manager so the FD is always
-            closed even if the upload fails — prevents EMFILE on long runs.
+    Polls _wait_for_task_ready() first so we never hit the instant-ERROR
+    caused by uploading while the task is still 'pending'.
     """
-    # If we have enough info, poll until the task is truly ready
     if api_key and job_id and task_name:
         task = await _wait_for_task_ready(api_key, job_id, task_name)
 
@@ -387,19 +359,19 @@ async def upload_file_to_task(
         )
 
     params = get_upload_params(task)
-    fname  = filename or os.path.basename(file_path)
-    fsize  = os.path.getsize(file_path)
-    log.info("[CC-API] Uploading %s (%d bytes) to %s…", fname, fsize, url[:60])
+    # Use sanitized filename for the upload — ensures S3 key is safe too
+    raw_fname  = filename or os.path.basename(file_path)
+    safe_fname = sanitize_for_cc(raw_fname)
+    fsize      = os.path.getsize(file_path)
 
-    # FIX: context manager guarantees the FD is closed after the request
+    log.info("[CC-API] Uploading %s → %s (%d bytes) to %s…",
+             raw_fname, safe_fname, fsize, url[:60])
+
     with open(file_path, "rb") as fh:
         data = aiohttp.FormData()
         for key, value in params.items():
             data.add_field(key, str(value))
-        data.add_field(
-            "file", fh,
-            filename=fname.replace(" ", "_"),
-        )
+        data.add_field("file", fh, filename=safe_fname)
         async with aiohttp.ClientSession() as sess:
             async with sess.post(url, data=data, allow_redirects=True) as resp:
                 if resp.status not in (200, 201, 204, 301, 302):
@@ -408,7 +380,7 @@ async def upload_file_to_task(
                         f"Upload failed ({resp.status}): {body[:300]}"
                     )
 
-    log.info("[CC-API] Upload complete: %s", fname)
+    log.info("[CC-API] Upload complete: %s", safe_fname)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -455,7 +427,7 @@ async def submit_hardsub(
 
     job_id = job.get("id", "?")
 
-    # Upload subtitle — always required
+    # Upload subtitle (always required)
     sub_task = _find_task(job, "import-sub")
     if not sub_task:
         raise RuntimeError("No import-sub task found in job")
@@ -464,7 +436,7 @@ async def submit_hardsub(
         api_key=selected_key, job_id=job_id, task_name="import-sub",
     )
 
-    # Upload video file only when no URL was provided
+    # Upload video file only when no URL provided
     if video_path:
         vid_task = _find_task(job, "import-video")
         if not vid_task:
