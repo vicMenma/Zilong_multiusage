@@ -223,28 +223,48 @@ async def poll_until_ready(
     torrent_name_hint: str = "",
     timeout_s: int = 3600,
     progress_cb=None,
+    existing_folder_ids: Optional[set] = None,
 ) -> dict:
     """
-    Poll Seedr until the most recently added torrent finishes downloading.
+    Poll Seedr until the torrent we just added finishes downloading.
     Returns the folder dict {id, name, size, ...}.
     Raises RuntimeError on timeout.
 
-    progress_cb(pct: float, speed_str: str, name: str) — optional UI update.
+    existing_folder_ids — set of folder IDs that existed BEFORE add_magnet().
+        Any folder in this set is ignored so we never return a stale result
+        from a previous run.  Pass an empty set if the account was clean.
+
+    progress_cb(pct: float, name: str) — optional UI update.
+
+    BUG FIXES applied here:
+      1. existing_folder_ids baseline — prevents returning old completed folders
+         when the new torrent finishes quickly (or Seedr serves a cached copy).
+      2. Check happens BEFORE the first sleep so sub-10s downloads are caught.
+      3. Name hint filtering is combined with the baseline exclusion.
     """
+    if existing_folder_ids is None:
+        existing_folder_ids = set()
+
     username = os.environ.get("SEEDR_USERNAME", "")
     password = os.environ.get("SEEDR_PASSWORD", "")
     token    = await _get_token(username, password)
 
-    deadline = time.time() + timeout_s
+    deadline  = time.time() + timeout_s
     last_pct  = -1.0
+    first_run = True
 
     while time.time() < deadline:
-        await asyncio.sleep(10)
+        # FIX: check BEFORE sleeping on the first iteration so fast downloads
+        # (sub-10s, cached torrents) are caught immediately.
+        if not first_run:
+            await asyncio.sleep(10)
+        first_run = False
 
         try:
             root = await list_root(token)
         except Exception as e:
             log.warning("[Seedr] Poll error: %s", e)
+            await asyncio.sleep(5)
             continue
 
         folders  = root.get("folders", [])
@@ -253,16 +273,20 @@ async def poll_until_ready(
         # Check if any torrent is still downloading
         downloading = [t for t in torrents if str(t.get("progress", "100")) != "100"]
 
-        # Find our folder — newest one if no hint, or match by name
-        ready_folders = [
+        # FIX: only consider NEW folders — exclude anything that existed before
+        # we called add_magnet().  Also apply name hint if provided.
+        new_folders = [
             f for f in folders
-            if not torrent_name_hint or torrent_name_hint.lower()[:20]
-            in f.get("name", "").lower()
+            if f.get("id") not in existing_folder_ids
+            and (
+                not torrent_name_hint
+                or torrent_name_hint.lower()[:20] in f.get("name", "").lower()
+            )
         ]
 
         if downloading:
             # Still running — report progress
-            dl = downloading[0]
+            dl      = downloading[0]
             pct_raw = dl.get("progress", "0")
             try:
                 pct = float(pct_raw)
@@ -276,54 +300,70 @@ async def poll_until_ready(
                     await progress_cb(pct, dl.get("name", ""))
             continue
 
-        # No active torrents — folder should be ready
-        if ready_folders:
-            folder = ready_folders[-1]   # most recently added
+        # No active torrents — check for our new folder
+        if new_folders:
+            folder = new_folders[-1]   # most recently added
             log.info("[Seedr] Ready: %s (id=%s)", folder.get("name"), folder.get("id"))
             return folder
 
-        # Might still be queued — keep waiting
-        log.debug("[Seedr] No ready folder yet, waiting…")
+        # Torrent may still be queued (not yet moved to torrents list)
+        log.debug("[Seedr] No new folder yet — waiting (existing_ids=%s)…",
+                  len(existing_folder_ids))
 
     raise RuntimeError(f"Seedr download timed out after {timeout_s}s")
 
 
 async def get_file_urls(folder_id: int) -> list[dict]:
     """
-    Return list of {name, url, size} for every file in folder_id.
-    URLs are temporary signed links valid for ~1 hour.
+    Return list of {name, url, size} for every file in folder_id,
+    recursing into sub-folders.
+
+    BUG FIX: the old code only read top-level files via contents.get("files", []).
+    Multi-episode torrents (e.g. "Show S01/E01.mkv, E02.mkv") place files inside
+    a sub-folder, so top-level files=[] and the bot reported "no files downloaded".
+    Now we walk the entire folder tree.
     """
     username = os.environ.get("SEEDR_USERNAME", "")
     password = os.environ.get("SEEDR_PASSWORD", "")
     token    = await _get_token(username, password)
 
-    # Get folder contents
-    contents = await _get(token, {
-        "func":         "list",
-        "content_type": "folder",
-        "content_id":   str(folder_id),
-    })
+    async def _collect(fid: int) -> list[dict]:
+        contents = await _get(token, {
+            "func":         "list",
+            "content_type": "folder",
+            "content_id":   str(fid),
+        })
 
-    files = contents.get("files", [])
-    result = []
+        result: list[dict] = []
 
-    for f in files:
-        file_id = f.get("folder_file_id") or f.get("id")
-        name    = f.get("name", "file")
-        size    = int(f.get("size", 0))
+        # Files at this level
+        for f in contents.get("files", []):
+            file_id = f.get("folder_file_id") or f.get("id")
+            name    = f.get("name", "file")
+            size    = int(f.get("size", 0))
+            try:
+                link_data = await _get(token, {
+                    "func":           "fetch_file",
+                    "folder_file_id": str(file_id),
+                })
+                url = link_data.get("url", "")
+                if url:
+                    result.append({"name": name, "url": url, "size": size})
+            except Exception as e:
+                log.warning("[Seedr] Could not fetch URL for %s: %s", name, e)
 
-        try:
-            link_data = await _get(token, {
-                "func":           "fetch_file",
-                "folder_file_id": str(file_id),
-            })
-            url = link_data.get("url", "")
-            if url:
-                result.append({"name": name, "url": url, "size": size})
-        except Exception as e:
-            log.warning("[Seedr] Could not fetch URL for %s: %s", name, e)
+        # Recurse into sub-folders
+        for sub in contents.get("folders", []):
+            sub_id = sub.get("id")
+            if sub_id:
+                try:
+                    result.extend(await _collect(sub_id))
+                except Exception as e:
+                    log.warning("[Seedr] Sub-folder %s error: %s", sub.get("name"), e)
 
-    return result
+        return result
+
+    return await _collect(folder_id)
 
 
 async def delete_folder(folder_id: int) -> None:
@@ -362,18 +402,42 @@ async def download_via_seedr(
     if progress_cb:
         await progress_cb("adding", 0.0, "Submitting to Seedr…")
 
+    # ── Snapshot BEFORE add_magnet so poll_until_ready never returns a stale folder ──
+    # poll_until_ready() uses existing_folder_ids to exclude folders that already
+    # existed before this job started.  Without this snapshot it defaults to an
+    # empty set — meaning any old folder in the account is treated as "new" and
+    # returned immediately on the first poll iteration, causing the bot to download
+    # and delete the wrong torrent.
+    username = os.environ.get("SEEDR_USERNAME", "")
+    password = os.environ.get("SEEDR_PASSWORD", "")
+    _pre_token = await _get_token(username, password)
+    try:
+        _pre_root = await list_root(_pre_token)
+        existing_folder_ids: set = {
+            f.get("id") for f in _pre_root.get("folders", []) if f.get("id") is not None
+        }
+        log.info("[Seedr] Baseline: %d existing folder(s) will be excluded from poll",
+                 len(existing_folder_ids))
+    except Exception as _snap_exc:
+        log.warning("[Seedr] Could not snapshot existing folders: %s — using empty set", _snap_exc)
+        existing_folder_ids = set()
+
     # Add
     await add_magnet(magnet)
 
     if progress_cb:
         await progress_cb("waiting", 0.0, "Seedr is downloading on their servers…")
 
-    # Poll
+    # Poll — pass the pre-snapshot so stale folders are excluded
     async def _poll_progress(pct: float, name: str) -> None:
         if progress_cb:
             await progress_cb("downloading", pct, name)
 
-    folder = await poll_until_ready(timeout_s=timeout_s, progress_cb=_poll_progress)
+    folder = await poll_until_ready(
+        timeout_s=timeout_s,
+        progress_cb=_poll_progress,
+        existing_folder_ids=existing_folder_ids,
+    )
     folder_id = folder["id"]
 
     if progress_cb:
