@@ -4,15 +4,20 @@ Download strategies decoupled from Telegram.
 
 KEY FIXES (kept from prior audit):
   1. download_parallel removed from _dispatch — burns single-use CDN tokens.
-     Replaced with download_direct → aria2c fallback.
+     Replaced with download_direct → yt-dlp → page-scrape → aria2c fallback.
   2. Magnet META_TIMEOUT now 3 min (was effectively 6 h due to bad logic).
   3. --bt-max-peers not applied to plain HTTP aria2c commands.
   4. download_direct validates received bytes vs Content-Length.
 
-REWRITE additions:
-  - Progress callback edits status message using new progress_panel() design
-  - smart_download registers a TaskRecord and uses new panel for live updates
-  - _dispatch cleaner, no redundant imports
+NEW (this patch):
+  5. VK / VKVideo / VKPlay added to _YTDLP_RE — yt-dlp has full VK support.
+  6. _scrape_page_video() added — generic HTML video-URL extractor for sites
+     yt-dlp doesn't know (vidmoli, sbnet, and similar hosters).
+     Looks for: <source src=...>, <video src=...>, mp4/m3u8 in JSON/JS vars,
+     jwplayer / videojs / hls configs, and og:video meta tags.
+  7. _dispatch fallback chain for "direct" URLs is now:
+       download_direct → yt-dlp → page-scrape → aria2c
+     This means ANY HTTP URL has four chances to succeed.
 """
 from __future__ import annotations
 
@@ -73,11 +78,25 @@ _MAGNET_RE  = re.compile(r"^magnet:\?", re.I)
 _TORRENT_RE = re.compile(r"\.torrent(\?.*)?$", re.I)
 _GDRIVE_RE  = re.compile(r"drive\.google\.com", re.I)
 _MF_RE      = re.compile(r"mediafire\.com", re.I)
+
+# ── Expanded yt-dlp site list — includes VK family (NEW) ─────
 _YTDLP_RE   = re.compile(
     r"(youtube\.com|youtu\.be|instagram\.com|twitter\.com|x\.com|"
     r"facebook\.com|tiktok\.com|dailymotion\.com|vimeo\.com|twitch\.tv|"
     r"reddit\.com|pinterest\.com|ok\.ru|bilibili\.com|soundcloud\.com|"
-    r"nicovideo\.jp|rumble\.com|odysee\.com|bitchute\.com)",
+    r"nicovideo\.jp|rumble\.com|odysee\.com|bitchute\.com|"
+    # VK family — yt-dlp has native vk / vk:uservideos / vk:wallpost / VKPlay extractors
+    r"vk\.com|vkvideo\.ru|vkplay\.live)",
+    re.I,
+)
+
+# ── Sites that need the page-scraper fallback ─────────────────
+# These are NOT in yt-dlp. We try to pull the direct video URL from the page HTML.
+_SCRAPE_RE  = re.compile(
+    r"(vidmoli\.com|sbnet\.(?:ru|com|net|cc)|"
+    # common generic hosters that embed via jwplayer / videojs
+    r"streamtape\.com|mixdrop\.co|upstream\.to|dood\.(?:la|re|so|to|watch)|"
+    r"fembed\.com|filemoon\.sx|voe\.sx)",
     re.I,
 )
 
@@ -88,6 +107,7 @@ def classify(url: str) -> str:
     if _GDRIVE_RE.search(url):   return "gdrive"
     if _MF_RE.search(url):       return "mediafire"
     if _YTDLP_RE.search(url):    return "ytdlp"
+    if _SCRAPE_RE.search(url):   return "scrape"
     return "direct"
 
 
@@ -133,6 +153,133 @@ async def download_direct(
             "(connection dropped mid-transfer)."
         )
     return fpath
+
+
+# ── Generic page video scraper (NEW) ──────────────────────────
+#
+# For sites not in yt-dlp: fetches the page HTML then hunts for
+# video URLs using a layered strategy:
+#
+#   Layer 1 — <source src="..."> and <video src="..."> tags
+#   Layer 2 — og:video meta tag
+#   Layer 3 — JSON/JS variable patterns  (file:"...", src:"...", url:"...")
+#              covering jwplayer, videojs, plyr, hls.js configs
+#   Layer 4 — Any bare https?://... URL ending in .mp4/.m3u8/.webm/.ts
+#
+# Returns the best candidate URL (prefers mp4 over m3u8 over webm).
+# Raises RuntimeError if nothing is found.
+
+_VIDEO_EXTS_PAT = re.compile(
+    r'https?://[^\s\'"<>]+\.(?:mp4|m3u8|webm|ts|mkv|avi|mov)(?:[?#][^\s\'"<>]*)?',
+    re.I,
+)
+
+_JS_VIDEO_PAT = re.compile(
+    r'''(?:file|src|url|source|video_url|stream|hls|mp4|dash)\s*[:=,]\s*['"]?(https?://[^\s'"<>&]+)['"]?''',
+    re.I,
+)
+
+_OG_VIDEO_PAT = re.compile(
+    r'<meta[^>]+property=["\']og:video(?::url)?["\'][^>]+content=["\']([^"\']+)["\']',
+    re.I,
+)
+
+_SRC_PAT = re.compile(
+    r'<(?:source|video)[^>]+src=["\']([^"\']+)["\']',
+    re.I,
+)
+
+
+def _rank_video_url(url: str) -> int:
+    """Lower score = better candidate."""
+    u = url.lower()
+    if ".mp4" in u:  return 0
+    if ".webm" in u: return 1
+    if ".ts" in u:   return 2
+    if ".m3u8" in u: return 3  # HLS — works but needs ffmpeg/aria2
+    return 4
+
+
+async def _scrape_page_video(url: str) -> str:
+    """
+    Fetch `url`, scrape the HTML for a playable video URL, return the best one.
+    Raises RuntimeError if no video URL is found.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": url,
+    }
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as sess:
+        async with sess.get(url, allow_redirects=True) as resp:
+            resp.raise_for_status()
+            html = await resp.text(errors="replace")
+
+    candidates: list[str] = []
+
+    # Layer 1 — <source> / <video src>
+    for m in _SRC_PAT.finditer(html):
+        u = m.group(1).strip()
+        if u.startswith("http"):
+            candidates.append(u)
+
+    # Layer 2 — og:video meta
+    for m in _OG_VIDEO_PAT.finditer(html):
+        u = m.group(1).strip()
+        if u.startswith("http"):
+            candidates.append(u)
+
+    # Layer 3 — JS variable patterns
+    for m in _JS_VIDEO_PAT.finditer(html):
+        u = m.group(1).strip()
+        if u.startswith("http") and any(
+            ext in u.lower() for ext in (".mp4", ".m3u8", ".webm", ".ts", ".mkv")
+        ):
+            candidates.append(u)
+
+    # Layer 4 — bare URLs with video extensions anywhere in page
+    for m in _VIDEO_EXTS_PAT.finditer(html):
+        candidates.append(m.group(0))
+
+    # Deduplicate preserving order
+    seen: set = set()
+    unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+
+    if not unique:
+        raise RuntimeError(
+            f"No video URL found on page: {url}\n"
+            "The site may use obfuscated JS, DRM, or require login."
+        )
+
+    # Pick best: prefer mp4, then webm, then m3u8
+    unique.sort(key=_rank_video_url)
+    return unique[0]
+
+
+async def download_scrape(
+    url: str, dest: str, progress: Optional[ProgressCB] = None,
+) -> str:
+    """
+    Scrape a page for its video URL, then download that URL directly.
+    Used for sites not supported by yt-dlp (vidmoli, sbnet, etc.).
+    """
+    video_url = await _scrape_page_video(url)
+
+    # m3u8 (HLS) needs aria2c or ffmpeg — hand off to aria2c
+    if ".m3u8" in video_url.lower():
+        return await download_aria2(video_url, dest, is_file=False, progress=progress)
+
+    return await download_direct(video_url, dest, progress=progress)
 
 
 # ── yt-dlp (process pool) ──────────────────────────────────────
@@ -466,12 +613,6 @@ async def download_aria2(
             f"aria2c exited {proc.returncode}: {err.decode(errors='replace')[-300:]}"
         )
 
-    # For magnet / torrent downloads the output is a directory that may contain
-    # multiple files.  Return the directory so the caller (smart_download →
-    # _launch_download, or handle_torrent_file → _upload_and_cleanup) can
-    # iterate all files with all_video_files().
-    # For plain HTTP downloads (single file) keep the original behaviour of
-    # returning the largest file directly.
     if is_magnet or is_file:
         from services.utils import all_video_files as _avf
         if not _avf(dest, min_bytes=0) and not largest_file(dest):
@@ -495,7 +636,7 @@ async def smart_download(
     progress:   Optional[ProgressCB] = None,
     user_id:    int = 0,
     label:      str = "",
-    msg         = None,   # if provided, progress edits this message inline
+    msg         = None,
 ) -> str:
     from services.task_runner import tracker, TaskRecord
 
@@ -506,6 +647,7 @@ async def smart_download(
         "gdrive":    "gdrive",
         "mediafire": "mediafire",
         "ytdlp":     "ytdlp",
+        "scrape":    "direct",   # scrape resolves to a direct URL
         "direct":    "direct",
     }.get(kind, "direct")
 
@@ -526,7 +668,7 @@ async def smart_download(
 
     from services.task_runner import _stats_cache
 
-    _last_edit  = [0.0]  # throttle gate for _tracked_progress
+    _last_edit  = [0.0]
     user_cfg    = await settings.get(record.user_id)
     panel_style = user_cfg.get("progress_style", "B")
 
@@ -583,6 +725,7 @@ async def _dispatch(
     import logging as _lg
     _dlog = _lg.getLogger(__name__)
 
+    # ── Dedicated strategies ──────────────────────────────────
     if kind == "magnet":
         return await download_aria2(
             url, dest, is_file=False,
@@ -602,13 +745,49 @@ async def _dispatch(
         return await download_ytdlp(url, dest, audio_only=audio_only,
                                     fmt_id=fmt_id, progress=progress)
 
-    # DIRECT: download_direct first, aria2c fallback
-    # NEVER use download_parallel by default — burns single-use CDN auth tokens
+    # ── Scrape sites (vidmoli, sbnet, etc.) ───────────────────
+    # Strategy: page-scrape → direct on extracted URL
+    # Falls back to yt-dlp probe → aria2c if scrape finds nothing.
+    if kind == "scrape":
+        try:
+            return await download_scrape(url, dest, progress=progress)
+        except Exception as scrape_exc:
+            _dlog.warning("[Downloader] page-scrape failed (%s) — trying yt-dlp", scrape_exc)
+        try:
+            return await download_ytdlp(url, dest, audio_only=audio_only, progress=progress)
+        except Exception as ytdlp_exc:
+            _dlog.warning("[Downloader] yt-dlp also failed (%s) — trying aria2c", ytdlp_exc)
+        return await download_aria2(
+            url, dest, is_file=False,
+            progress=progress, task_record=task_record,
+        )
+
+    # ── DIRECT: four-attempt fallback chain ───────────────────
+    # 1. download_direct  — fastest for plain file links
+    # 2. yt-dlp           — handles streaming sites missed by classifier
+    # 3. page-scrape      — last resort HTML extraction
+    # 4. aria2c           — final fallback
+    # NEVER use download_parallel — burns single-use CDN auth tokens
+    direct_exc = ytdlp_exc = scrape_exc = None
+
     try:
         return await download_direct(url, dest, progress=progress)
-    except Exception as direct_exc:
-        _direct_exc = direct_exc            # save before Python 3 deletes it at end of except block
-        _dlog.warning("[Downloader] direct failed (%s) — trying aria2c", _direct_exc)
+    except Exception as exc:
+        direct_exc = exc
+        _dlog.warning("[Downloader] direct failed (%s) — trying yt-dlp", exc)
+
+    try:
+        return await download_ytdlp(url, dest, audio_only=audio_only,
+                                    fmt_id=fmt_id, progress=progress)
+    except Exception as exc:
+        ytdlp_exc = exc
+        _dlog.warning("[Downloader] yt-dlp failed (%s) — trying page-scrape", exc)
+
+    try:
+        return await download_scrape(url, dest, progress=progress)
+    except Exception as exc:
+        scrape_exc = exc
+        _dlog.warning("[Downloader] page-scrape failed (%s) — trying aria2c", exc)
 
     try:
         return await download_aria2(
@@ -616,10 +795,12 @@ async def _dispatch(
             progress=progress, task_record=task_record,
         )
     except Exception as aria2_exc:
-        _dlog.error("[Downloader] aria2c also failed: %s", aria2_exc)
+        _dlog.error("[Downloader] all methods failed for %s", url)
         raise RuntimeError(
             f"All download methods failed.\n"
-            f"aiohttp: {_direct_exc}\n"
+            f"direct:  {direct_exc}\n"
+            f"yt-dlp:  {ytdlp_exc}\n"
+            f"scrape:  {scrape_exc}\n"
             f"aria2c:  {aria2_exc}"
         ) from aria2_exc
 
