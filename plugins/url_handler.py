@@ -107,25 +107,15 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
              InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
         ])
     elif kind in ("magnet", "torrent"):
-        seedr_ready = bool(
-            os.environ.get("SEEDR_USERNAME") and os.environ.get("SEEDR_PASSWORD")
-        )
-        rows = [
+        return InlineKeyboardMarkup([
             [InlineKeyboardButton("🟢 Download (local)",    callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("🔵 Stream Extractor",    callback_data=f"dl|magnet_stream|{token}")],
-            [InlineKeyboardButton("📊 Media Info",          callback_data=f"dl|info|{token}"),
-             InlineKeyboardButton("🔥 Hardsub",            callback_data=f"dl|hardsub|{token}")],
-            [InlineKeyboardButton("🟡 Convert",             callback_data=f"dl|convert|{token}"),
-             InlineKeyboardButton("❌ Cancel",              callback_data=f"dl|cancel|{token}")],
-        ]
-        if seedr_ready:
-            rows.insert(0, [
-                InlineKeyboardButton(
-                    "☁️ Download via Seedr",
-                    callback_data=f"dl|seedr|{token}",
-                )
-            ])
-        return InlineKeyboardMarkup(rows)
+             InlineKeyboardButton("☁️ Download via Seedr",  callback_data=f"dl|seedr|{token}")],
+            [InlineKeyboardButton("🔵 Stream Extractor",    callback_data=f"dl|magnet_stream|{token}"),
+             InlineKeyboardButton("📊 Media Info",          callback_data=f"dl|info|{token}")],
+            [InlineKeyboardButton("🔥 Hardsub",            callback_data=f"dl|hardsub|{token}"),
+             InlineKeyboardButton("🟡 Convert",             callback_data=f"dl|convert|{token}")],
+            [InlineKeyboardButton("❌ Cancel",              callback_data=f"dl|cancel|{token}")],
+        ])
     elif kind == "gdrive":
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🟢 Download",           callback_data=f"dl|video|{token}"),
