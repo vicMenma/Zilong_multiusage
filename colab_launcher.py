@@ -27,6 +27,8 @@ LOG_CHANNEL   = 0      # @param {type:"integer"}
 NGROK_TOKEN       = ""  # @param {type:"string"}
 CC_WEBHOOK_SECRET = ""  # @param {type:"string"}
 CC_API_KEY        = ""  # @param {type:"string"}
+SEEDR_USERNAME    = ""  # @param {type:"string"}
+SEEDR_PASSWORD    = ""  # @param {type:"string"}
 GITHUB_TOKEN      = ""  # @param {type:"string"}
 # Set manually only for VPS/EC2 — on Colab this is auto-filled via Serveo tunnel
 WEBHOOK_BASE_URL  = ""  # @param {type:"string"}
@@ -78,6 +80,8 @@ LOG_CHANNEL       = _secret_int("LOG_CHANNEL")   or LOG_CHANNEL
 NGROK_TOKEN       = _secret("NGROK_TOKEN") or _secret("NGROK_AUTHTOKEN") or NGROK_TOKEN
 CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET") or CC_WEBHOOK_SECRET
 CC_API_KEY        = _secret("CC_API_KEY")        or CC_API_KEY
+SEEDR_USERNAME    = _secret("SEEDR_USERNAME")    or SEEDR_USERNAME
+SEEDR_PASSWORD    = _secret("SEEDR_PASSWORD")    or SEEDR_PASSWORD
 GITHUB_TOKEN      = _secret("GITHUB_TOKEN")      or GITHUB_TOKEN
 WEBHOOK_BASE_URL  = _secret("WEBHOOK_BASE_URL")  or WEBHOOK_BASE_URL
 
@@ -380,6 +384,8 @@ env_lines = [
     f"NGROK_TOKEN={NGROK_TOKEN}",
     f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
     f"CC_API_KEY={CC_API_KEY}",
+    f"SEEDR_USERNAME={SEEDR_USERNAME}",
+    f"SEEDR_PASSWORD={SEEDR_PASSWORD}",
     f"WEBHOOK_BASE_URL={WEBHOOK_BASE_URL}",
 ]
 for optional in ("ADMINS", "GDRIVE_SA_JSON"):
