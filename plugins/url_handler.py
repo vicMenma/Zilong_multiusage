@@ -10,6 +10,10 @@ Other fixes (unchanged from prior audit):
   - _launch_download: live progress panel before smart_download
   - _handle_info (direct URLs): ffprobe on URL, zero bytes downloaded
   - _launch_download double-delete: only one _safe_delete call
+
+SEEDR+HARDSUB PATCH:
+  - Added "🔥 Seedr+Hardsub" button to magnet/torrent keyboard
+  - Uses shs| callback prefix → handled by plugins/seedr_hardsub.py
 """
 from __future__ import annotations
 
@@ -107,14 +111,16 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
              InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
         ])
     elif kind in ("magnet", "torrent"):
+        # ── PATCHED: added Seedr+Hardsub button ──────────────
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🟢 Download (local)",    callback_data=f"dl|video|{token}"),
              InlineKeyboardButton("☁️ Download via Seedr",  callback_data=f"dl|seedr|{token}")],
             [InlineKeyboardButton("🔵 Stream Extractor",    callback_data=f"dl|magnet_stream|{token}"),
              InlineKeyboardButton("📊 Media Info",          callback_data=f"dl|info|{token}")],
-            [InlineKeyboardButton("🔥 Hardsub",            callback_data=f"dl|hardsub|{token}"),
-             InlineKeyboardButton("🟡 Convert",             callback_data=f"dl|convert|{token}")],
-            [InlineKeyboardButton("❌ Cancel",              callback_data=f"dl|cancel|{token}")],
+            [InlineKeyboardButton("🔥 Hardsub (local)",     callback_data=f"dl|hardsub|{token}"),
+             InlineKeyboardButton("🔥 Seedr+Hardsub",       callback_data=f"shs|start|{token}")],
+            [InlineKeyboardButton("🟡 Convert",             callback_data=f"dl|convert|{token}"),
+             InlineKeyboardButton("❌ Cancel",              callback_data=f"dl|cancel|{token}")],
         ])
     elif kind == "gdrive":
         return InlineKeyboardMarkup([
@@ -768,16 +774,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^dlq\|"))
 async def dl_quality_cb(client: Client, cb: CallbackQuery):
-    """
-    Handles all quality/format picker interactions for yt-dlp video downloads.
-
-    Callback data patterns:
-      dlq|bucket|<token>|<bucket>   → show formats for that quality bucket
-      dlq|best|<token>|             → download best quality (auto)
-      dlq|audio|<token>|            → download best audio only
-      dlq|fmt|<token>|<fmt_id>      → download a specific format id
-      dlq|back|<token>|             → return to the quality bucket list
-    """
     parts = cb.data.split("|", 3)
     if len(parts) < 4:
         return await cb.answer("Invalid data.", show_alert=True)
@@ -794,7 +790,6 @@ async def dl_quality_cb(client: Client, cb: CallbackQuery):
             parse_mode=enums.ParseMode.HTML,
         )
 
-    # ── Shortcuts: best quality or audio-only ─────────────────
     if action in ("best", "audio"):
         audio_only = (action == "audio")
         _cache.pop(token, None)
@@ -804,7 +799,6 @@ async def dl_quality_cb(client: Client, cb: CallbackQuery):
         )
         return
 
-    # ── Specific format chosen → start download ───────────────
     if action == "fmt":
         fmt_id = extra or None
         _cache.pop(token, None)
@@ -814,19 +808,16 @@ async def dl_quality_cb(client: Client, cb: CallbackQuery):
         )
         return
 
-    # ── Back → re-display quality buckets ─────────────────────
     if action == "back":
         st = await cb.message.edit("📡 Loading quality list…")
         await _show_ytdlp_quality_picker(client, st, url, token, uid)
         return
 
-    # ── Bucket chosen → list individual formats ───────────────
     if action == "bucket":
         bucket = extra
         raw    = _cache.get(f"ytinfo|{token}")
 
         if not raw:
-            # Info expired — re-fetch transparently
             st = await cb.message.edit("📡 Re-fetching formats…")
             await _show_ytdlp_quality_picker(client, st, url, token, uid)
             return
