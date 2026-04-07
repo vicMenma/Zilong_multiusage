@@ -2,21 +2,9 @@
 plugins/hardsub.py
 CloudConvert-powered hardsubbing — batch multi-video support.
 
-DOWNLOAD-FIRST IMPROVEMENT:
-  Previously:
-    - Direct URLs → CloudConvert fetched via URL import
-    - CDN auth tokens expire, CC can't access private URLs
-    - Some CDN links are single-use (token burned on first request)
-  Now:
-    - ALL video sources download locally first
-    - CC always receives a file upload (100% reliable)
-    - start_hardsub_for_url(): downloads before asking for subtitle
-    - hardsub_url_handler() direct URL branch: downloads before queuing
-
-CRITICAL FIX (unchanged from prior audit):
-  _submit_one_job was calling cc_job_store.add() but never calling
-  _ensure_poller() afterwards — jobs would sit forever if poller had stopped.
-  Fix: call _ensure_poller() immediately after cc_job_store.add().
+PATCH: _submit_one_job() now uses build_cc_output_name() from cc_sanitize
+  instead of re.sub(r'[^\w\s\-\[\]()]', ...) which kept [] and spaces —
+  both of which silently break CloudConvert's FFmpeg subtitles filter.
 """
 from __future__ import annotations
 
@@ -33,6 +21,7 @@ from pyrogram.types import (
 
 from core.config import cfg
 from core.session import users
+from services.cc_sanitize import build_cc_output_name
 from services.utils import human_size, make_tmp, cleanup, safe_edit
 
 log = logging.getLogger(__name__)
@@ -64,15 +53,6 @@ async def start_hardsub_for_url(
 ) -> None:
     """
     DOWNLOAD-FIRST: Download the video locally before asking for subtitle.
-
-    Previously this stored the URL for CloudConvert to fetch via URL import.
-    URL import fails for:
-      - CDN auth URLs (token consumed on CC's fetch request)
-      - Single-use signed tokens (S3, Cloudfront, etc.)
-      - Any non-public URL
-
-    Now: download locally → CC always gets a file upload → 100% reliable.
-    The download progress is shown inline in the existing status message (st).
     """
     _clear(uid)
     tmp = make_tmp(cfg.download_dir, uid)
@@ -82,8 +62,7 @@ async def start_hardsub_for_url(
         f"⬇️ <b>Downloading video for Hardsub…</b>\n"
         "──────────────────────\n\n"
         f"📁 <code>{fname[:45]}</code>\n\n"
-        "<i>Download-first → CC file upload is reliable for any URL type.\n"
-        "URL import fails for CDN auth tokens and signed links.</i>",
+        "<i>Download-first → CC file upload is reliable for any URL type.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
@@ -91,7 +70,6 @@ async def start_hardsub_for_url(
         from services.downloader import smart_download
         path = await smart_download(url, tmp, user_id=uid, label=fname, msg=st)
 
-        # smart_download may return a directory for magnets/torrents
         if os.path.isdir(path):
             from services.utils import largest_file
             resolved = largest_file(path)
@@ -159,14 +137,19 @@ async def _submit_one_job(
     from services.cc_job_store import cc_job_store, CCJob
 
     video_fname = video.get("fname", "video.mkv")
-    name_base   = os.path.splitext(video_fname)[0]
-    output_name = re.sub(r'[^\w\s\-\[\]()]', '_', name_base).strip() + " [VOSTFR].mp4"
+
+    # PATCH: build_cc_output_name() replaces the old re.sub() which kept
+    # brackets and spaces — both silently break CloudConvert's FFmpeg job.
+    # build_cc_output_name sanitizes via sanitize_for_cc() internally.
+    output_name = build_cc_output_name(video_fname, suffix="VOSTFR")
+
+    log.info("[Hardsub] CC-safe output name: %s → %s", video_fname, output_name)
 
     try:
         job_id = await submit_hardsub(
             api_key,
             video_path=video.get("path"),
-            video_url=video.get("url"),   # None for download-first path
+            video_url=video.get("url"),
             subtitle_path=sub_path,
             output_name=output_name,
             scale_height=0,
@@ -182,7 +165,6 @@ async def _submit_one_job(
         ))
         log.info("[Hardsub] Registered job %s in cc_job_store for uid=%d", job_id, uid)
 
-        # Ensure ccstatus poller is running (it stops after 3 idle cycles)
         try:
             from plugins.ccstatus import _ensure_poller
             _ensure_poller()
@@ -463,27 +445,20 @@ async def hardsub_url_handler(client: Client, msg: Message):
     if not url_re.match(text):
         return
 
-    # ── Subtitle URL ──────────────────────────────────────────
     if state["step"] == "waiting_subtitle":
         await _handle_subtitle_url(msg, state, text, uid)
         msg.stop_propagation()
         return
 
-    # ── Video URL — always download first ────────────────────
     from services.downloader import classify
     kind = classify(text)
 
     if kind == "direct":
-        # DOWNLOAD-FIRST: previously stored as URL for CC to import.
-        # CDN auth tokens / signed S3 links / Cloudfront expire or are
-        # single-use — CC's import would fail silently.
-        # Download locally → CC always gets a reliable file upload.
         raw_name = text.split("/")[-1].split("?")[0]
         fname    = _urlparse.unquote_plus(raw_name)[:50] or "video.mkv"
         st = await msg.reply(
             f"⬇️ <b>Downloading video…</b>\n"
-            f"<code>{fname[:40]}</code>\n\n"
-            "<i>Download-first for reliable CC upload.</i>",
+            f"<code>{fname[:40]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
         tmp = state["tmp"]

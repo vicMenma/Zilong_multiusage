@@ -107,14 +107,25 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
              InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
         ])
     elif kind in ("magnet", "torrent"):
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🟢 Download",           callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("🔵 Stream Extractor",   callback_data=f"dl|magnet_stream|{token}")],
-            [InlineKeyboardButton("📊 Media Info",         callback_data=f"dl|info|{token}"),
-             InlineKeyboardButton("🔥 Hardsub",           callback_data=f"dl|hardsub|{token}")],
-            [InlineKeyboardButton("🟡 Convert",            callback_data=f"dl|convert|{token}"),
-             InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
-        ])
+        seedr_ready = bool(
+            os.environ.get("SEEDR_USERNAME") and os.environ.get("SEEDR_PASSWORD")
+        )
+        rows = [
+            [InlineKeyboardButton("🟢 Download (local)",    callback_data=f"dl|video|{token}"),
+             InlineKeyboardButton("🔵 Stream Extractor",    callback_data=f"dl|magnet_stream|{token}")],
+            [InlineKeyboardButton("📊 Media Info",          callback_data=f"dl|info|{token}"),
+             InlineKeyboardButton("🔥 Hardsub",            callback_data=f"dl|hardsub|{token}")],
+            [InlineKeyboardButton("🟡 Convert",             callback_data=f"dl|convert|{token}"),
+             InlineKeyboardButton("❌ Cancel",              callback_data=f"dl|cancel|{token}")],
+        ]
+        if seedr_ready:
+            rows.insert(0, [
+                InlineKeyboardButton(
+                    "☁️ Download via Seedr",
+                    callback_data=f"dl|seedr|{token}",
+                )
+            ])
+        return InlineKeyboardMarkup(rows)
     elif kind == "gdrive":
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🟢 Download",           callback_data=f"dl|video|{token}"),
@@ -435,6 +446,118 @@ async def _show_ytdlp_quality_picker(
 # Download callback
 # ─────────────────────────────────────────────────────────────
 
+
+# ─────────────────────────────────────────────────────────────
+# Seedr cloud download pipeline  (NEW)
+# ─────────────────────────────────────────────────────────────
+
+async def _seedr_download(client, st, magnet: str, uid: int) -> None:
+    """
+    Full Seedr pipeline with live status panel.
+    Seedr downloads the torrent on their servers at datacenter speed,
+    then the bot downloads the resulting files via HTTPS and uploads to Telegram.
+    Files are auto-deleted from Seedr after download to stay within 2 GB free tier.
+    """
+    from services.seedr import download_via_seedr
+    from services.utils import make_tmp, cleanup, human_size
+    from core.session import settings as _settings
+
+    tmp = make_tmp(cfg.download_dir, uid)
+
+    async def _progress(stage: str, pct: float, detail: str) -> None:
+        icons = {
+            "adding":      "⬆️",
+            "waiting":     "⏳",
+            "downloading": "☁️",
+            "fetching":    "🔗",
+            "dl_file":     "⬇️",
+        }
+        icon = icons.get(stage, "⏳")
+        bar  = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+        await safe_edit(
+            st,
+            f"☁️ <b>Seedr Cloud Download</b>\n"
+            "──────────────────────\n\n"
+            f"{icon} <i>{detail}</i>\n\n"
+            f"<code>[{bar}]</code>  <b>{pct:.0f}%</b>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    try:
+        local_paths = await download_via_seedr(
+            magnet, tmp, progress_cb=_progress, timeout_s=7200,
+        )
+    except Exception as exc:
+        log.error("[Seedr] Pipeline failed: %s", exc, exc_info=True)
+        cleanup(tmp)
+        return await safe_edit(
+            st,
+            f"❌ <b>Seedr download failed</b>\n\n<code>{str(exc)[:300]}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    if not local_paths:
+        cleanup(tmp)
+        return await safe_edit(
+            st, "❌ <b>Seedr: no files downloaded.</b>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    total = len(local_paths)
+    if total > 1:
+        await safe_edit(
+            st,
+            f"✅ <b>Seedr done — {total} files</b>\n📤 <i>Uploading…</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    s      = await _settings.get(uid)
+    prefix = s.get("prefix", "").strip()
+    suffix_s = s.get("suffix", "").strip()
+
+    try:
+        for i, fpath in enumerate(local_paths, 1):
+            fsize = os.path.getsize(fpath)
+            if fsize > cfg.file_limit_b:
+                await client.send_message(
+                    uid,
+                    f"⚠️ <b>Skipped ({i}/{total})</b>\n"
+                    f"<code>{os.path.basename(fpath)}</code>\n"
+                    f"<code>{human_size(fsize)}</code> exceeds limit",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+                continue
+
+            fname     = os.path.basename(fpath)
+            name, ext = os.path.splitext(fname)
+            final     = f"{prefix}{name}{suffix_s}{ext}"
+            if final != fname:
+                new_path = os.path.join(os.path.dirname(fpath), final)
+                try:
+                    os.rename(fpath, new_path)
+                    fpath = new_path
+                except OSError:
+                    pass
+
+            upload_st = await client.send_message(
+                uid,
+                f"📤 <b>Uploading {i}/{total}</b>\n"
+                f"<code>{os.path.basename(fpath)}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            await upload_file(client, upload_st, fpath, user_id=uid)
+
+            if i < total:
+                await asyncio.sleep(2)
+
+        try:
+            await st.delete()
+        except Exception:
+            pass
+
+    finally:
+        cleanup(tmp)
+
 @Client.on_callback_query(filters.regex(r"^dl\|"))
 async def dl_cb(client: Client, cb: CallbackQuery):
     parts = cb.data.split("|")
@@ -504,6 +627,28 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         }
         _evict_magnet_probes()
         await _show_magnet_streams(client, st, sess_tok, sd, dur, fname, uid)
+        return
+
+    # ── Seedr cloud download ──────────────────────────────────
+    if mode == "seedr":
+        username = os.environ.get("SEEDR_USERNAME", "").strip()
+        password = os.environ.get("SEEDR_PASSWORD", "").strip()
+        if not username or not password:
+            return await safe_edit(
+                cb.message,
+                "❌ <b>Seedr not configured</b>\n\n"
+                "Add to your .env:\n"
+                "<code>SEEDR_USERNAME=your@email.com</code>\n"
+                "<code>SEEDR_PASSWORD=yourpassword</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        st = await cb.message.edit(
+            "☁️ <b>Seedr Cloud Download</b>\n"
+            "──────────────────────\n\n"
+            "⬆️ <i>Submitting to Seedr servers…</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        asyncio.create_task(_seedr_download(client, st, url, uid))
         return
 
     # ── Hardsub ───────────────────────────────────────────────
