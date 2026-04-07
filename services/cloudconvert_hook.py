@@ -196,6 +196,7 @@ def _build_app() -> web.Application:
 
 
 async def _register_webhook_with_cc(webhook_url: str, api_key: str, secret: str) -> bool:
+    """Register (or replace) webhook on a single CloudConvert account."""
     import aiohttp as _aiohttp
     CC_API = "https://api.cloudconvert.com/v2"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -205,7 +206,7 @@ async def _register_webhook_with_cc(webhook_url: str, api_key: str, secret: str)
 
     try:
         async with _aiohttp.ClientSession() as sess:
-            # delete existing webhooks
+            # delete existing webhooks on this account first
             async with sess.get(f"{CC_API}/webhooks", headers=headers) as resp:
                 if resp.status == 200:
                     existing = (await resp.json()).get("data", [])
@@ -213,21 +214,55 @@ async def _register_webhook_with_cc(webhook_url: str, api_key: str, secret: str)
                         wh_id = wh.get("id")
                         if wh_id:
                             await sess.delete(f"{CC_API}/webhooks/{wh_id}", headers=headers)
-                            log.info("[CC-Hook] Deleted old webhook id=%s", wh_id)
+                            log.info("[CC-Hook] Deleted old webhook id=%s (key=...%s)",
+                                     wh_id, api_key[-6:])
 
             async with sess.post(f"{CC_API}/webhooks", json=payload, headers=headers) as resp:
                 data = await resp.json()
                 if resp.status in (200, 201):
                     wh_id = (data.get("data") or {}).get("id", "?")
-                    log.info("[CC-Hook] Webhook registered with CC: id=%s url=%s", wh_id, webhook_url)
+                    log.info("[CC-Hook] Webhook registered: id=%s url=%s key=...%s",
+                             wh_id, webhook_url, api_key[-6:])
                     return True
                 else:
-                    log.warning("[CC-Hook] Webhook registration failed: %s %s",
-                                resp.status, data.get("message", str(data)))
+                    log.warning("[CC-Hook] Webhook registration failed (key=...%s): %s %s",
+                                api_key[-6:], resp.status, data.get("message", str(data)))
                     return False
     except Exception as exc:
-        log.warning("[CC-Hook] Webhook auto-registration error: %s", exc)
+        log.warning("[CC-Hook] Webhook auto-registration error (key=...%s): %s",
+                    api_key[-6:], exc)
         return False
+
+
+async def _register_webhook_all_keys(
+    webhook_url: str, api_keys_raw: str, secret: str
+) -> tuple[int, int]:
+    """
+    Register the webhook on EVERY account in the comma-separated CC_API_KEY string.
+
+    CloudConvert credits are per-account, so if the user has N keys for rotation,
+    ALL N accounts must have the webhook registered — otherwise only the first key's
+    jobs deliver via webhook; the rest fall back to the slow 5 s ccstatus poller.
+
+    Returns (ok_count, total_count).
+    """
+    from services.cloudconvert_api import parse_api_keys
+
+    keys = parse_api_keys(api_keys_raw)
+    if not keys:
+        log.warning("[CC-Hook] No valid API keys found in CC_API_KEY — webhook not registered")
+        return 0, 0
+
+    log.info("[CC-Hook] Registering webhook on %d account(s)…", len(keys))
+
+    results = await asyncio.gather(
+        *[_register_webhook_with_cc(webhook_url, k, secret) for k in keys],
+        return_exceptions=True,
+    )
+
+    ok = sum(1 for r in results if r is True)
+    log.info("[CC-Hook] Webhook registration complete: %d/%d accounts OK", ok, len(keys))
+    return ok, len(keys)
 
 
 # ── Tunnel backends ───────────────────────────────────────────────────────────
@@ -417,7 +452,7 @@ async def start_webhook_server(port: int = LISTEN_PORT) -> str:
         webhook_url = f"{preset_url}/webhook/cloudconvert"
         log.info("[CC-Hook] Using preset WEBHOOK_BASE_URL: %s", webhook_url)
         if api_key:
-            await _register_webhook_with_cc(webhook_url, api_key, WEBHOOK_SECRET)
+            await _register_webhook_all_keys(webhook_url, api_key, WEBHOOK_SECRET)
         return webhook_url
 
     # 3. Try Cloudflare tunnel (no account needed, always first)
@@ -438,15 +473,19 @@ async def start_webhook_server(port: int = LISTEN_PORT) -> str:
 
     webhook_url = f"{public_url}/webhook/cloudconvert"
 
-    # 5. Auto-register with CloudConvert
+    # 5. Auto-register with ALL CloudConvert accounts
     reg_status = "⚠️ No CC_API_KEY — cannot auto-register webhook"
     if api_key:
-        registered = await _register_webhook_with_cc(webhook_url, api_key, WEBHOOK_SECRET)
-        reg_status = (
-            "✅ Auto-registered with CloudConvert"
-            if registered
-            else "⚠️ Auto-registration failed — set manually in CC dashboard"
-        )
+        ok, total = await _register_webhook_all_keys(webhook_url, api_key, WEBHOOK_SECRET)
+        if total == 0:
+            reg_status = "⚠️ No valid API keys found in CC_API_KEY"
+        elif ok == total:
+            reg_status = f"✅ Webhook registered on all {total} CC account(s)"
+        else:
+            reg_status = (
+                f"⚠️ Registered on {ok}/{total} CC accounts — "
+                "check logs for failed keys"
+            )
 
     # 6. Notify owner via Telegram
     try:
