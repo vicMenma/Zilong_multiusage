@@ -5,18 +5,7 @@ Handles URL messages and torrent files.
 DOWNLOAD-FIRST IMPROVEMENTS (applied directly):
 
 PATCH 1 — _probe_magnet_file(): full download instead of 30 MB cap
-  Previously: stopped after PROBE_ENOUGH = 30 MB, paused aria2, probed partial file
-  Problem: MKV files store audio language tags, subtitle tracks, and chapter
-  metadata throughout the file. 30 MB of a 500 MB file = incomplete mediainfo.
-  Fix: download complete file → 100% accurate mediainfo + file ready for
-  hardsub/convert immediately (no re-download needed).
-
 PATCH 2 — ccv_resolution_cb(): always download-first for CC convert
-  Previously: direct URLs used CC URL import (CC fetches from URL)
-  Problem: CDN auth tokens / signed S3 / Cloudfront URLs are single-use or
-  short-lived — CC's import fetch burns the token, then errors silently.
-  Fix: all URL types download locally first → CC always gets file upload → reliable.
-
 Other fixes (unchanged from prior audit):
   - _launch_download: live progress panel before smart_download
   - _handle_info (direct URLs): ffprobe on URL, zero bytes downloaded
@@ -225,36 +214,10 @@ async def handle_torrent_file(client: Client, msg: Message, media, uid: int) -> 
 
 
 # ─────────────────────────────────────────────────────────────
-# Magnet probe — COMPLETE REWRITE: use smart_download pipeline
+# Magnet probe
 # ─────────────────────────────────────────────────────────────
 
 async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str | None, dict]:
-    """
-    Download a magnet torrent completely then probe streams locally.
-
-    ROOT CAUSE of the 30 MB bug (survived all previous patch attempts):
-      The old code used aria2p API directly with TWO separate magnet adds:
-        dl  = api.add_magnet(magnet, {"bt-metadata-only": "true"})  ← metadata fetch
-        dl2 = api.add_magnet(magnet, {"select-file": "1"})          ← file download
-
-      With follow-torrent="mem", dl2 has to re-fetch metadata from scratch.
-      During this re-fetch aria2c briefly reports completed_length ~= metadata
-      size, then fires is_complete=True for the METADATA PHASE — not the file.
-      The loop breaks immediately. The actual file never downloads.
-      This happened regardless of whether PROBE_ENOUGH was in the code or not.
-
-    Fix: throw out the entire manual aria2p approach.
-      Use smart_download() from downloader.py — the same proven pipeline
-      used by all other download operations in the bot. It handles magnets
-      correctly via download_aria2() which uses aria2c subprocess (not API)
-      and reliably waits for the real file to finish.
-
-    Benefits:
-      - 100% accurate stream detection (full file locally)
-      - Full mediainfo (streams throughout file, not just header)
-      - File cached in _magnet_probe — no re-download for hardsub/convert
-      - Live progress panel via msg=st parameter
-    """
     from services import ffmpeg as FF
     from services.downloader import smart_download as _smart_dl
 
@@ -270,10 +233,6 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
     )
 
     try:
-        # smart_download handles the full magnet pipeline correctly:
-        # - aria2c subprocess (not aria2p API — avoids the metadata-phase bug)
-        # - live progress edited into st via msg=st
-        # - returns directory path for magnets (may contain multiple files)
         path_or_dir = await _smart_dl(
             magnet, tmp,
             user_id=uid,
@@ -281,7 +240,6 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
             msg=st,
         )
 
-        # Resolve to the largest/best video file in the download
         if os.path.isdir(path_or_dir):
             path = largest_file(path_or_dir)
             if not path:
@@ -329,7 +287,6 @@ async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple[str | None, str
         return None, None, {}
 
 
-
 # ─────────────────────────────────────────────────────────────
 # Background magnet download for hardsub flow
 # ─────────────────────────────────────────────────────────────
@@ -368,6 +325,113 @@ async def _hardsub_magnet_dl(st, url: str, uid: int, tmp: str, fname: str) -> No
 
 
 # ─────────────────────────────────────────────────────────────
+# yt-dlp quality picker  (NEW)
+# ─────────────────────────────────────────────────────────────
+
+async def _show_ytdlp_quality_picker(
+    client: Client, st, url: str, token: str, uid: int,
+) -> None:
+    """
+    Fetch yt-dlp format info and display quality-bucket buttons inline.
+    Reuses _parse_yt_formats / _QUALITY_ORDER / _QUALITY_ICON from
+    stream_extractor so there is zero duplication of parsing logic.
+    Falls back to best-quality download if format fetch fails.
+    """
+    import yt_dlp as _yt_dlp
+    from plugins.stream_extractor import _parse_yt_formats, _QUALITY_ORDER, _QUALITY_ICON
+
+    try:
+        ydl_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+        loop = asyncio.get_running_loop()
+
+        def _extract() -> dict:
+            with _yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        info = await loop.run_in_executor(None, _extract)
+    except Exception as exc:
+        await safe_edit(
+            st,
+            f"❌ <b>Could not fetch formats</b>\n\n<code>{exc}</code>\n\n"
+            "<i>Falling back to best quality…</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        asyncio.create_task(_launch_download(client, st, url, uid))
+        return
+
+    groups = _parse_yt_formats(info)
+    if not groups:
+        await safe_edit(st, "❌ No downloadable formats found.")
+        return
+
+    title    = (info.get("title") or "")[:50]
+    uploader = info.get("uploader") or info.get("channel") or ""
+    dur      = info.get("duration", 0)
+    h, rem   = divmod(int(dur or 0), 3600)
+    m, s     = divmod(rem, 60)
+    dur_s    = (f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}") if dur else ""
+
+    lines = [
+        "📥 <b>Choose Quality</b>",
+        "──────────────────────",
+        f"<b>{title}</b>" if title else "",
+        f"👤 {uploader}" if uploader else "",
+        f"⏱ {dur_s}" if dur_s else "",
+        "──────────────────────",
+        "<i>Tap a quality to see formats:</i>",
+    ]
+
+    # Serialise format groups into cache so bucket callback can read without re-fetch
+    _cache[f"ytinfo|{token}"] = _json.dumps({
+        "url":   url,
+        "title": title,
+        "groups": {
+            bucket: [
+                {
+                    "fmt_id":   f.fmt_id,
+                    "label":    f.label,
+                    "detail":   f.detail,
+                    "filesize": f.filesize,
+                }
+                for f in fmts
+            ]
+            for bucket, fmts in groups.items()
+        },
+    })
+
+    rows = []
+    for bucket in _QUALITY_ORDER:
+        fmts = groups.get(bucket, [])
+        if not fmts:
+            continue
+        icon  = _QUALITY_ICON.get(bucket, "📦")
+        count = len(fmts)
+        rows.append([InlineKeyboardButton(
+            f"{icon} {bucket}  ({count} option{'s' if count > 1 else ''})",
+            callback_data=f"dlq|bucket|{token}|{bucket}",
+        )])
+
+    rows.append([
+        InlineKeyboardButton(
+            "⚡ Best quality (auto)",
+            callback_data=f"dlq|best|{token}|",
+        ),
+        InlineKeyboardButton(
+            "🎵 Audio only",
+            callback_data=f"dlq|audio|{token}|",
+        ),
+    ])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"dl|cancel|{token}")])
+
+    await safe_edit(
+        st,
+        "\n".join(l for l in lines if l),
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # Download callback
 # ─────────────────────────────────────────────────────────────
 
@@ -382,6 +446,7 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 
     if mode == "cancel":
         _cache.pop(token, None)
+        _cache.pop(f"ytinfo|{token}", None)
         await cb.message.delete()
         return await cb.answer()
 
@@ -478,7 +543,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             asyncio.create_task(_hardsub_magnet_dl(st, url, uid, tmp, fname))
             return
 
-        # direct / ytdlp / gdrive — use download-first hardsub entry point
         st = await cb.message.edit(
             f"🔥 <b>Hardsub</b>\n──────────────────────\n\n"
             f"📁 <code>{fname[:45]}</code>\n\n"
@@ -549,12 +613,136 @@ async def dl_cb(client: Client, cb: CallbackQuery):
     # ── Standard download ─────────────────────────────────────
     if mode in ("video", "audio"):
         audio_only = (mode == "audio")
+
+        # For yt-dlp sites in video mode: show resolution/format picker first
+        if not audio_only and classify(url) == "ytdlp":
+            st = await cb.message.edit("📡 Fetching available resolutions…")
+            await _show_ytdlp_quality_picker(client, st, url, token, uid)
+            return
+
+        # Audio mode or non-ytdlp: download immediately (best quality / best audio)
         _cache.pop(token, None)
-        asyncio.create_task(_launch_download(client, cb.message, url, uid, audio_only=audio_only))
+        asyncio.create_task(
+            _launch_download(client, cb.message, url, uid, audio_only=audio_only)
+        )
 
 
 # ─────────────────────────────────────────────────────────────
-# Convert resolution picker — PATCH 2: always download-first
+# yt-dlp quality / format picker callbacks  (NEW)
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^dlq\|"))
+async def dl_quality_cb(client: Client, cb: CallbackQuery):
+    """
+    Handles all quality/format picker interactions for yt-dlp video downloads.
+
+    Callback data patterns:
+      dlq|bucket|<token>|<bucket>   → show formats for that quality bucket
+      dlq|best|<token>|             → download best quality (auto)
+      dlq|audio|<token>|            → download best audio only
+      dlq|fmt|<token>|<fmt_id>      → download a specific format id
+      dlq|back|<token>|             → return to the quality bucket list
+    """
+    parts = cb.data.split("|", 3)
+    if len(parts) < 4:
+        return await cb.answer("Invalid data.", show_alert=True)
+
+    _, action, token, extra = parts
+    uid = cb.from_user.id
+    await cb.answer()
+
+    url = _get(token)
+    if not url:
+        return await safe_edit(
+            cb.message,
+            "❌ Session expired. Resend the link.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    # ── Shortcuts: best quality or audio-only ─────────────────
+    if action in ("best", "audio"):
+        audio_only = (action == "audio")
+        _cache.pop(token, None)
+        _cache.pop(f"ytinfo|{token}", None)
+        asyncio.create_task(
+            _launch_download(client, cb.message, url, uid, audio_only=audio_only)
+        )
+        return
+
+    # ── Specific format chosen → start download ───────────────
+    if action == "fmt":
+        fmt_id = extra or None
+        _cache.pop(token, None)
+        _cache.pop(f"ytinfo|{token}", None)
+        asyncio.create_task(
+            _launch_download(client, cb.message, url, uid, fmt_id=fmt_id)
+        )
+        return
+
+    # ── Back → re-display quality buckets ─────────────────────
+    if action == "back":
+        st = await cb.message.edit("📡 Loading quality list…")
+        await _show_ytdlp_quality_picker(client, st, url, token, uid)
+        return
+
+    # ── Bucket chosen → list individual formats ───────────────
+    if action == "bucket":
+        bucket = extra
+        raw    = _cache.get(f"ytinfo|{token}")
+
+        if not raw:
+            # Info expired — re-fetch transparently
+            st = await cb.message.edit("📡 Re-fetching formats…")
+            await _show_ytdlp_quality_picker(client, st, url, token, uid)
+            return
+
+        try:
+            data  = _json.loads(raw)
+            fmts  = data.get("groups", {}).get(bucket, [])
+            title = data.get("title", "")
+        except Exception:
+            fmts  = []
+            title = ""
+
+        if not fmts:
+            await safe_edit(cb.message, f"❌ No formats available for {bucket}.")
+            return
+
+        lines = [
+            f"📥 <b>{bucket} — select format</b>",
+            "──────────────────────",
+            f"<code>{title[:50]}</code>" if title else "",
+            "──────────────────────",
+        ]
+
+        rows = []
+        for f in fmts:
+            rows.append([InlineKeyboardButton(
+                f["label"][:56],
+                callback_data=f"dlq|fmt|{token}|{f['fmt_id']}",
+            )])
+
+        rows.append([
+            InlineKeyboardButton(
+                "🔙 Back to qualities",
+                callback_data=f"dlq|back|{token}|",
+            ),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"dl|cancel|{token}"),
+        ])
+
+        await safe_edit(
+            cb.message,
+            "\n".join(l for l in lines if l),
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    await cb.answer("Unknown action.", show_alert=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# Convert resolution picker
 # ─────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^ccv\|"))
@@ -589,12 +777,6 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
 
     api_key = os.environ.get("CC_API_KEY", "").strip()
 
-    # PATCH 2: DOWNLOAD-FIRST for all URL types
-    # Previously: direct URLs used CC URL import → fails for:
-    #   - CDN auth tokens (token consumed on CC's fetch request)
-    #   - Signed S3 / Cloudfront URLs with short expiry
-    #   - Any non-public URL
-    # Now: download locally first → CC always gets file upload → 100% reliable
     tmp_conv = make_tmp(cfg.download_dir, uid)
     await safe_edit(cb.message,
         f"⬇️ <b>Downloading for Convert…</b>\n"
@@ -641,7 +823,7 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
 
         job_id = await submit_convert(
             api_key,
-            video_path=video_path,   # always file upload — no URL import
+            video_path=video_path,
             video_url=None,
             output_name=output_name,
             scale_height=scale_height,
