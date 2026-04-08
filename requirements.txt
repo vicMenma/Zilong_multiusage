@@ -13,6 +13,8 @@ google-auth
 google-auth-httplib2
 psutil
 Pillow
+# seedrcc: Seedr.cc API wrapper — works for free + premium accounts.
+# Uses the same internal endpoints as the Kodi/Chrome extensions.
+# REST API v1 (Basic Auth) returns 401 for free accounts — seedrcc is required.
+seedrcc>=2.0.2
 # pyngrok removed — keep-alive uses Serveo (SSH tunnel, no token needed) on EC2/VPS.
-# seedrcc REMOVED — we use Seedr REST API v1 directly via aiohttp (already installed).
-# Zero extra dependencies, zero library version issues.
