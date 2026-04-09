@@ -230,6 +230,13 @@ async def main() -> None:
     bot_name = get_bot_name()
     log.info("🤖 Bot name: %s", bot_name.upper())
 
+    # ── Nyaa anime tracker poller ────────────────────────────
+    try:
+        from plugins.nyaa_tracker import start_nyaa_poller
+        start_nyaa_poller()
+    except Exception as exc:
+        log.warning("Nyaa tracker poller startup failed: %s", exc)
+
     # ── Keep-alive health server (optional) ─────────────────────
     keepalive_url = ""
     try:
