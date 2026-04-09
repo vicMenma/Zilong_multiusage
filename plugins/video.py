@@ -40,6 +40,8 @@ _IGNORED = {
     "mergedone","admin","ban_user","unban_user","banned_list","status",
     "forward","createarchive","archiveddone","bulk_url","usettings",
     "show_thumb","del_thumb","json_formatter","stream",
+    "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
+    "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit",
 }
 
 

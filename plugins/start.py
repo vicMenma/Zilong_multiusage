@@ -44,6 +44,13 @@ def _help_text() -> str:
         "› /hardsub — burn subtitles via CloudConvert\n"
         "› Supports: video file, URL, magnet + subtitle (.ass/.srt)\n"
         "› Output: MP4 with hardcoded subs, auto-uploaded\n\n"
+        "📡 <b>Nyaa Tracker</b>\n"
+        "› /nyaa_add — track anime on Nyaa (auto-scrape weekly)\n"
+        "› /nyaa_list — show tracked anime\n"
+        "› /nyaa_remove — stop tracking\n"
+        "› /nyaa_check — manual check now\n"
+        "› /nyaa_search — one-shot Nyaa search\n"
+        "› /nyaa_dump — set dump channel for raw results\n\n"
         "📦 <b>Archives</b>\n"
         "› Extract: zip rar 7z tar.gz\n"
         "› Create: zip 7z tar.gz\n\n"
@@ -112,6 +119,7 @@ def _welcome(user_name: str) -> str:
         "🧲 Torrents &amp; magnet links\n"
         "🎬 Full video toolkit\n"
         "🔥 /hardsub — CloudConvert hardsub\n"
+        "📡 /nyaa_add — track anime on Nyaa\n"
         "📦 Archive management\n\n"
         "<i>Tap <b>Help</b> to see everything.</i>"
     )
@@ -187,6 +195,8 @@ async def cmd_botname(client: Client, msg: Message):
         "cancel", "show_thumb", "del_thumb", "json_formatter", "bulk_url",
         "hardsub", "stream", "forward", "createarchive", "archiveddone",
         "mergedone", "botname", "ccstatus", "convert",
+        "nyaa_add", "nyaa_list", "nyaa_remove", "nyaa_check",
+        "nyaa_search", "nyaa_dump", "nyaa_toggle", "nyaa_edit",
     ]),
     group=10,
 )
@@ -397,7 +407,9 @@ async def cq_st_clrsuffix(client: Client, cb: CallbackQuery):
         ["start","help","settings","info","status","log","restart",
          "broadcast","admin","ban_user","unban_user","banned_list",
          "cancel","show_thumb","del_thumb","json_formatter","bulk_url",
-         "hardsub","botname","ccstatus","convert"]
+         "hardsub","botname","ccstatus","convert",
+         "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
+         "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit"]
     ),
     group=8,
 )
@@ -526,7 +538,9 @@ async def cq_af_del(client: Client, cb: CallbackQuery):
         ["start","help","settings","info","status","log","restart","broadcast",
          "admin","ban_user","unban_user","banned_list","cancel",
          "show_thumb","del_thumb","json_formatter","bulk_url","hardsub",
-         "botname","ccstatus","convert"]
+         "botname","ccstatus","convert",
+         "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
+         "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit"]
     ),
     group=9,
 )

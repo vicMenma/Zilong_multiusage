@@ -138,9 +138,6 @@ async def _submit_one_job(
 
     video_fname = video.get("fname", "video.mkv")
 
-    # PATCH: build_cc_output_name() replaces the old re.sub() which kept
-    # brackets and spaces — both silently break CloudConvert's FFmpeg job.
-    # build_cc_output_name sanitizes via sanitize_for_cc() internally.
     output_name = build_cc_output_name(video_fname, suffix="VOSTFR")
 
     log.info("[Hardsub] CC-safe output name: %s → %s", video_fname, output_name)
@@ -428,7 +425,9 @@ async def hardsub_video_file(client: Client, msg: Message):
         ["start", "help", "settings", "info", "status", "log", "restart",
          "broadcast", "admin", "ban_user", "unban_user", "banned_list",
          "cancel", "show_thumb", "del_thumb", "json_formatter", "bulk_url",
-         "hardsub", "stream", "forward", "createarchive", "archiveddone", "mergedone"]
+         "hardsub", "stream", "forward", "createarchive", "archiveddone", "mergedone",
+         "nyaa_add", "nyaa_list", "nyaa_remove", "nyaa_check",
+         "nyaa_search", "nyaa_dump", "nyaa_toggle", "nyaa_edit"]
     ),
     group=1,
 )

@@ -106,7 +106,6 @@ async def cmd_resize(client: Client, msg: Message):
     args = msg.command[1:]
 
     if args and args[0].startswith("http"):
-        # /resize <url> — show picker immediately
         url   = args[0]
         fname = url.split("/")[-1].split("?")[0][:50] or "video.mkv"
         tok   = _store_url(url, fname)
@@ -117,7 +116,6 @@ async def cmd_resize(client: Client, msg: Message):
         )
         return
 
-    # /resize with no args → ask for file/URL
     _interactive_mode[uid] = "resize"
     _compress_waiting.pop(uid, None)
     await msg.reply(
@@ -141,7 +139,6 @@ async def cmd_compress(client: Client, msg: Message):
     url       = next((a for a in args if a.startswith("http")), None)
     target_mb = next((float(a) for a in args if re.match(r"^\d+(\.\d+)?$", a)), None)
 
-    # /compress <url> <mb>  — direct inline path
     if url and target_mb:
         fname = url.split("/")[-1].split("?")[0][:50] or "video.mkv"
         tmp   = make_tmp(cfg.download_dir, uid)
@@ -161,7 +158,6 @@ async def cmd_compress(client: Client, msg: Message):
         await _do_compress(client, st, path, os.path.basename(path), tmp, target_mb, uid)
         return
 
-    # Reply to video with /compress <mb>
     reply     = msg.reply_to_message
     if reply and target_mb:
         media = reply.video or reply.document
@@ -186,7 +182,6 @@ async def cmd_compress(client: Client, msg: Message):
             await _do_compress(client, st, path, fname, tmp, target_mb, uid)
             return
 
-    # No valid args — interactive mode
     _interactive_mode[uid] = "compress"
     _compress_waiting.pop(uid, None)
     await msg.reply(
@@ -274,7 +269,6 @@ async def handle_url_compress(client: Client, cb: CallbackQuery, url: str, uid: 
 
 # ─────────────────────────────────────────────────────────────
 # Interactive file/URL receiver  (group=1)
-# Fires when user sends a file/URL after /resize or /compress (no args)
 # ─────────────────────────────────────────────────────────────
 
 @Client.on_message(
@@ -328,7 +322,9 @@ async def resize_compress_file_receiver(client: Client, msg: Message):
 
 @Client.on_message(
     filters.private & filters.text
-    & ~filters.command(["start", "help", "settings", "cancel", "resize", "compress"]),
+    & ~filters.command(["start", "help", "settings", "cancel", "resize", "compress",
+                        "nyaa_add", "nyaa_list", "nyaa_remove", "nyaa_check",
+                        "nyaa_search", "nyaa_dump", "nyaa_toggle", "nyaa_edit"]),
     group=1,
 )
 async def resize_url_receiver(client: Client, msg: Message):
@@ -365,6 +361,8 @@ async def resize_url_receiver(client: Client, msg: Message):
         "cancel", "show_thumb", "del_thumb", "json_formatter", "bulk_url",
         "hardsub", "botname", "ccstatus", "convert", "resize", "compress",
         "usage", "captiontemplate",
+        "nyaa_add", "nyaa_list", "nyaa_remove", "nyaa_check",
+        "nyaa_search", "nyaa_dump", "nyaa_toggle", "nyaa_edit",
     ]),
     group=1,
 )
@@ -587,7 +585,6 @@ async def _do_resize(
     fsize = os.path.getsize(out)
     log.info("[Resize] Done: %s → %dp  (%s)", fname, height, human_size(fsize))
 
-    # Delete the "downloading/processing" placeholder
     try:
         await msg.delete()
     except Exception:
@@ -643,7 +640,6 @@ async def _do_compress(
     log.info("[Compress] Done: %s → %.0f MB actual %s",
              fname, target_mb, human_size(fsize))
 
-    # Delete the "downloading/processing" placeholder
     try:
         await msg.delete()
     except Exception:

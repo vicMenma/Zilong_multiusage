@@ -342,6 +342,8 @@ async def ctpl_cb(client: Client, cb: CallbackQuery):
         "cancel","show_thumb","del_thumb","json_formatter","bulk_url",
         "hardsub","botname","ccstatus","convert","resize","compress",
         "usage","captiontemplate",
+        "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
+        "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit",
     ]),
     group=12,
 )
