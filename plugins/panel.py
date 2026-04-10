@@ -8,7 +8,7 @@ Handles inline button callbacks for the /status panel.
 """
 from __future__ import annotations
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import CallbackQuery
 
 from services.task_runner import render_panel, render_panel_kb, runner, tracker
@@ -26,22 +26,28 @@ async def panel_cb(client: Client, cb: CallbackQuery) -> None:
     if action == "cancel":
         t = tracker._tasks.get(target)
         if not t:
-            return await cb.answer("Task not found or already finished.", show_alert=True)
-        fname = (t.fname or t.label)[:30]
-        ok    = await runner.cancel_task(target)
-        await cb.answer(
-            f"❌ Cancelled: {fname}" if ok else "Task already finished.",
-        )
+            await cb.answer("⚠️ Task not found or already finished.", show_alert=True)
+            # Still refresh panel to show updated state
+        else:
+            fname = (t.fname or t.label)[:30]
+            if t.is_terminal:
+                await cb.answer(f"Task #{t.seq} already finished.", show_alert=True)
+            else:
+                ok = await runner.cancel_task(target)
+                if ok:
+                    await cb.answer(f"❌ Cancelled #{t.seq}: {fname}", show_alert=False)
+                else:
+                    await cb.answer("⚠️ Could not cancel — task may have just finished.")
 
     elif action == "cancel_all":
         count = await runner.cancel_all(uid)
-        await cb.answer(
-            f"❌ Cancelled {count} task(s)." if count else "Nothing to cancel.",
-        )
+        if count:
+            await cb.answer(f"❌ Cancelled {count} task(s).")
+        else:
+            await cb.answer("Nothing active to cancel.")
 
     elif action == "refresh":
         try:
-            from pyrogram import enums
             text = await render_panel(uid)
             kb   = render_panel_kb(uid)
             await cb.message.edit(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
@@ -58,15 +64,14 @@ async def panel_cb(client: Client, cb: CallbackQuery) -> None:
             await cb.message.delete()
         except Exception:
             pass
-        await cb.answer("Panel closed.")
+        await cb.answer()
         return
 
     else:
         return await cb.answer("Unknown action.", show_alert=True)
 
-    # Refresh after cancel actions
+    # Refresh panel after any cancel action
     try:
-        from pyrogram import enums
         text = await render_panel(uid)
         kb   = render_panel_kb(uid)
         await cb.message.edit(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)

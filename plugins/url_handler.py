@@ -450,13 +450,22 @@ async def _show_ytdlp_quality_picker(
 async def _seedr_download(client, st, magnet: str, uid: int) -> None:
     """
     Full Seedr pipeline with live status panel.
-    Seedr downloads the torrent on their servers at datacenter speed,
-    then the bot downloads the resulting files via HTTPS and uploads to Telegram.
-    Files are auto-deleted from Seedr after download to stay within 2 GB free tier.
+    Self-registers with GlobalTracker so /status can cancel it.
     """
     from services.seedr import download_via_seedr
     from services.utils import make_tmp, cleanup, human_size
     from core.session import settings as _settings
+    from services.task_runner import tracker, runner, TaskRecord
+
+    # ── Self-register so /status cancel works ─────────────────
+    import re as _re
+    _dn = _re.search(r"[&?]dn=([^&]+)", magnet)
+    _lbl = _dn.group(1)[:40] if _dn else "Seedr Download"
+    _tid = tracker.new_tid()
+    _rec = TaskRecord(tid=_tid, user_id=uid, label=_lbl, mode="seedr", engine="seedr")
+    await tracker.register(_rec)
+    runner.register_raw(_tid, asyncio.current_task())
+    # ──────────────────────────────────────────────────────────
 
     tmp = make_tmp(cfg.download_dir, uid)
 
@@ -483,7 +492,13 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
         local_paths = await download_via_seedr(
             magnet, tmp, progress_cb=_progress, timeout_s=7200,
         )
+    except asyncio.CancelledError:
+        await tracker.finish(_tid, success=False, msg="Cancelled")
+        cleanup(tmp)
+        await safe_edit(st, "❌ <b>Seedr download cancelled.</b>", parse_mode=enums.ParseMode.HTML)
+        return
     except Exception as exc:
+        await tracker.finish(_tid, success=False, msg=str(exc)[:50])
         log.error("[Seedr] Pipeline failed: %s", exc, exc_info=True)
         cleanup(tmp)
         return await safe_edit(
@@ -493,11 +508,14 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
         )
 
     if not local_paths:
+        await tracker.finish(_tid, success=False, msg="No files")
         cleanup(tmp)
         return await safe_edit(
             st, "❌ <b>Seedr: no files downloaded.</b>",
             parse_mode=enums.ParseMode.HTML,
         )
+
+    await tracker.update(_tid, state="📤 Uploading", done=1, total=len(local_paths))
 
     total = len(local_paths)
     if total > 1:
@@ -551,6 +569,17 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
         except Exception:
             pass
 
+    except asyncio.CancelledError:
+        await tracker.finish(_tid, success=False, msg="Cancelled")
+        cleanup(tmp)
+        await safe_edit(st, "❌ <b>Seedr upload cancelled.</b>", parse_mode=enums.ParseMode.HTML)
+        return
+    except Exception as exc:
+        await tracker.finish(_tid, success=False, msg=str(exc)[:50])
+        cleanup(tmp)
+        return
+    else:
+        await tracker.finish(_tid, success=True)
     finally:
         cleanup(tmp)
 
@@ -1365,6 +1394,18 @@ async def _launch_download(
     audio_only: bool = False,
     fmt_id: str | None = None,
 ) -> None:
+    # ── Self-register with tracker so /status cancel works ────
+    from services.task_runner import tracker, runner, TaskRecord
+    _tid = tracker.new_tid()
+    _kind_pre = classify(url)
+    _mode_pre = "magnet" if _kind_pre in ("magnet", "torrent") else "dl"
+    _eng_pre  = "magnet" if _mode_pre == "magnet" else ("ytdlp" if _kind_pre == "ytdlp" else "direct")
+    _lbl_pre  = url.split("/")[-1].split("?")[0][:40] or "Download"
+    _rec = TaskRecord(tid=_tid, user_id=uid, label=_lbl_pre, mode=_mode_pre, engine=_eng_pre)
+    await tracker.register(_rec)
+    runner.register_raw(_tid, asyncio.current_task())
+    # ──────────────────────────────────────────────────────────
+
     tmp  = make_tmp(cfg.download_dir, uid)
     kind = classify(url)
 
@@ -1409,7 +1450,16 @@ async def _launch_download(
             label=label,
             msg=st,
         )
+    except asyncio.CancelledError:
+        await tracker.finish(_tid, success=False, msg="Cancelled")
+        cleanup(tmp)
+        try:
+            await st.edit("❌ <b>Download cancelled.</b>", parse_mode=enums.ParseMode.HTML)
+        except Exception:
+            pass
+        return
     except Exception as exc:
+        await tracker.finish(_tid, success=False, msg=str(exc)[:50])
         log.error("_launch_download uid=%d failed: %s", uid, exc, exc_info=True)
         cleanup(tmp)
         try:
@@ -1433,6 +1483,7 @@ async def _launch_download(
         all_files = []
 
     if not all_files:
+        await tracker.finish(_tid, success=False, msg="No output files")
         log.error("_launch_download uid=%d: no output files in %s", uid, tmp)
         cleanup(tmp)
         try:
@@ -1509,6 +1560,18 @@ async def _launch_download(
             await st.delete()
         except Exception:
             pass
+    except asyncio.CancelledError:
+        await tracker.finish(_tid, success=False, msg="Cancelled")
+        try:
+            await st.edit("❌ <b>Upload cancelled.</b>", parse_mode=enums.ParseMode.HTML)
+        except Exception:
+            pass
+        return
+    except Exception as exc:
+        await tracker.finish(_tid, success=False, msg=str(exc)[:50])
+        log.error("_launch_download upload uid=%d: %s", uid, exc)
+    else:
+        await tracker.finish(_tid, success=True)
     finally:
         cleanup(tmp)
 

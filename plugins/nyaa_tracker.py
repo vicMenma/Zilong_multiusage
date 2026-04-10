@@ -72,8 +72,9 @@ class WatchlistEntry:
     last_match:    float     = 0.0
     added_at:      float     = field(default_factory=time.time)
     # ── Scheduled date+time check ─────────────────────────────
-    scheduled_ts:  float     = 0.0   # unix timestamp for one-shot date+time check
-    schedule_done: bool      = False
+    scheduled_ts:    float = 0.0   # unix timestamp for one-shot date+time check
+    schedule_done:   bool  = False
+    timezone_offset: int   = 0     # UTC offset in minutes (e.g. +120 = UTC+2)
 
 
 class WatchlistStore:
@@ -157,7 +158,9 @@ class WatchlistStore:
         day = day.lower()
         return [
             e for e in self._entries.values()
-            if e.active and (e.day == day or e.day == "daily")
+            if e.active
+            and e.day not in ("scheduled",)   # scheduled-only entries skip regular polling
+            and (e.day == day or e.day == "daily")
         ]
 
     def scheduled_entries(self) -> list[WatchlistEntry]:
@@ -630,19 +633,39 @@ async def nya_cb(client: Client, cb: CallbackQuery):
         await _show_uploader_step(cb.message, sid, state)
         return
 
-    # ── Date+Time input request ───────────────────────────────
+    # ── Date+Time input request — first pick timezone ─────────
     if action == "dt":
-        state["step"] = "waiting_datetime"
+        state["step"] = "waiting_tz"
         uid = cb.from_user.id
         _schedule_waiting[uid] = sid
+        tz_rows = [
+            [
+                InlineKeyboardButton("UTC−5  (EST)",    callback_data=f"nyatz|{sid}|-300"),
+                InlineKeyboardButton("UTC±0  (UTC/GMT)", callback_data=f"nyatz|{sid}|0"),
+            ],
+            [
+                InlineKeyboardButton("UTC+1  (CET)",    callback_data=f"nyatz|{sid}|60"),
+                InlineKeyboardButton("UTC+2  (CAT/EET)", callback_data=f"nyatz|{sid}|120"),
+            ],
+            [
+                InlineKeyboardButton("UTC+3  (EAT/MSK)", callback_data=f"nyatz|{sid}|180"),
+                InlineKeyboardButton("UTC+5:30 (IST)",  callback_data=f"nyatz|{sid}|330"),
+            ],
+            [
+                InlineKeyboardButton("UTC+7  (WIB)",    callback_data=f"nyatz|{sid}|420"),
+                InlineKeyboardButton("UTC+8  (CST/SGT)", callback_data=f"nyatz|{sid}|480"),
+            ],
+            [
+                InlineKeyboardButton("UTC+9  (JST/KST)", callback_data=f"nyatz|{sid}|540"),
+                InlineKeyboardButton("UTC+10 (AEST)",   callback_data=f"nyatz|{sid}|600"),
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"nya|x|{sid}")],
+        ]
         await cb.message.edit(
-            "🎯 <b>Specific Date+Time</b>\n\n"
-            "Send the date and time to start checking:\n\n"
-            "<code>DD-MM-YYYY HH:MM</code>\n\n"
-            "Example: <code>12-04-2026 12:00</code>\n\n"
-            "<i>The bot will poll Nyaa every 5 seconds\n"
-            "starting from that exact moment.</i>",
+            "🌍 <b>Step 1 — Select your timezone</b>\n\n"
+            "<i>Your local time will be converted to UTC automatically.</i>",
             parse_mode=enums.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(tz_rows),
         )
         return
 
@@ -658,11 +681,14 @@ async def nya_cb(client: Client, cb: CallbackQuery):
     if action == "q":
         quality = parts[3] if len(parts) > 3 else ""
         state["quality"] = quality
+        # Use day="scheduled" for date+time entries so they skip daily polling
+        effective_day = "scheduled" if state.get("scheduled_ts", 0) > 0 else (state.get("day") or "daily")
         entry = WatchlistEntry(
             id=0, display_name=state["title"], titles=state["titles"],
-            anilist_id=state["anilist_id"], day=state.get("day") or "daily",
+            anilist_id=state["anilist_id"], day=effective_day,
             uploader=state.get("uploader") or "", quality=quality,
             scheduled_ts=state.get("scheduled_ts", 0),
+            timezone_offset=state.get("timezone_offset", 0),
         )
         eid = await watchlist.add(entry)
         _setup.pop(sid, None)
@@ -671,17 +697,70 @@ async def nya_cb(client: Client, cb: CallbackQuery):
         sched = ""
         if entry.scheduled_ts:
             import datetime as dt
-            ts_str = dt.datetime.fromtimestamp(entry.scheduled_ts).strftime("%d-%m-%Y %H:%M")
-            sched = f"\n🎯 Scheduled: <code>{ts_str}</code> (polls every 5s)"
+            offset_min = entry.timezone_offset
+            sign = "+" if offset_min >= 0 else "-"
+            h, m = divmod(abs(offset_min), 60)
+            tz_str = f"UTC{sign}{h}" + (f":{m:02d}" if m else "")
+            local_dt = dt.datetime.utcfromtimestamp(entry.scheduled_ts) + dt.timedelta(minutes=offset_min)
+            ts_str = local_dt.strftime("%d-%m-%Y %H:%M")
+            sched = (
+                f"\n🎯 Scheduled: <code>{ts_str}</code> ({tz_str})\n"
+                f"<i>Polls every 5 s from that moment — one-shot check.</i>"
+            )
+
+        day_label = "🎯 Scheduled" if effective_day == "scheduled" else f"📅 {effective_day.capitalize()}"
 
         await cb.message.edit(
             f"✅ <b>Added #{eid}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📺 <b>{entry.display_name}</b>\n"
-            f"📅 {entry.day.capitalize()}  👤 {entry.uploader or 'Any'}  📐 {quality or 'Any'}\n"
+            f"{day_label}  👤 {entry.uploader or 'Any'}  📐 {quality or 'Any'}\n"
             f"🔑 {len(entry.titles)} aliases{sched}",
             parse_mode=enums.ParseMode.HTML,
         )
         return
+
+
+# ─────────────────────────────────────────────────────────────
+# Timezone selection callback   nyatz|<sid>|<offset_minutes>
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^nyatz\|"))
+async def nyatz_cb(client: Client, cb: CallbackQuery) -> None:
+    parts = cb.data.split("|")
+    if len(parts) < 3:
+        return await cb.answer("Invalid.", show_alert=True)
+    sid, offset_s = parts[1], parts[2]
+    state = _setup.get(sid)
+    if not state:
+        return await cb.answer("Expired. /nyaa_add again.", show_alert=True)
+    await cb.answer()
+
+    try:
+        offset_min = int(offset_s)
+    except ValueError:
+        offset_min = 0
+
+    state["timezone_offset"] = offset_min
+    state["step"] = "waiting_datetime"
+    uid = cb.from_user.id
+    _schedule_waiting[uid] = sid
+
+    sign   = "+" if offset_min >= 0 else "-"
+    abs_m  = abs(offset_min)
+    h, m   = divmod(abs_m, 60)
+    tz_str = f"UTC{sign}{h}" + (f":{m:02d}" if m else "")
+
+    await cb.message.edit(
+        f"🎯 <b>Specific Date+Time</b>\n\n"
+        f"🌍 Timezone: <b>{tz_str}</b>\n\n"
+        f"Now send the date and time in <b>your local time</b>:\n\n"
+        f"<code>DD-MM-YYYY HH:MM</code>\n\n"
+        f"Example: <code>12-04-2026 18:30</code>\n\n"
+        f"<i>The bot will start polling Nyaa every 5 s\n"
+        f"from that exact moment ({tz_str}) until a match\n"
+        f"is found or 2 hours have elapsed.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
 
 
 async def _show_uploader_step(msg, sid, state):
@@ -697,9 +776,16 @@ async def _show_uploader_step(msg, sid, state):
     rows.append([InlineKeyboardButton("🔓 Any", callback_data=f"nya|u|{sid}|99")])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"nya|x|{sid}")])
 
-    day_s = state["day"].capitalize() if state.get("day") != "daily" else "Daily"
+    day_s = state.get("day", "daily")
+    if day_s == "daily":
+        day_label = "📅 Daily"
+    elif day_s == "scheduled":
+        day_label = "🎯 Scheduled"
+    else:
+        day_label = f"📅 {day_s.capitalize()}"
+
     await msg.edit(
-        f"📅 {day_s} ✅\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{day_label} ✅\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "<b>Step 2/3 — Uploader:</b>",
         parse_mode=enums.ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
@@ -753,31 +839,41 @@ async def datetime_receiver(client: Client, msg: Message):
         return
 
     text = msg.text.strip()
-    # Parse DD-MM-YYYY HH:MM
     import datetime as dt
     try:
-        parsed = dt.datetime.strptime(text, "%d-%m-%Y %H:%M")
-        ts = parsed.timestamp()
-        if ts < time.time():
-            await msg.reply("❌ That's in the past. Send a future date.",
-                            parse_mode=enums.ParseMode.HTML)
-            return
+        # Parse local time as entered by user
+        parsed_local = dt.datetime.strptime(text, "%d-%m-%Y %H:%M")
     except ValueError:
         await msg.reply(
             "❌ Invalid format. Use: <code>DD-MM-YYYY HH:MM</code>\n"
-            "Example: <code>12-04-2026 12:00</code>",
+            "Example: <code>12-04-2026 18:30</code>",
+            parse_mode=enums.ParseMode.HTML)
+        return
+
+    # Convert local time → UTC using the stored timezone offset
+    offset_min = state.get("timezone_offset", 0)
+    utc_dt = parsed_local - dt.timedelta(minutes=offset_min)
+    ts = (utc_dt - dt.datetime(1970, 1, 1)).total_seconds()
+
+    if ts < time.time() - 60:  # 60 s grace for near-past
+        await msg.reply(
+            "❌ That time is in the past.\n"
+            "Please send a future date and time.",
             parse_mode=enums.ParseMode.HTML)
         return
 
     _schedule_waiting.pop(uid, None)
     state["scheduled_ts"] = ts
-    state["day"] = "daily"  # daily ensures normal poller also picks it up
+    state["day"] = "scheduled"   # NOT daily — one-shot only, no regular polling
     state["step"] = "uploader"
 
-    ts_display = parsed.strftime("%d-%m-%Y %H:%M")
+    sign   = "+" if offset_min >= 0 else "-"
+    h, m   = divmod(abs(offset_min), 60)
+    tz_str = f"UTC{sign}{h}" + (f":{m:02d}" if m else "")
+
     st = await msg.reply(
-        f"🎯 Scheduled: <code>{ts_display}</code> ✅\n"
-        f"<i>Will poll every 5s starting at that time.</i>",
+        f"🎯 <b>Scheduled:</b> <code>{parsed_local.strftime('%d-%m-%Y %H:%M')}</code> ({tz_str}) ✅\n"
+        f"<i>Will poll every 5 s from that moment — one-shot, not daily.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
     await _show_uploader_step(st, sid, state)
@@ -794,19 +890,31 @@ async def cmd_nyaa_list(client: Client, msg: Message):
     if not entries:
         return await msg.reply("📡 <b>Empty</b> — /nyaa_add to start.",
                                parse_mode=enums.ParseMode.HTML)
+    import datetime as dt
     lines = ["📡 <b>Nyaa Watchlist</b>", "━━━━━━━━━━━━━━━━━━━━━━━━", ""]
     for e in entries:
         ico = "🟢" if e.active else "🔴"
-        day = e.day.capitalize() if e.day != "daily" else "Daily"
         up  = f"[{e.uploader}]" if e.uploader else ""
         sched = ""
-        if e.scheduled_ts and not e.schedule_done:
-            import datetime as dt
-            sched = f"\n   🎯 {dt.datetime.fromtimestamp(e.scheduled_ts).strftime('%d-%m %H:%M')}"
+        if e.day == "scheduled":
+            if e.scheduled_ts and not e.schedule_done:
+                offset_min = getattr(e, "timezone_offset", 0)
+                sign = "+" if offset_min >= 0 else "-"
+                h, m = divmod(abs(offset_min), 60)
+                tz_str = f"UTC{sign}{h}" + (f":{m:02d}" if m else "")
+                local_dt = dt.datetime.utcfromtimestamp(e.scheduled_ts) + dt.timedelta(minutes=offset_min)
+                sched = f"\n   🎯 {local_dt.strftime('%d-%m-%Y %H:%M')} ({tz_str}) — pending"
+            elif e.schedule_done:
+                sched = "\n   ✅ Schedule completed"
+            day_label = "🎯 Scheduled"
+        elif e.day == "daily":
+            day_label = "📅 Daily"
+        else:
+            day_label = f"📅 {e.day.capitalize()}"
         lines.append(
             f"{ico} <b>#{e.id}</b> <code>{e.display_name[:25]}</code>\n"
-            f"   📅{day} 📐{e.quality or 'Any'} {up}"
-            f"\n   🔑{len(e.titles)} · 📦{len(e.seen_hashes)} seen{sched}"
+            f"   {day_label} 📐{e.quality or 'Any'} {up}"
+            f"\n   🔑{len(e.titles)} aliases · 📦{len(e.seen_hashes)} seen{sched}"
         )
         lines.append("")
     await msg.reply("\n".join(lines)[:4000], parse_mode=enums.ParseMode.HTML)
@@ -908,14 +1016,13 @@ async def _poll_loop():
                     log.error("[Poll] %s: %s", e.display_name, exc)
                 await asyncio.sleep(3)
 
-            # ── Scheduled date+time entries (5s precision) ────
+            # ── Scheduled date+time entries — launch each in its own task ──
             scheduled = watchlist.scheduled_entries()
             for e in scheduled:
-                log.info("[NyaaTracker] Scheduled check triggered for '%s'", e.display_name)
-                found = await _rapid_check(e, duration=7200, interval=5)
-                if found:
-                    log.info("[NyaaTracker] Scheduled match found for '%s'", e.display_name)
+                log.info("[NyaaTracker] Launching rapid-check for '%s'", e.display_name)
+                # Mark done immediately so the next poll cycle doesn't relaunch it
                 await watchlist.update(e.id, schedule_done=True)
+                asyncio.create_task(_rapid_check(e, duration=7200, interval=5))
 
         except Exception as exc:
             log.error("[Poll] %s", exc, exc_info=True)
@@ -924,20 +1031,35 @@ async def _poll_loop():
 
 
 async def _rapid_check(entry: WatchlistEntry, duration: int = 7200, interval: int = 5) -> bool:
-    """Poll every `interval` seconds for up to `duration` seconds until a match is found."""
+    """
+    Poll every `interval` seconds for up to `duration` seconds.
+    Runs as an independent task — does NOT block the main poll loop.
+    """
+    import datetime as dt
     from core.session import get_client
     client = get_client()
 
     deadline = time.time() + duration
-    attempt = 0
+    attempt  = 0
+
+    # Build timezone display string
+    offset_min = getattr(entry, "timezone_offset", 0)
+    sign = "+" if offset_min >= 0 else "-"
+    h, m = divmod(abs(offset_min), 60)
+    tz_str = f"UTC{sign}{h}" + (f":{m:02d}" if m else "")
+
+    # Show local scheduled time
+    local_dt = dt.datetime.utcfromtimestamp(entry.scheduled_ts) + dt.timedelta(minutes=offset_min)
+    ts_display = local_dt.strftime("%d-%m-%Y %H:%M")
 
     try:
         await client.send_message(
             cfg.owner_id,
             f"🎯 <b>Scheduled check started</b>\n\n"
             f"📺 <b>{entry.display_name}</b>\n"
-            f"⏱ Polling every {interval}s for up to {duration//60} min\n"
-            f"<i>I'll notify you when a match is found.</i>",
+            f"🕐 <code>{ts_display}</code> ({tz_str})\n"
+            f"⏱ Polling every {interval}s for up to {duration // 60} min\n"
+            f"<i>You'll be notified when a match is found.</i>",
             parse_mode=enums.ParseMode.HTML,
         )
     except Exception:
@@ -949,6 +1071,8 @@ async def _rapid_check(entry: WatchlistEntry, duration: int = 7200, interval: in
             n = await _check_entry(entry)
             if n > 0:
                 return True
+        except asyncio.CancelledError:
+            return False
         except Exception as exc:
             log.warning("[RapidCheck] %s attempt %d: %s", entry.display_name, attempt, exc)
         await asyncio.sleep(interval)
@@ -957,8 +1081,9 @@ async def _rapid_check(entry: WatchlistEntry, duration: int = 7200, interval: in
         await client.send_message(
             cfg.owner_id,
             f"⏰ <b>Scheduled check expired</b>\n\n"
-            f"📺 {entry.display_name}\n"
-            f"Checked {attempt} times over {duration//60} min — no new match.",
+            f"📺 <b>{entry.display_name}</b>\n"
+            f"🕐 Started at: <code>{ts_display}</code> ({tz_str})\n"
+            f"Checked <b>{attempt}</b> times over <b>{duration // 60} min</b> — no new match.",
             parse_mode=enums.ParseMode.HTML,
         )
     except Exception:

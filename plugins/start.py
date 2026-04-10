@@ -70,32 +70,65 @@ def _start_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _settings_header(s: dict, bot_name: str) -> str:
+    """Build a readable settings state header shown above the keyboard."""
+    mode     = "📄 Document" if s.get("upload_mode") == "document" else "📁 Auto"
+    prefix   = s.get("prefix", "").strip()
+    suffix   = s.get("suffix", "").strip()
+    af       = s.get("auto_forward", False)
+    chs      = s.get("forward_channels", [])
+    ps       = s.get("progress_style", "B")
+    caption  = s.get("caption_style", "Monospace")
+    thumb    = s.get("thumb_id")
+
+    af_s  = f"✅ ON ({len(chs)} ch)" if af and chs else ("✅ ON (no channels)" if af else "❌ OFF")
+    ps_s  = "Cards" if ps == "B" else "Minimal"
+    th_s  = "✅ Set" if thumb else "❌ None"
+
+    SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    lines = [
+        SEP,
+        f"⚙️  <b>{bot_name} — Settings</b>",
+        SEP,
+        f"📤  Upload Mode  <code>{mode}</code>",
+        f"🔡  Prefix       <code>{prefix or '—'}</code>",
+        f"🔤  Suffix       <code>{suffix or '—'}</code>",
+        f"🖼️  Thumbnail    <code>{th_s}</code>",
+        f"📡  Auto-Fwd     <code>{af_s}</code>",
+        f"✏️  Caption      <code>{caption}</code>",
+        f"🎨  Progress     <code>{ps_s}</code>",
+        SEP,
+        "<i>Tap a button below to change a setting.</i>",
+    ]
+    return "\n".join(lines)
+
+
 def _settings_kb(s: dict) -> InlineKeyboardMarkup:
     mode     = "📄 Document" if s.get("upload_mode") == "document" else "📁 Auto"
     prefix   = s.get("prefix", "").strip()
     suffix   = s.get("suffix", "").strip()
     af       = s.get("auto_forward", False)
     chs      = s.get("forward_channels", [])
-    af_lbl   = f"📡 Auto-Forward: ✅ ({len(chs)} ch)" if af else "📡 Auto-Forward: ❌"
+    af_lbl   = f"📡 Auto-Fwd ✅ ({len(chs)})" if af else "📡 Auto-Fwd ❌"
     ps       = s.get("progress_style", "B")
-    ps_lbl   = "🎨 Progress: Cards (B)" if ps == "B" else "🎨 Progress: Minimal (C)"
+    ps_lbl   = "🎨 Progress: Cards" if ps == "B" else "🎨 Progress: Minimal"
 
-    prefix_lbl = f"🔡 Prefix: {prefix[:18]}" if prefix else "🔡 Prefix: none"
-    suffix_lbl = f"🔤 Suffix: {suffix[:18]}" if suffix else "🔤 Suffix: none"
+    prefix_lbl = f"🔡 Prefix: {prefix[:16]}" if prefix else "🔡 Prefix: none"
+    suffix_lbl = f"🔤 Suffix: {suffix[:16]}" if suffix else "🔤 Suffix: none"
 
     rows = [
-        [InlineKeyboardButton(prefix_lbl,               callback_data="st_prefix"),
-         InlineKeyboardButton("🗑",                     callback_data="st_clrprefix")],
-        [InlineKeyboardButton(suffix_lbl,               callback_data="st_suffix"),
-         InlineKeyboardButton("🗑",                     callback_data="st_clrsuffix")],
-        [InlineKeyboardButton(f"📤 Upload Mode: {mode}", callback_data="st_mode")],
+        [InlineKeyboardButton(prefix_lbl,                callback_data="st_prefix"),
+         InlineKeyboardButton("🗑",                      callback_data="st_clrprefix")],
+        [InlineKeyboardButton(suffix_lbl,                callback_data="st_suffix"),
+         InlineKeyboardButton("🗑",                      callback_data="st_clrsuffix")],
+        [InlineKeyboardButton(f"📤 Mode: {mode}",        callback_data="st_mode")],
         [InlineKeyboardButton("🖼️ Set Thumbnail",         callback_data="st_thumb"),
          InlineKeyboardButton("🗑️ Clear Thumbnail",       callback_data="st_clearthumb")],
         [InlineKeyboardButton(af_lbl,                    callback_data="st_af_toggle"),
          InlineKeyboardButton("⚙️ Channels",              callback_data="st_af_manage")],
         [InlineKeyboardButton(f"✏️ Caption: {s.get('caption_style', 'Monospace')[:12]}", callback_data="st_caption"),
          InlineKeyboardButton(ps_lbl,                    callback_data="st_progress_style")],
-        [InlineKeyboardButton("❌ Close",                  callback_data="st_close")],
+        [InlineKeyboardButton("❌ Close",                 callback_data="st_close")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -144,9 +177,11 @@ async def cmd_help(client: Client, msg: Message):
 async def cmd_settings(client: Client, msg: Message):
     s = await settings.get(msg.from_user.id)
     bot_name = get_bot_name().upper()
-    await msg.reply(f"⚙️ <b>{bot_name} — Settings</b>",
-                    reply_markup=_settings_kb(s),
-                    parse_mode=enums.ParseMode.HTML)
+    await msg.reply(
+        _settings_header(s, bot_name),
+        reply_markup=_settings_kb(s),
+        parse_mode=enums.ParseMode.HTML,
+    )
 
 
 @Client.on_message(filters.command("info") & filters.private)
@@ -239,9 +274,11 @@ async def cq_help(client: Client, cb: CallbackQuery):
 async def cq_settings(client: Client, cb: CallbackQuery):
     s = await settings.get(cb.from_user.id)
     bot_name = get_bot_name().upper()
-    await cb.message.edit(f"⚙️ <b>{bot_name} — Settings</b>",
-                          reply_markup=_settings_kb(s),
-                          parse_mode=enums.ParseMode.HTML)
+    await cb.message.edit(
+        _settings_header(s, bot_name),
+        reply_markup=_settings_kb(s),
+        parse_mode=enums.ParseMode.HTML,
+    )
     await cb.answer()
 
 
@@ -270,7 +307,9 @@ async def cq_st_mode(client: Client, cb: CallbackQuery):
     new = "document" if s.get("upload_mode") != "document" else "auto"
     await settings.update(cb.from_user.id, {"upload_mode": new})
     s["upload_mode"] = new
-    await cb.message.edit_reply_markup(_settings_kb(s))
+    bot_name = get_bot_name().upper()
+    await cb.message.edit(_settings_header(s, bot_name), reply_markup=_settings_kb(s),
+                          parse_mode=enums.ParseMode.HTML)
     await cb.answer(f"Mode: {new} ✅")
 
 
@@ -281,8 +320,10 @@ async def cq_st_progress_style(client: Client, cb: CallbackQuery):
     new     = "C" if current == "B" else "B"
     await settings.update(cb.from_user.id, {"progress_style": new})
     s["progress_style"] = new
-    await cb.message.edit_reply_markup(_settings_kb(s))
-    label = "Cards (B)" if new == "B" else "Minimal (C)"
+    bot_name = get_bot_name().upper()
+    await cb.message.edit(_settings_header(s, bot_name), reply_markup=_settings_kb(s),
+                          parse_mode=enums.ParseMode.HTML)
+    label = "Cards" if new == "B" else "Minimal"
     await cb.answer(f"Progress style: {label} ✅")
 
 
@@ -339,9 +380,11 @@ async def cq_st_cap_pick(client: Client, cb: CallbackQuery):
     await settings.update(cb.from_user.id, {"caption_style": style})
     s = await settings.get(cb.from_user.id)
     bot_name = get_bot_name().upper()
-    await cb.message.edit(f"⚙️ <b>{bot_name} — Settings</b>",
-                          reply_markup=_settings_kb(s),
-                          parse_mode=enums.ParseMode.HTML)
+    await cb.message.edit(
+        _settings_header(s, bot_name),
+        reply_markup=_settings_kb(s),
+        parse_mode=enums.ParseMode.HTML,
+    )
     await cb.answer(f"Caption style: {style} ✅")
 
 
@@ -389,7 +432,9 @@ async def cq_st_clrprefix(client: Client, cb: CallbackQuery):
     await settings.update(cb.from_user.id, {"prefix": ""})
     _PREFIX_WAITING.discard(cb.from_user.id)
     s = await settings.get(cb.from_user.id)
-    await cb.message.edit_reply_markup(_settings_kb(s))
+    bot_name = get_bot_name().upper()
+    await cb.message.edit(_settings_header(s, bot_name), reply_markup=_settings_kb(s),
+                          parse_mode=enums.ParseMode.HTML)
     await cb.answer("Prefix cleared ✅")
 
 
@@ -398,7 +443,9 @@ async def cq_st_clrsuffix(client: Client, cb: CallbackQuery):
     await settings.update(cb.from_user.id, {"suffix": ""})
     _SUFFIX_WAITING.discard(cb.from_user.id)
     s = await settings.get(cb.from_user.id)
-    await cb.message.edit_reply_markup(_settings_kb(s))
+    bot_name = get_bot_name().upper()
+    await cb.message.edit(_settings_header(s, bot_name), reply_markup=_settings_kb(s),
+                          parse_mode=enums.ParseMode.HTML)
     await cb.answer("Suffix cleared ✅")
 
 
@@ -443,6 +490,14 @@ async def prefix_suffix_collector(client: Client, msg: Message):
             f"Files will be named: <code>Oshi no Ko S03E10{text}.mkv</code>",
             parse_mode=enums.ParseMode.HTML,
         )
+    # Re-send settings panel so user can see the updated state immediately
+    s_new = await settings.get(uid)
+    bot_name = get_bot_name().upper()
+    await msg.reply(
+        _settings_header(s_new, bot_name),
+        reply_markup=_settings_kb(s_new),
+        parse_mode=enums.ParseMode.HTML,
+    )
     msg.stop_propagation()
 
 
@@ -476,7 +531,9 @@ async def cq_af_toggle(client: Client, cb: CallbackQuery):
     new = not s.get("auto_forward", False)
     await settings.update(uid, {"auto_forward": new})
     s["auto_forward"] = new
-    await cb.message.edit_reply_markup(_settings_kb(s))
+    bot_name = get_bot_name().upper()
+    await cb.message.edit(_settings_header(s, bot_name), reply_markup=_settings_kb(s),
+                          parse_mode=enums.ParseMode.HTML)
     await cb.answer(f"Auto-Forward {'✅ ON' if new else '❌ OFF'}")
 
 
