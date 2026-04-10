@@ -2,14 +2,14 @@
 services/task_runner.py
 Global task registry + /status panel renderer.
 
-REWRITE:
-  - Removed LivePanel class (replaced by per-task inline progress in
-    tg_download.py and uploader.py — each task edits its own message)
-  - GlobalTracker kept for /status overview
-  - render_panel() uses the new panel design
-  - _stats_cache background updater kept
-  - TaskRunner simplified: no auto_panel, no _wake_panel complexity
-  - MAX_CONCURRENT semaphore kept for queue management
+CHANGES v4:
+  - TaskRunner._raw_tasks: any coroutine can self-register via
+    runner.register_raw(tid, asyncio.current_task()) so cancel works
+    even for tasks NOT submitted through runner.submit().
+  - cancel_task() checks both _task_handles and _raw_tasks.
+  - render_panel() completely redesigned: clean header, per-task rows
+    with seq#, progress bar, engine label, completed summary.
+  - render_panel_kb() redesigned with per-task cancel + footer row.
 """
 from __future__ import annotations
 
@@ -23,11 +23,11 @@ from typing import Awaitable, Callable, Optional
 log = logging.getLogger(__name__)
 
 MAX_CONCURRENT = 5
-TASK_LINGER    = 60   # seconds to keep finished tasks visible in /status
+TASK_LINGER    = 120   # seconds to keep finished tasks visible in /status
 
 _task_semaphore: Optional[asyncio.Semaphore] = None
 
-# ── Background stats cache ─────────────────────────────────────
+# ── Background stats cache ────────────────────────────────────
 _stats_cache: dict = {
     "cpu": 0.0, "ram_pct": 0.0, "ram_used": 0,
     "disk_free": 0, "dl_speed": 0.0, "ul_speed": 0.0,
@@ -60,7 +60,7 @@ class TaskRecord:
     tid:        str
     user_id:    int
     label:      str
-    mode:       str   = "dl"      # dl | ul | proc | magnet | queue
+    mode:       str   = "dl"   # dl | ul | proc | magnet | seedr | queue
     engine:     str   = ""
     state:      str   = "⏳ Queued"
     fname:      str   = ""
@@ -149,10 +149,10 @@ tracker = GlobalTracker()
 
 
 # ─────────────────────────────────────────────────────────────
-# /status panel renderer  (used by admin.py and panel.py)
+# /status panel renderer
 # ─────────────────────────────────────────────────────────────
 
-def _pbar(pct: float, w: int = 16) -> str:
+def _pbar(pct: float, w: int = 15) -> str:
     filled = round(min(max(pct, 0), 100) / 100 * w)
     return "█" * filled + "░" * (w - filled)
 
@@ -162,6 +162,28 @@ def _compact(n: float) -> str:
         if n >= div:
             return f"{n / div:.1f}{sym}"
     return f"{int(n)}B"
+
+
+_MODE_ARROW = {
+    "dl":     "↓",
+    "magnet": "🧲",
+    "seedr":  "☁️",
+    "ul":     "↑",
+    "proc":   "⚙",
+}
+_ENGINE_LABEL = {
+    "aria2c":    "aria2c",
+    "ytdlp":     "yt-dlp",
+    "ytdl":      "yt-dlp",
+    "gdrive":    "GDrive",
+    "mediafire": "MF",
+    "telegram":  "TG",
+    "magnet":    "BitTorrent",
+    "seedr":     "Seedr",
+    "direct":    "HTTP",
+    "http":      "HTTP",
+    "tg_file":   "TG",
+}
 
 
 async def render_panel(target_uid: Optional[int] = None) -> str:
@@ -183,59 +205,92 @@ async def render_panel(target_uid: Optional[int] = None) -> str:
     dl_s = f"{human_size(dl_spd)}/s" if dl_spd else "—"
     ul_s = f"{human_size(ul_spd)}/s" if ul_spd else "—"
 
-    SEP  = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    n_active  = len(active)
+    n_queued  = sum(1 for t in active if t.state == "⏳ Queued")
+    n_running = n_active - n_queued
+
+    SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     lines: list[str] = [
         SEP,
         f"⚡  <b>{bot_name} MULTIUSAGE BOT</b>",
         SEP,
-        f"↓ <code>{dl_s}</code>   ↑ <code>{ul_s}</code>",
-        "",
+        (
+            f"💻 CPU <code>{cpu:.0f}%</code>  "
+            f"🧠 RAM <code>{ram_pct:.0f}%</code>  "
+            f"💾 <code>{_compact(disk_free)}</code> free"
+        ),
+        (
+            f"↓ <code>{dl_s}</code>  "
+            f"↑ <code>{ul_s}</code>  "
+            f"📋 <code>{n_running}/{MAX_CONCURRENT}</code> slots"
+        ),
+        SEP,
     ]
 
-    display = active + done[-3:]
-
-    if not display:
-        lines.append("<i>No active tasks — idle.</i>")
-        lines.append("")
+    if not tasks:
+        lines += ["", "  <i>Bot is idle — no tasks.</i>", ""]
     else:
+        # Summary badge
+        if n_active:
+            parts = [f"<b>{n_running} running</b>"]
+            if n_queued:
+                parts.append(f"{n_queued} queued")
+            if done:
+                parts.append(f"{len(done)} finished")
+            lines.append(f"  [ {'  ·  '.join(parts)} ]")
+        else:
+            lines.append(f"  [ <i>{len(done)} finished</i> ]")
+        lines.append("")
+
+        # Show active tasks first, then last 4 finished
+        display = active + done[-4:]
+
         for t in display:
-            fname_s = ((t.fname or t.label)[:32] + "…") if len(t.fname or t.label) > 32 else (t.fname or t.label)
-            arrow = "↑" if t.mode == "ul" else ("⚙" if t.mode == "proc" else "↓")
+            fname_s = (t.fname or t.label)
+            if len(fname_s) > 36:
+                fname_s = fname_s[:35] + "…"
 
+            arrow = _MODE_ARROW.get(t.mode, "↓")
+            eng   = _ENGINE_LABEL.get((t.engine or "").lower(), t.engine)
+
+            # ── Completed tasks (compact one-liner) ──────────
             if t.is_terminal:
-                icon = "✅" if t.state.startswith("✅") else "❌"
-                lines.append(f"{arrow}  <code>{fname_s}</code>  {icon}")
+                ok  = t.state.startswith("✅")
+                ico = "✅" if ok else "❌"
+                dur = f"  <i>{human_dur(int(t.elapsed))}</i>" if t.elapsed > 1 else ""
+                lines.append(f"{ico}  <code>{fname_s}</code>{dur}")
 
+            # ── Metadata fetch ────────────────────────────────
             elif t.meta_phase:
-                lines.append(f"{arrow}  <code>{fname_s}</code>")
-                lines.append("   🔍 <i>Fetching metadata…</i>")
+                lines.append(f"🔍  <b>#{t.seq}</b>  <code>{fname_s}</code>")
+                lines.append("     <i>Fetching torrent metadata…</i>")
 
+            # ── Queued (waiting for slot) ─────────────────────
             elif t.state == "⏳ Queued":
-                lines.append(f"🕐  <code>{fname_s}</code>  <i>queued</i>")
+                lines.append(f"🕐  <b>#{t.seq}</b>  <code>{fname_s}</code>  <i>queued</i>")
 
+            # ── Active task with progress ─────────────────────
             else:
                 pct   = t.pct()
-                spd_s = f"{human_size(t.speed)}/s" if t.speed else "—"
-                eta_s = human_dur(t.eta) if t.eta > 0 else ""
-                lines.append(f"{arrow}  <code>{fname_s}</code>  ⚡ <code>{spd_s}</code>")
-                bar_line = f"   <code>{_pbar(pct)}</code>  {pct:.0f}%"
-                if eta_s:
-                    bar_line += f"  <i>{eta_s}</i>"
+                eng_s = f" <i>[{eng}]</i>" if eng else ""
+                lines.append(f"{arrow}  <b>#{t.seq}</b>  <code>{fname_s}</code>{eng_s}")
+
+                bar_line = f"     <code>[{_pbar(pct)}]</code>  <b>{pct:.0f}%</b>"
+                meta: list[str] = []
+                if t.speed:
+                    meta.append(f"⚡ <code>{human_size(t.speed)}/s</code>")
+                if t.eta > 0:
+                    meta.append(f"<i>ETA {human_dur(t.eta)}</i>")
+                if t.seeds:
+                    meta.append(f"🌱 <code>{t.seeds}</code>")
+                if meta:
+                    bar_line += "  " + "  ".join(meta)
                 lines.append(bar_line)
 
             lines.append("")
 
-    slots = sum(1 for t in active if not t.state.startswith("⏳"))
-    lines += [
-        SEP,
-        f"🖥  CPU <code>{cpu:.0f}%</code>   "
-        f"🧠 RAM <code>{ram_pct:.0f}%</code>   "
-        f"💾 <code>{_compact(disk_free)}</code> free",
-        f"📋  Slots <code>{slots}/{MAX_CONCURRENT}</code>   "
-        f"↓ <code>{dl_s}</code>   ↑ <code>{ul_s}</code>",
-        SEP,
-    ]
+    lines.append(SEP)
     return "\n".join(lines)
 
 
@@ -246,11 +301,12 @@ def render_panel_kb(uid: int):
     active = [t for t in tasks if not t.is_terminal]
     rows: list = []
 
+    # Per-task cancel buttons (2 per row, up to 8 tasks)
     row: list = []
     for t in active[:8]:
-        short = (t.fname or t.label)[:12].strip()
+        label = (t.fname or t.label)[:14].strip()
         row.append(InlineKeyboardButton(
-            f"❌ #{t.seq} {short}",
+            f"❌ #{t.seq} {label}",
             callback_data=f"panel|cancel|{t.tid}",
         ))
         if len(row) == 2:
@@ -259,27 +315,30 @@ def render_panel_kb(uid: int):
     if row:
         rows.append(row)
 
+    # Footer
     if active:
         rows.append([
             InlineKeyboardButton("❌ Cancel All", callback_data=f"panel|cancel_all|{uid}"),
             InlineKeyboardButton("🔄 Refresh",    callback_data=f"panel|refresh|{uid}"),
+            InlineKeyboardButton("✖ Close",       callback_data=f"panel|close|{uid}"),
         ])
     else:
         rows.append([
             InlineKeyboardButton("🔄 Refresh", callback_data=f"panel|refresh|{uid}"),
-            InlineKeyboardButton("❌ Close",    callback_data=f"panel|close|{uid}"),
+            InlineKeyboardButton("✖ Close",    callback_data=f"panel|close|{uid}"),
         ])
 
     return InlineKeyboardMarkup(rows)
 
 
 # ─────────────────────────────────────────────────────────────
-# TaskRunner — simplified (no LivePanel)
+# TaskRunner
 # ─────────────────────────────────────────────────────────────
 
 class TaskRunner:
     def __init__(self) -> None:
-        self._task_handles: dict[str, asyncio.Task] = {}
+        self._task_handles: dict[str, asyncio.Task] = {}  # submit()-based tasks
+        self._raw_tasks:    dict[str, asyncio.Task] = {}  # self-registering tasks
         self._running = False
 
     def start(self) -> None:
@@ -294,7 +353,7 @@ class TaskRunner:
 
     def stop(self) -> None:
         self._running = False
-        for handle in self._task_handles.values():
+        for handle in list(self._task_handles.values()) + list(self._raw_tasks.values()):
             if not handle.done():
                 handle.cancel()
         try:
@@ -304,16 +363,45 @@ class TaskRunner:
         except Exception:
             pass
 
+    def register_raw(self, tid: str, task: Optional[asyncio.Task]) -> None:
+        """
+        Register any asyncio.Task not submitted via submit().
+        Call from inside the coroutine:
+            runner.register_raw(tid, asyncio.current_task())
+        """
+        if task is None:
+            return
+        self._raw_tasks[tid] = task
+        # prune completed tasks
+        stale = [k for k, t in self._raw_tasks.items() if t.done()]
+        for k in stale:
+            self._raw_tasks.pop(k, None)
+
     async def cancel_task(self, tid: str) -> bool:
-        handle = self._task_handles.get(tid)
-        if handle and not handle.done():
-            handle.cancel()
+        """
+        Cancel task by TID — checks both registries.
+        Returns True if the task was found and cancelled.
+        """
+        found = False
+
+        h = self._task_handles.get(tid)
+        if h and not h.done():
+            h.cancel()
+            found = True
+
+        r = self._raw_tasks.get(tid)
+        if r and not r.done():
+            r.cancel()
+            found = True
+
         t = tracker._tasks.get(tid)
         if t and not t.is_terminal:
             await tracker.finish(tid, success=False, msg="Cancelled")
             self._task_handles.pop(tid, None)
+            self._raw_tasks.pop(tid, None)
             return True
-        return False
+
+        return found
 
     async def cancel_all(self, uid: int) -> int:
         count = 0
@@ -324,7 +412,7 @@ class TaskRunner:
         return count
 
     def _wake_panel(self, uid: int, immediate: bool = False) -> None:
-        """No-op stub — LivePanel removed, inline progress handles display."""
+        """No-op stub — inline progress handles display."""
         pass
 
     async def submit(
@@ -370,19 +458,19 @@ class TaskRunner:
             log.error("Task %s failed: %s", record.tid, exc)
             record.update(state=f"❌ {str(exc)[:60]}")
         else:
-            # Accumulate persistent session stats (survives tracker eviction)
             try:
                 from plugins.usage import session as _us
                 if record.mode == "ul":
                     _us.bytes_uploaded += record.total or record.done
                     _us.files_uploaded += 1
-                elif record.mode in ("dl", "magnet"):
+                elif record.mode in ("dl", "magnet", "seedr"):
                     _us.bytes_downloaded += record.total or record.done
                     _us.files_downloaded += 1
             except Exception:
                 pass
         finally:
             self._task_handles.pop(record.tid, None)
+            self._raw_tasks.pop(record.tid, None)
 
 
 runner = TaskRunner()
