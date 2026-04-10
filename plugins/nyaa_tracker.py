@@ -1,14 +1,18 @@
 """
-colab_leecher/nyaa_tracker.py
-Nyaa anime search + tracker for Zilong bot.
+plugins/nyaa_tracker.py
+Nyaa anime tracker — v3.
 
-FEATURES:
-  /nyaa_search <query>  — 10 results/page, paginated, magnets + Seedr+CC
-  /nyaa_add <title>     — interactive setup with date+time scheduling
-  /nyaa_list            — watchlist
-  /nyaa_remove <id>     — remove
-  /nyaa_check           — poll now
-  /nyaa_snipe <query> <datetime>  — snipe mode: poll every 5s at specific time
+CHANGES v3:
+  • 10 results per page (was 5)
+  • Added [☁️ Seedr+CC Compress] button per result
+    → Seedr downloads, then CC converts at target resolution (no hardsub)
+  • /nyaa_add now supports specific date+time scheduling:
+    After selecting a day, user can pick [📅 Specific Date+Time]
+    which asks for "DD-MM-YYYY HH:MM" — poller then checks every 5s
+    starting from that exact moment until a match is found or 2h passes
+  • Interactive setup with buttons (no pipe syntax)
+  • All search open to allowed users; management owner-only
+  • NO auto-seedr — everything button-driven, one file at a time
 """
 from __future__ import annotations
 
@@ -20,745 +24,1094 @@ import os
 import re
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
 from typing import Optional
-from urllib.parse import quote_plus
 
-import aiohttp
-from pyrogram import filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram import Client, filters, enums
+from pyrogram.types import (
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+)
 
-from colab_leecher import colab_bot, OWNER
+from core.config import cfg
+from core.session import users
 
 log = logging.getLogger(__name__)
 
-_DATA_DIR    = "/content/zilong/data"
+_DATA_DIR    = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "data"))
 _STORE_PATH  = os.path.join(_DATA_DIR, "nyaa_watchlist.json")
-_CACHE_TTL   = 1800
-PER_PAGE     = 10
+_CONFIG_PATH = os.path.join(_DATA_DIR, "nyaa_config.json")
 
+RESULTS_PER_PAGE = 10
 NUM_EMOJI = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
 
 DAYS = ("monday","tuesday","wednesday","thursday","friday","saturday","sunday")
-DAY_SHORT = {"monday":"Mon","tuesday":"Tue","wednesday":"Wed",
-             "thursday":"Thu","friday":"Fri","saturday":"Sat","sunday":"Sun"}
+DAY_SHORT = {d: d[:3].capitalize() for d in DAYS}
 
-UPLOADERS = ["Erai-raws","SubsPlease","Tsundere-Raws","EMBER","ToonsHub","DKB","Judas","ASW"]
+COMMON_UPLOADERS = [
+    "Erai-raws", "SubsPlease", "Tsundere-Raws",
+    "EMBER", "ToonsHub", "DKB", "ANi",
+]
 
-_NYAA_RSS = "https://nyaa.si/?page=rss"
-_NYAA_NS  = {"nyaa": "https://nyaa.si/xmlns/nyaa"}
-_TRACKERS = (
-    "http://nyaa.tracker.wf:7777/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://exodus.desync.com:6969/announce",
-)
 
 # ═════════════════════════════════════════════════════════════
-# Nyaa RSS parser
+# Watchlist
 # ═════════════════════════════════════════════════════════════
 
 @dataclass
-class NyaaEntry:
-    title: str; link: str; magnet: str = ""
-    torrent_url: str = ""; size: str = ""
-    seeders: int = 0; leechers: int = 0; downloads: int = 0
-    pub_date: str = ""; info_hash: str = ""; uploader: str = ""
-
-    def __post_init__(self):
-        m = re.match(r'^\[([^\]]+)\]', self.title)
-        if m and not self.uploader: self.uploader = m.group(1).strip()
-        if not self.torrent_url and self.link:
-            nid = re.search(r'/view/(\d+)', self.link)
-            if nid: self.torrent_url = f"https://nyaa.si/download/{nid.group(1)}.torrent"
-        if self.magnet and not self.info_hash:
-            ih = re.search(r'btih:([a-fA-F0-9]{40}|[A-Za-z2-7]{32})', self.magnet)
-            if ih: self.info_hash = ih.group(1).upper()
-        if not self.magnet and self.info_hash:
-            dn = quote_plus(self.title)
-            trs = "&".join(f"tr={quote_plus(t)}" for t in _TRACKERS)
-            self.magnet = f"magnet:?xt=urn:btih:{self.info_hash}&dn={dn}&{trs}"
+class WatchlistEntry:
+    id:            int
+    display_name:  str
+    titles:        list[str] = field(default_factory=list)
+    anilist_id:    int       = 0
+    day:           str       = "daily"
+    uploader:      str       = ""
+    quality:       str       = "1080p"
+    category:      str       = "1_2"
+    active:        bool      = True
+    seen_hashes:   list[str] = field(default_factory=list)
+    last_check:    float     = 0.0
+    last_match:    float     = 0.0
+    added_at:      float     = field(default_factory=time.time)
+    # ── Scheduled date+time check ─────────────────────────────
+    scheduled_ts:  float     = 0.0   # unix timestamp for one-shot date+time check
+    schedule_done: bool      = False
 
 
-def _parse_rss(xml_text: str) -> list[NyaaEntry]:
-    import xml.etree.ElementTree as ET
-    entries = []
+class WatchlistStore:
+    def __init__(self):
+        self._entries: dict[int, WatchlistEntry] = {}
+        self._next_id: int = 1
+        self._lock = asyncio.Lock()
+        self._load()
+
+    def _load(self):
+        try:
+            with open(_STORE_PATH, encoding="utf-8") as f:
+                raw = json.load(f)
+            for d in raw.get("entries", {}).values():
+                try:
+                    e = WatchlistEntry(**d)
+                    self._entries[e.id] = e
+                except TypeError:
+                    pass
+            self._next_id = raw.get("next_id", max(self._entries.keys(), default=0) + 1)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log.warning("[NyaaTracker] Load: %s", e)
+
+    def _save(self):
+        try:
+            os.makedirs(_DATA_DIR, exist_ok=True)
+            with open(_STORE_PATH, "w", encoding="utf-8") as f:
+                json.dump({
+                    "entries": {str(e.id): asdict(e) for e in self._entries.values()},
+                    "next_id": self._next_id,
+                }, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            log.warning("[NyaaTracker] Save: %s", e)
+
+    async def add(self, entry: WatchlistEntry) -> int:
+        async with self._lock:
+            entry.id = self._next_id
+            self._next_id += 1
+            self._entries[entry.id] = entry
+            self._save()
+        return entry.id
+
+    async def remove(self, eid: int) -> bool:
+        async with self._lock:
+            if eid in self._entries:
+                del self._entries[eid]
+                self._save()
+                return True
+        return False
+
+    async def update(self, eid: int, **kw) -> bool:
+        async with self._lock:
+            e = self._entries.get(eid)
+            if not e:
+                return False
+            for k, v in kw.items():
+                if hasattr(e, k):
+                    setattr(e, k, v)
+            self._save()
+            return True
+
+    async def mark_seen(self, eid: int, info_hash: str):
+        async with self._lock:
+            e = self._entries.get(eid)
+            if e and info_hash and info_hash not in e.seen_hashes:
+                e.seen_hashes.append(info_hash)
+                if len(e.seen_hashes) > 300:
+                    e.seen_hashes = e.seen_hashes[-300:]
+                e.last_match = time.time()
+                self._save()
+
+    def get(self, eid: int) -> Optional[WatchlistEntry]:
+        return self._entries.get(eid)
+
+    def all_entries(self) -> list[WatchlistEntry]:
+        return sorted(self._entries.values(), key=lambda e: e.id)
+
+    def entries_for_day(self, day: str) -> list[WatchlistEntry]:
+        day = day.lower()
+        return [
+            e for e in self._entries.values()
+            if e.active and (e.day == day or e.day == "daily")
+        ]
+
+    def scheduled_entries(self) -> list[WatchlistEntry]:
+        """Entries with a future scheduled_ts that haven't been checked yet."""
+        now = time.time()
+        return [
+            e for e in self._entries.values()
+            if e.active and e.scheduled_ts > 0 and not e.schedule_done
+            and now >= e.scheduled_ts
+        ]
+
+
+watchlist = WatchlistStore()
+
+
+# ─────────────────────────────────────────────────────────────
+# Config + caches
+# ─────────────────────────────────────────────────────────────
+
+_config: dict = {"dump_channel": 0, "poll_interval": 600}
+
+
+def _load_config():
+    global _config
     try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return []
-    for item in root.findall(".//item"):
-        title     = (item.findtext("title") or "").strip()
-        link      = (item.findtext("link") or "").strip()
-        guid      = (item.findtext("guid") or "").strip()
-        seeders   = int(item.findtext("nyaa:seeders",   "0", _NYAA_NS) or 0)
-        leechers  = int(item.findtext("nyaa:leechers",  "0", _NYAA_NS) or 0)
-        downloads = int(item.findtext("nyaa:downloads",  "0", _NYAA_NS) or 0)
-        size      = (item.findtext("nyaa:size", "", _NYAA_NS) or "").strip()
-        info_hash = (item.findtext("nyaa:infoHash", "", _NYAA_NS) or "").strip()
-        pub_date  = (item.findtext("pubDate") or "").strip()
-        magnet    = guid if guid.startswith("magnet:") else ""
-        entries.append(NyaaEntry(
-            title=title, link=link, magnet=magnet, size=size,
-            seeders=seeders, leechers=leechers, downloads=downloads,
-            pub_date=pub_date, info_hash=info_hash.upper() if info_hash else "",
-        ))
-    return entries
-
-
-async def search_nyaa(query: str, category: str = "1_0", timeout: int = 15) -> list[NyaaEntry]:
-    url = f"{_NYAA_RSS}&q={quote_plus(query)}&c={category}&f=0&s=id&o=desc"
-    try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=timeout),
-            headers={"User-Agent": "ZilongBot/2.0"},
-        ) as sess:
-            async with sess.get(url) as resp:
-                if resp.status != 200: return []
-                return _parse_rss(await resp.text())
+        with open(_CONFIG_PATH, encoding="utf-8") as f:
+            _config.update(json.load(f))
+    except FileNotFoundError:
+        pass
     except Exception as e:
-        log.warning("[Nyaa] %s", e)
-        return []
+        log.warning("[NyaaTracker] Config: %s", e)
 
-def _short_date(d: str) -> str:
+
+def _save_config():
     try:
-        parts = d.split()
-        return f"{parts[2]} {parts[1]} {parts[4][:5]}"
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(_config, f, indent=2)
+    except Exception as e:
+        log.warning("[NyaaTracker] Config save: %s", e)
+
+
+_load_config()
+
+_search_cache: dict[str, dict] = {}
+_CACHE_TTL = 1800
+_magnet_cache: dict[str, str] = {}
+
+
+def _cache_key(query: str) -> str:
+    return hashlib.md5(f"{query}_{time.time():.0f}".encode()).hexdigest()[:8]
+
+
+def _cache_put(key: str, results: list, query: str):
+    now = time.time()
+    for k in [k for k, v in _search_cache.items() if now - v["ts"] > _CACHE_TTL]:
+        _search_cache.pop(k, None)
+    _search_cache[key] = {"results": results, "query": query, "ts": now}
+
+
+def _cache_get(key: str) -> Optional[dict]:
+    entry = _search_cache.get(key)
+    if entry and time.time() - entry["ts"] < _CACHE_TTL:
+        return entry
+    _search_cache.pop(key, None)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Setup state
+# ─────────────────────────────────────────────────────────────
+
+_setup: dict[str, dict] = {}
+_schedule_waiting: dict[int, str] = {}  # uid → sid (waiting for date+time text)
+
+
+def _sid() -> str:
+    return hashlib.md5(str(time.time()).encode()).hexdigest()[:6]
+
+
+def _short_date(pub: str) -> str:
+    try:
+        p = pub.split()
+        return f"{p[2]} {p[1]} {p[4][:5]}"
     except Exception:
-        return d[:16]
+        return pub[:16] if pub else ""
+
 
 # ═════════════════════════════════════════════════════════════
-# Search cache + magnet cache
+# Search rendering (10 per page)
 # ═════════════════════════════════════════════════════════════
 
-_cache: dict[str, dict] = {}
-_magnets: dict[str, str] = {}
-
-def _ck(q): return hashlib.md5(f"{q}_{time.time():.0f}".encode()).hexdigest()[:8]
-def _cp(k, r, q): _cache[k] = {"r": r, "q": q, "t": time.time()}
-def _cg(k):
-    e = _cache.get(k)
-    if e and time.time() - e["t"] < _CACHE_TTL: return e
-    _cache.pop(k, None); return None
-
-# ═════════════════════════════════════════════════════════════
-# Render helpers
-# ═════════════════════════════════════════════════════════════
-
-def _render_page(key, page, query, results):
+def _render_page(key: str, page: int, query: str, results: list):
     total = len(results)
-    pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
+    pages = max(1, (total + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE)
     page  = max(0, min(page, pages - 1))
-    start = page * PER_PAGE
-    chunk = results[start:start + PER_PAGE]
+    start = page * RESULTS_PER_PAGE
+    chunk = results[start:start + RESULTS_PER_PAGE]
 
     lines = [
-        f"📡 <b>Nyaa Search</b> — <code>{query[:30]}</code>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"Page <b>{page+1}/{pages}</b>  ·  {total} results",
+        f"📡 <b>Nyaa</b> — <code>{query[:30]}</code>",
+        f"Page <b>{page+1}/{pages}</b> · {total} results",
         "",
     ]
     for i, r in enumerate(chunk):
-        num = NUM_EMOJI[i] if i < len(NUM_EMOJI) else f"{i+1}."
-        title = r.title[:60] + "…" if len(r.title) > 60 else r.title
-        lines.append(f"{num} <code>{title}</code>")
-        lines.append(f"   💾 {r.size}  🌱 {r.seeders}  📅 {_short_date(r.pub_date)}")
-        lines.append("")
+        n = NUM_EMOJI[i] if i < len(NUM_EMOJI) else f"{i+1}."
+        t = r.title[:58] + "…" if len(r.title) > 58 else r.title
+        lines.append(f"{n} <code>{t}</code>")
+        lines.append(f"  💾{r.size} 🌱{r.seeders} 📅{_short_date(r.pub_date)}")
 
-    # Number buttons (2 rows of 5)
-    nums1 = [InlineKeyboardButton(NUM_EMOJI[i], callback_data=f"nys|a|{key}|{start+i}")
-             for i in range(min(5, len(chunk)))]
-    nums2 = [InlineKeyboardButton(NUM_EMOJI[i], callback_data=f"nys|a|{key}|{start+i}")
-             for i in range(5, len(chunk))]
-
-    rows = []
-    if nums1: rows.append(nums1)
-    if nums2: rows.append(nums2)
+    # Number buttons
+    nums = [
+        InlineKeyboardButton(NUM_EMOJI[i] if i < len(NUM_EMOJI) else str(i+1),
+                             callback_data=f"nys|a|{key}|{start+i}")
+        for i in range(len(chunk))
+    ]
+    # Split into 2 rows of 5
+    rows = [nums[:5]]
+    if len(nums) > 5:
+        rows.append(nums[5:])
 
     nav = []
-    if page > 0: nav.append(InlineKeyboardButton("◀️", callback_data=f"nys|p|{key}|{page-1}"))
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"nys|p|{key}|{page-1}"))
     nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="nys|noop"))
-    if page < pages - 1: nav.append(InlineKeyboardButton("▶️", callback_data=f"nys|p|{key}|{page+1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"nys|p|{key}|{page+1}"))
     rows.append(nav)
     rows.append([InlineKeyboardButton("❌ Close", callback_data="nys|x")])
 
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-def _render_detail(key, idx, r, page):
-    title = r.title[:65] + "…" if len(r.title) > 65 else r.title
+def _render_detail(key: str, idx: int, r, page: int):
+    t = r.title[:65] + "…" if len(r.title) > 65 else r.title
     lines = [
-        "📦 <b>Selected</b>",
+        "📦 <b>Result Detail</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"<code>{title}</code>", "",
-        f"💾 {r.size}  ·  🌱 {r.seeders}  ·  📥 {r.downloads}",
-        f"👤 {r.uploader or '—'}  ·  📅 {_short_date(r.pub_date)}",
-        f"🔗 {r.link}", "",
+        f"<code>{t}</code>", "",
+        f"💾 {r.size}  🌱 {r.seeders}  📥 {r.downloads}",
+        f"📅 {_short_date(r.pub_date)}  👤 {r.uploader or '—'}",
+        f"🔗 {r.link}",
     ]
-    h = r.info_hash[:12] if r.info_hash else hashlib.md5(r.title.encode()).hexdigest()[:12]
     rows = [
-        [InlineKeyboardButton("🧲 Magnet",        callback_data=f"nys|m|{key}|{idx}"),
-         InlineKeyboardButton("📥 .torrent",      callback_data=f"nys|t|{key}|{idx}")],
-        [InlineKeyboardButton("☁️ Seedr+Hardsub", callback_data=f"nys|sr|{key}|{idx}"),
-         InlineKeyboardButton("☁️ Seedr+CC 🗜",   callback_data=f"nys|sc|{key}|{idx}")],
-        [InlineKeyboardButton("📥 Local DL",      callback_data=f"nys|dl|{key}|{idx}")],
-        [InlineKeyboardButton("🔙 Back",          callback_data=f"nys|p|{key}|{page}")],
+        [InlineKeyboardButton("🧲 Magnet",       callback_data=f"nys|m|{key}|{idx}"),
+         InlineKeyboardButton("📥 .torrent",     callback_data=f"nys|t|{key}|{idx}")],
+        [InlineKeyboardButton("☁️ Seedr+HS",     callback_data=f"nys|sr|{key}|{idx}"),
+         InlineKeyboardButton("📥 Local DL",     callback_data=f"nys|dl|{key}|{idx}")],
+        [InlineKeyboardButton("☁️ Seedr+CC 🗜️",  callback_data=f"nys|sc|{key}|{idx}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"nys|p|{key}|{page}")],
     ]
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 # ═════════════════════════════════════════════════════════════
-# /nyaa_search
+# /nyaa_search — open to ALL allowed users
 # ═════════════════════════════════════════════════════════════
 
-@colab_bot.on_message(filters.command("nyaa_search") & filters.private)
-async def cmd_nyaa_search(client, message):
-    query = " ".join(message.command[1:])
+@Client.on_message(filters.private & filters.command("nyaa_search"))
+async def cmd_nyaa_search(client: Client, msg: Message):
+    query = " ".join(msg.command[1:])
     if not query:
-        return await message.reply_text(
+        return await msg.reply(
             "📡 <b>Nyaa Search</b>\n\n"
-            "Usage: <code>/nyaa_search Kujima Utaeba</code>\n\n"
-            "10 results per page with magnet, torrent,\n"
-            "Seedr+Hardsub and Seedr+CC Compress buttons."
-        )
-    st = await message.reply_text(f"🔍 Searching: <code>{query[:40]}</code>…")
-    results = await search_nyaa(query)
-    if not results:
-        return await st.edit_text(f"❌ No results for: <code>{query}</code>")
+            "<code>/nyaa_search Kujima Utaeba le Hororo 1080p</code>",
+            parse_mode=enums.ParseMode.HTML)
 
-    key = _ck(query)
-    _cp(key, results, query)
+    st = await msg.reply(f"🔍 Searching: <code>{query[:40]}</code>…",
+                         parse_mode=enums.ParseMode.HTML)
+
+    from services.nyaa import search_nyaa
+    results = await search_nyaa(query, category="1_0")
+
+    if not results:
+        return await st.edit(f"❌ No results for: <code>{query}</code>",
+                             parse_mode=enums.ParseMode.HTML)
+
+    key = _cache_key(query)
+    _cache_put(key, results, query)
     for i, r in enumerate(results):
-        if r.magnet: _magnets[f"{key}_{i}"] = r.magnet
+        if r.magnet:
+            _magnet_cache[f"{key}_{i}"] = r.magnet
 
     text, kb = _render_page(key, 0, query, results)
-    await st.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await st.edit(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
 
 
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 # Search callbacks
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 
-@colab_bot.on_callback_query(filters.regex(r"^nys\|"))
-async def nys_cb(client, cq):
-    parts = cq.data.split("|")
-    action = parts[1]
-    uid = cq.message.chat.id
+@Client.on_callback_query(filters.regex(r"^nys\|"))
+async def nys_cb(client: Client, cb: CallbackQuery):
+    parts  = cb.data.split("|")
+    action = parts[1] if len(parts) > 1 else ""
 
-    if action == "noop": return await cq.answer()
-    if action == "x": await cq.answer(); return await cq.message.delete()
+    if action == "noop":
+        return await cb.answer()
+    if action == "x":
+        await cb.answer()
+        return await cb.message.delete()
+    if len(parts) < 4:
+        return await cb.answer("Invalid.", show_alert=True)
 
-    if len(parts) < 4: return await cq.answer("Invalid.", show_alert=True)
     key, param = parts[2], parts[3]
-    cached = _cg(key)
+    uid = cb.from_user.id
+
+    cached = _cache_get(key)
     if not cached:
-        return await cq.answer("Expired. /nyaa_search again.", show_alert=True)
-    results, query = cached["r"], cached["q"]
-    await cq.answer()
+        return await cb.answer("Expired. Run /nyaa_search again.", show_alert=True)
+    results, query = cached["results"], cached["query"]
+    await cb.answer()
 
     if action == "p":
         text, kb = _render_page(key, int(param), query, results)
-        try: await cq.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
-        except Exception: pass
+        try:
+            await cb.message.edit(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            pass
         return
 
     if action == "a":
         idx = int(param)
-        if idx >= len(results): return
-        text, kb = _render_detail(key, idx, results[idx], idx // PER_PAGE)
-        await cq.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        if idx >= len(results):
+            return
+        text, kb = _render_detail(key, idx, results[idx], idx // RESULTS_PER_PAGE)
+        await cb.message.edit(text, parse_mode=enums.ParseMode.HTML,
+                              reply_markup=kb, disable_web_page_preview=True)
         return
 
+    # All action handlers below need a result
     idx = int(param)
-    if idx >= len(results): return
+    if idx >= len(results):
+        return
     r = results[idx]
-    magnet = r.magnet or _magnets.get(f"{key}_{idx}", "")
+    magnet = r.magnet or _magnet_cache.get(f"{key}_{idx}", "")
 
     if action == "m":
-        if not magnet: return await client.send_message(uid, "❌ No magnet.")
-        await client.send_message(uid, f"🧲 <b>Magnet</b>\n\n<code>{magnet}</code>")
-        return
-
-    if action == "t":
+        if not magnet:
+            return await client.send_message(uid, "❌ No magnet available.")
+        await client.send_message(uid, f"🧲 <b>Magnet</b>\n\n<code>{magnet}</code>",
+                                  parse_mode=enums.ParseMode.HTML)
+    elif action == "t":
         if r.torrent_url:
-            await client.send_message(uid, f"📥 <b>Torrent</b>\n\n<code>{r.torrent_url}</code>")
-        return
-
-    if action == "dl":
-        if not magnet: return await client.send_message(uid, "❌ No magnet.")
-        # Feed magnet into the bot's normal link handler
-        from colab_leecher.utility.variables import BOT
-        BOT.SOURCE = [magnet]
-        BOT.Mode.ytdl = False; BOT.Mode.mode = "leech"
-        BOT.State.started = True
-        await cq.message.edit_text(
-            f"📥 <b>Download queued</b>\n<code>{r.title[:50]}</code>\n\n"
-            "Choose mode:",
+            await client.send_message(uid, f"📥 <b>Torrent</b>\n\n<code>{r.torrent_url}</code>",
+                                      parse_mode=enums.ParseMode.HTML)
+        else:
+            await client.send_message(uid, "❌ No torrent URL.")
+    elif action == "sr":
+        if not magnet:
+            return await client.send_message(uid, "❌ No magnet.")
+        from plugins.url_handler import _seedr_download
+        st = await client.send_message(uid, "☁️ <b>Seedr</b>\n⬆️ Submitting…",
+                                       parse_mode=enums.ParseMode.HTML)
+        asyncio.create_task(_seedr_download(client, st, magnet, uid))
+    elif action == "dl":
+        if not magnet:
+            return await client.send_message(uid, "❌ No magnet.")
+        from plugins.url_handler import _launch_download
+        st = await client.send_message(uid, "📥 <b>Downloading…</b>",
+                                       parse_mode=enums.ParseMode.HTML)
+        asyncio.create_task(_launch_download(client, st, magnet, uid))
+    elif action == "sc":
+        # Seedr + CloudConvert Compress (no hardsub, just resolution convert)
+        if not magnet:
+            return await client.send_message(uid, "❌ No magnet.")
+        api_key = os.environ.get("CC_API_KEY", "").strip()
+        if not api_key:
+            return await client.send_message(
+                uid, "❌ CC_API_KEY not set.", parse_mode=enums.ParseMode.HTML)
+        # Ask for target resolution
+        h12 = hashlib.md5(magnet.encode()).hexdigest()[:12]
+        _magnet_cache[h12] = magnet
+        await client.send_message(
+            uid,
+            f"☁️ <b>Seedr + CC Compress</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📦 <code>{r.title[:50]}</code>\n\n"
+            f"Choose target resolution:",
+            parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📄 Normal", callback_data="normal"),
-                 InlineKeyboardButton("🗜 Compress", callback_data="zip")],
-                [InlineKeyboardButton("📂 Extract", callback_data="unzip")],
-            ])
-        )
-        return
-
-    if action == "sr":
-        if not magnet: return await client.send_message(uid, "❌ No magnet.")
-        await client.send_message(
-            uid,
-            f"☁️ <b>Seedr+Hardsub</b>\n\n"
-            f"📦 <code>{r.title[:50]}</code>\n\n"
-            f"🧲 <code>{magnet[:80]}…</code>\n\n"
-            f"<i>Paste this magnet in the bot to use Seedr pipeline\n"
-            f"(the full Seedr+Hardsub workflow from Zilong Multiusage).</i>"
-        )
-        return
-
-    if action == "sc":
-        if not magnet: return await client.send_message(uid, "❌ No magnet.")
-        await client.send_message(
-            uid,
-            f"☁️ <b>Seedr + CloudConvert Compress</b>\n\n"
-            f"📦 <code>{r.title[:50]}</code>\n\n"
-            f"🧲 <code>{magnet[:80]}…</code>\n\n"
-            f"<b>Why Seedr+CC Compress?</b>\n"
-            f"Seedr downloads at datacenter speed → CC re-encodes\n"
-            f"to target resolution/size → auto-uploads to Telegram.\n\n"
-            f"<i>Available in Zilong Multiusage (full version).\n"
-            f"Use /nyaa_search in Multiusage for the full pipeline.</i>"
-        )
-        return
-
-
-# ═════════════════════════════════════════════════════════════
-# Watchlist store
-# ═════════════════════════════════════════════════════════════
-
-@dataclass
-class WatchEntry:
-    id: int; name: str; titles: list = field(default_factory=list)
-    day: str = "daily"; uploader: str = ""; quality: str = "1080p"
-    active: bool = True; seen: list = field(default_factory=list)
-    # Snipe mode: specific date+time, poll every 5s
-    snipe_at: str = ""  # ISO format: "2026-04-12T12:00:00"
-    snipe_done: bool = False
-
-
-class _WL:
-    _entries: dict = {}; _nid: int = 1
-
-    @classmethod
-    def _load(cls):
-        try:
-            with open(_STORE_PATH) as f: raw = json.load(f)
-            for d in raw.get("e", {}).values():
-                try:
-                    e = WatchEntry(**d); cls._entries[e.id] = e
-                except TypeError: pass
-            cls._nid = raw.get("n", max(cls._entries.keys(), default=0) + 1)
-        except FileNotFoundError: pass
-        except Exception as e: log.warning("[NyaaWL] %s", e)
-
-    @classmethod
-    def _save(cls):
-        os.makedirs(_DATA_DIR, exist_ok=True)
-        with open(_STORE_PATH, "w") as f:
-            json.dump({"e": {str(e.id): asdict(e) for e in cls._entries.values()}, "n": cls._nid}, f, indent=2)
-
-    @classmethod
-    def add(cls, e): e.id = cls._nid; cls._nid += 1; cls._entries[e.id] = e; cls._save(); return e.id
-
-    @classmethod
-    def remove(cls, eid):
-        if eid in cls._entries: del cls._entries[eid]; cls._save(); return True
-        return False
-
-    @classmethod
-    def get(cls, eid): return cls._entries.get(eid)
-    @classmethod
-    def all(cls): return sorted(cls._entries.values(), key=lambda e: e.id)
-    @classmethod
-    def for_day(cls, day):
-        return [e for e in cls._entries.values() if e.active and (e.day == day or e.day == "daily")]
-    @classmethod
-    def snipers(cls):
-        return [e for e in cls._entries.values() if e.active and e.snipe_at and not e.snipe_done]
-    @classmethod
-    def mark_seen(cls, eid, h):
-        e = cls._entries.get(eid)
-        if e and h not in e.seen: e.seen.append(h); cls._save()
-    @classmethod
-    def update(cls, eid, **kw):
-        e = cls._entries.get(eid)
-        if not e: return
-        for k, v in kw.items():
-            if hasattr(e, k): setattr(e, k, v)
-        cls._save()
-
-_WL._load()
-
-
-# ═════════════════════════════════════════════════════════════
-# /nyaa_add — interactive setup
-# ═════════════════════════════════════════════════════════════
-
-_setup: dict = {}
-
-@colab_bot.on_message(filters.command("nyaa_add") & filters.private)
-async def cmd_nyaa_add(client, message):
-    if message.chat.id != OWNER: return
-    title = " ".join(message.command[1:])
-    if not title:
-        return await message.reply_text(
-            "📡 <b>Nyaa Tracker — Add</b>\n\n"
-            "<code>/nyaa_add Kujima Utaeba le Hororo</code>\n\n"
-            "I'll guide you through day/uploader/quality with buttons."
+                [InlineKeyboardButton("🔵 1080p", callback_data=f"nyc|1080|{h12}"),
+                 InlineKeyboardButton("🟢 720p",  callback_data=f"nyc|720|{h12}")],
+                [InlineKeyboardButton("🟡 480p",  callback_data=f"nyc|480|{h12}"),
+                 InlineKeyboardButton("🎬 Original", callback_data=f"nyc|0|{h12}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="nyc|x|0")],
+            ]),
         )
 
-    # Resolve titles via AniList (lightweight, no dep needed)
-    titles = [title]
+
+# ─────────────────────────────────────────────────────────────
+# Seedr+CC Compress callback   nyc|<height>|<hash12>
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^nyc\|"))
+async def nyc_cb(client: Client, cb: CallbackQuery):
+    parts = cb.data.split("|")
+    if len(parts) < 3:
+        return await cb.answer("Invalid.", show_alert=True)
+    height_s, h12 = parts[1], parts[2]
+    uid = cb.from_user.id
+    await cb.answer()
+
+    if height_s == "x":
+        return await cb.message.delete()
+
+    magnet = _magnet_cache.get(h12, "")
+    if not magnet:
+        return await cb.message.edit("❌ Magnet expired.", parse_mode=enums.ParseMode.HTML)
+
+    height = int(height_s) if height_s.isdigit() else 0
+    res_label = f"{height}p" if height else "Original"
+
+    asyncio.create_task(
+        _seedr_then_cc_compress(client, cb.message, magnet, uid, height, res_label)
+    )
+
+
+async def _seedr_then_cc_compress(client, st, magnet, uid, height, res_label):
+    """Seedr download → CC convert (resolution compress, no hardsub)."""
+    from services.seedr import download_via_seedr
+    from services.utils import make_tmp, cleanup, human_size, largest_file
+    from services.cloudconvert_api import submit_convert
+    from services.cc_job_store import cc_job_store, CCJob
+    from services.cc_sanitize import sanitize_for_cc
+
+    tmp = make_tmp(cfg.download_dir, uid)
+
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
-            q = '{ Page(page:1,perPage:3) { media(search:"%s",type:ANIME) { title { romaji english native } synonyms } } }' % title.replace('"', '\\"')
-            async with s.post("https://graphql.anilist.co", json={"query": q}) as r:
-                data = await r.json()
-            for m in (data.get("data") or {}).get("Page", {}).get("media", [])[:1]:
-                t = m.get("title") or {}
-                for v in (t.get("romaji"), t.get("english"), t.get("native")):
-                    if v and v.lower() not in [x.lower() for x in titles]:
-                        titles.append(v)
-                for syn in (m.get("synonyms") or [])[:3]:
-                    if syn and syn.lower() not in [x.lower() for x in titles]:
-                        titles.append(syn)
-    except Exception: pass
+        await st.edit(
+            f"☁️ <b>Seedr+CC Compress → {res_label}</b>\n"
+            "⬆️ <i>Submitting to Seedr…</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
 
-    sid = hashlib.md5(str(time.time()).encode()).hexdigest()[:6]
-    _setup[sid] = {"title": title, "titles": titles}
+        paths = await download_via_seedr(magnet, tmp, timeout_s=7200)
+        if not paths:
+            cleanup(tmp)
+            return await st.edit("❌ Seedr: no files.", parse_mode=enums.ParseMode.HTML)
 
-    preview = "\n".join(f"  · <code>{t}</code>" for t in titles[:6])
+        video_path = max(paths, key=lambda p: os.path.getsize(p))
+        fname = os.path.basename(video_path)
 
-    rows = [
+        await st.edit(
+            f"☁️ <b>Seedr done — submitting to CC</b>\n"
+            f"📦 <code>{fname[:40]}</code>\n"
+            f"📐 → <b>{res_label}</b>\n"
+            "⬆️ <i>Uploading to CloudConvert…</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+        api_key = os.environ.get("CC_API_KEY", "").strip()
+        out_name = sanitize_for_cc(os.path.splitext(fname)[0] + f"_{res_label}.mp4")
+
+        job_id = await submit_convert(
+            api_key, video_path=video_path,
+            output_name=out_name, scale_height=height,
+        )
+
+        await cc_job_store.add(CCJob(
+            job_id=job_id, uid=uid,
+            fname=fname, output_name=out_name,
+            status="processing",
+        ))
+
+        try:
+            from plugins.ccstatus import _ensure_poller
+            _ensure_poller()
+        except Exception:
+            pass
+
+        await st.edit(
+            f"✅ <b>CC Compress submitted</b>\n"
+            f"🆔 <code>{job_id}</code>\n"
+            f"📦 <code>{fname[:35]}</code> → <b>{res_label}</b>\n\n"
+            "⏳ <i>Processing… auto-uploads when done.</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    except Exception as exc:
+        log.error("[Seedr+CC] %s", exc, exc_info=True)
+        await st.edit(f"❌ <b>Failed</b>\n<code>{str(exc)[:200]}</code>",
+                      parse_mode=enums.ParseMode.HTML)
+    finally:
+        cleanup(tmp)
+
+
+# ═════════════════════════════════════════════════════════════
+# /nyaa_add — Interactive setup with date+time scheduling
+# ═════════════════════════════════════════════════════════════
+
+@Client.on_message(filters.command("nyaa_add") & filters.user(cfg.owner_id))
+async def cmd_nyaa_add(client: Client, msg: Message):
+    title = " ".join(msg.command[1:])
+    if not title:
+        return await msg.reply(
+            "📡 <b>Nyaa Tracker — Add</b>\n\n"
+            "<code>/nyaa_add Oshi no Ko</code>\n\n"
+            "Buttons guide you through day/uploader/quality.",
+            parse_mode=enums.ParseMode.HTML)
+
+    st = await msg.reply(f"🔍 Resolving: <code>{title}</code>…",
+                         parse_mode=enums.ParseMode.HTML)
+
+    from services.anilist import search_anime, all_titles
+    all_t = [title]
+    aid = 0
+    try:
+        res = await search_anime(title)
+        if res:
+            aid = res[0].get("id", 0)
+            for t in all_titles(res[0]):
+                if t.lower() not in {s.lower() for s in all_t}:
+                    all_t.append(t)
+    except Exception as exc:
+        log.warning("[NyaaTracker] AniList: %s", exc)
+
+    sid = _sid()
+    _setup[sid] = {
+        "uid": msg.from_user.id, "title": title, "titles": all_t,
+        "anilist_id": aid, "day": None, "uploader": None,
+        "quality": None, "scheduled_ts": 0, "step": "day",
+    }
+
+    preview = "\n".join(f"  • <code>{t}</code>" for t in all_t[:5])
+    extra = f"\n  <i>+{len(all_t)-5} more</i>" if len(all_t) > 5 else ""
+
+    day_rows = [
         [InlineKeyboardButton(DAY_SHORT[d], callback_data=f"nya|d|{sid}|{i}")
          for i, d in enumerate(DAYS) if i < 4],
         [InlineKeyboardButton(DAY_SHORT[d], callback_data=f"nya|d|{sid}|{i}")
          for i, d in enumerate(DAYS) if i >= 4],
-        [InlineKeyboardButton("📅 Daily", callback_data=f"nya|d|{sid}|7"),
-         InlineKeyboardButton("🎯 Snipe (date+time)", callback_data=f"nya|d|{sid}|8")],
+        [InlineKeyboardButton("📅 Daily", callback_data=f"nya|d|{sid}|7")],
+        [InlineKeyboardButton("🎯 Specific Date+Time", callback_data=f"nya|dt|{sid}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"nya|x|{sid}")],
     ]
-    await message.reply_text(
-        f"✅ <b>{len(titles)} title(s) resolved</b>\n\n{preview}\n\n"
+
+    await st.edit(
+        f"✅ <b>{len(all_t)} title(s) resolved</b>\n\n{preview}{extra}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "<b>Step 1/3 — Schedule:</b>",
-        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(day_rows),
     )
 
 
-# Snipe datetime input state
-_snipe_waiting: dict = {}  # uid → sid
+# ─────────────────────────────────────────────────────────────
+# Setup callbacks
+# ─────────────────────────────────────────────────────────────
 
-
-@colab_bot.on_callback_query(filters.regex(r"^nya\|"))
-async def nya_cb(client, cq):
-    parts = cq.data.split("|")
-    action, sid = parts[1], parts[2]
-    state = _setup.get(sid)
-    if not state: return await cq.answer("Expired.", show_alert=True)
-    await cq.answer()
+@Client.on_callback_query(filters.regex(r"^nya\|"))
+async def nya_cb(client: Client, cb: CallbackQuery):
+    parts  = cb.data.split("|")
+    action = parts[1]
+    sid    = parts[2] if len(parts) > 2 else ""
+    state  = _setup.get(sid)
+    if not state:
+        return await cb.answer("Expired. /nyaa_add again.", show_alert=True)
+    await cb.answer()
 
     if action == "x":
         _setup.pop(sid, None)
-        return await cq.message.delete()
+        return await cb.message.delete()
 
+    # ── Day selection ─────────────────────────────────────────
     if action == "d":
-        idx = int(parts[3])
-        if idx == 8:
-            # Snipe mode — ask for date+time
-            _snipe_waiting[cq.message.chat.id] = sid
-            state["day"] = "snipe"
-            await cq.message.edit_text(
-                "🎯 <b>Snipe Mode</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "Send the exact date and time to start polling:\n\n"
-                "<code>12-04-2026 12:00</code>\n\n"
-                "Format: <code>DD-MM-YYYY HH:MM</code>\n\n"
-                "<i>The bot will poll Nyaa every 5 seconds\n"
-                "starting at this time until a match is found.</i>"
-            )
-            return
-        elif idx < 7:
-            state["day"] = DAYS[idx]
-        else:
-            state["day"] = "daily"
+        idx = int(parts[3]) if len(parts) > 3 else 7
+        state["day"] = DAYS[idx] if idx < 7 else "daily"
+        state["step"] = "uploader"
+        await _show_uploader_step(cb.message, sid, state)
+        return
 
-        # Step 2: uploader
-        rows = []
-        row = []
-        for i, up in enumerate(UPLOADERS):
-            row.append(InlineKeyboardButton(up, callback_data=f"nya|u|{sid}|{i}"))
-            if len(row) == 3: rows.append(row); row = []
-        if row: rows.append(row)
-        rows.append([InlineKeyboardButton("🔓 Any", callback_data=f"nya|u|{sid}|99")])
-        rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"nya|x|{sid}")])
-
-        await cq.message.edit_text(
-            f"📅 {state['day'].capitalize()} ✅\n\n"
-            "<b>Step 2/3 — Uploader:</b>",
-            reply_markup=InlineKeyboardMarkup(rows),
+    # ── Date+Time input request ───────────────────────────────
+    if action == "dt":
+        state["step"] = "waiting_datetime"
+        uid = cb.from_user.id
+        _schedule_waiting[uid] = sid
+        await cb.message.edit(
+            "🎯 <b>Specific Date+Time</b>\n\n"
+            "Send the date and time to start checking:\n\n"
+            "<code>DD-MM-YYYY HH:MM</code>\n\n"
+            "Example: <code>12-04-2026 12:00</code>\n\n"
+            "<i>The bot will poll Nyaa every 5 seconds\n"
+            "starting from that exact moment.</i>",
+            parse_mode=enums.ParseMode.HTML,
         )
         return
 
+    # ── Uploader selection ────────────────────────────────────
     if action == "u":
-        idx = int(parts[3])
-        state["uploader"] = UPLOADERS[idx] if idx < len(UPLOADERS) else ""
-
-        rows = [
-            [InlineKeyboardButton("🔵 1080p", callback_data=f"nya|q|{sid}|1080p"),
-             InlineKeyboardButton("🟢 720p",  callback_data=f"nya|q|{sid}|720p")],
-            [InlineKeyboardButton("🟡 480p",  callback_data=f"nya|q|{sid}|480p"),
-             InlineKeyboardButton("🔓 Any",   callback_data=f"nya|q|{sid}|")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"nya|x|{sid}")],
-        ]
-        await cq.message.edit_text(
-            f"📅 {state['day'].capitalize()} ✅\n"
-            f"👤 {state['uploader'] or 'Any'} ✅\n\n"
-            "<b>Step 3/3 — Quality:</b>",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
+        idx = int(parts[3]) if len(parts) > 3 else 99
+        state["uploader"] = COMMON_UPLOADERS[idx] if idx < len(COMMON_UPLOADERS) else ""
+        state["step"] = "quality"
+        await _show_quality_step(cb.message, sid, state)
         return
 
+    # ── Quality → save ────────────────────────────────────────
     if action == "q":
-        quality = parts[3]
-        entry = WatchEntry(
-            id=0, name=state["title"], titles=state["titles"],
-            day=state["day"], uploader=state.get("uploader", ""),
-            quality=quality, snipe_at=state.get("snipe_at", ""),
+        quality = parts[3] if len(parts) > 3 else ""
+        state["quality"] = quality
+        entry = WatchlistEntry(
+            id=0, display_name=state["title"], titles=state["titles"],
+            anilist_id=state["anilist_id"], day=state.get("day") or "daily",
+            uploader=state.get("uploader") or "", quality=quality,
+            scheduled_ts=state.get("scheduled_ts", 0),
         )
-        eid = _WL.add(entry)
+        eid = await watchlist.add(entry)
         _setup.pop(sid, None)
         _ensure_poller()
 
-        extra = ""
-        if entry.snipe_at:
-            extra = f"\n🎯 Snipe at: <code>{entry.snipe_at}</code>\n   <i>Polling every 5 seconds</i>"
+        sched = ""
+        if entry.scheduled_ts:
+            import datetime as dt
+            ts_str = dt.datetime.fromtimestamp(entry.scheduled_ts).strftime("%d-%m-%Y %H:%M")
+            sched = f"\n🎯 Scheduled: <code>{ts_str}</code> (polls every 5s)"
 
-        await cq.message.edit_text(
+        await cb.message.edit(
             f"✅ <b>Added #{eid}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📺 <b>{entry.name}</b>\n"
-            f"📅 {entry.day.capitalize()}\n"
-            f"👤 {entry.uploader or 'Any'}\n"
-            f"📐 {quality or 'Any'}\n"
-            f"🔑 {len(entry.titles)} aliases{extra}"
+            f"📺 <b>{entry.display_name}</b>\n"
+            f"📅 {entry.day.capitalize()}  👤 {entry.uploader or 'Any'}  📐 {quality or 'Any'}\n"
+            f"🔑 {len(entry.titles)} aliases{sched}",
+            parse_mode=enums.ParseMode.HTML,
         )
-
-
-# Handle snipe datetime input
-@colab_bot.on_message(filters.text & filters.private & ~filters.command(
-    ["start","help","settings","status","stats","ping","cancel","stop",
-     "setname","rename","zipaswd","unzipaswd",
-     "nyaa_search","nyaa_add","nyaa_list","nyaa_remove","nyaa_check","nyaa_snipe"]
-))
-async def snipe_input(client, message):
-    uid = message.chat.id
-    sid = _snipe_waiting.get(uid)
-    if not sid or sid not in _setup:
         return
-    text = message.text.strip()
-    # Parse DD-MM-YYYY HH:MM
-    try:
-        dt = datetime.strptime(text, "%d-%m-%Y %H:%M")
-        iso = dt.isoformat()
-    except ValueError:
-        try:
-            dt = datetime.strptime(text, "%Y-%m-%d %H:%M")
-            iso = dt.isoformat()
-        except ValueError:
-            return await message.reply_text("❌ Invalid format. Use: <code>DD-MM-YYYY HH:MM</code>")
 
-    _setup[sid]["snipe_at"] = iso
-    _snipe_waiting.pop(uid, None)
 
-    # Continue to step 2 (uploader)
-    state = _setup[sid]
+async def _show_uploader_step(msg, sid, state):
     rows = []
     row = []
-    for i, up in enumerate(UPLOADERS):
-        row.append(InlineKeyboardButton(up, callback_data=f"nya|u|{sid}|{i}"))
-        if len(row) == 3: rows.append(row); row = []
-    if row: rows.append(row)
+    for i, u in enumerate(COMMON_UPLOADERS):
+        row.append(InlineKeyboardButton(u, callback_data=f"nya|u|{sid}|{i}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     rows.append([InlineKeyboardButton("🔓 Any", callback_data=f"nya|u|{sid}|99")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"nya|x|{sid}")])
 
-    await message.reply_text(
-        f"🎯 Snipe: <code>{text}</code> ✅\n\n"
+    day_s = state["day"].capitalize() if state.get("day") != "daily" else "Daily"
+    await msg.edit(
+        f"📅 {day_s} ✅\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "<b>Step 2/3 — Uploader:</b>",
+        parse_mode=enums.ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
 
+async def _show_quality_step(msg, sid, state):
+    rows = [
+        [InlineKeyboardButton("🔵 1080p", callback_data=f"nya|q|{sid}|1080p"),
+         InlineKeyboardButton("🟢 720p",  callback_data=f"nya|q|{sid}|720p")],
+        [InlineKeyboardButton("🟡 480p",  callback_data=f"nya|q|{sid}|480p"),
+         InlineKeyboardButton("🔓 Any",   callback_data=f"nya|q|{sid}|")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"nya|x|{sid}")],
+    ]
+    day_s = state.get("day", "daily").capitalize()
+    up_s  = state.get("uploader") or "Any"
+    await msg.edit(
+        f"📅 {day_s} ✅  👤 {up_s} ✅\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>Step 3/3 — Quality:</b>",
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Date+time text receiver
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_message(
+    filters.private & filters.text
+    & ~filters.command([
+        "start","help","settings","info","status","log","restart","broadcast",
+        "admin","ban_user","unban_user","banned_list","cancel",
+        "show_thumb","del_thumb","json_formatter","bulk_url",
+        "hardsub","botname","ccstatus","convert","resize","compress",
+        "usage","captiontemplate","stream","forward",
+        "createarchive","archiveddone","mergedone",
+        "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
+        "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit",
+    ]),
+    group=0,
+)
+async def datetime_receiver(client: Client, msg: Message):
+    uid = msg.from_user.id
+    sid = _schedule_waiting.get(uid)
+    if not sid:
+        return
+    state = _setup.get(sid)
+    if not state or state.get("step") != "waiting_datetime":
+        _schedule_waiting.pop(uid, None)
+        return
+
+    text = msg.text.strip()
+    # Parse DD-MM-YYYY HH:MM
+    import datetime as dt
+    try:
+        parsed = dt.datetime.strptime(text, "%d-%m-%Y %H:%M")
+        ts = parsed.timestamp()
+        if ts < time.time():
+            await msg.reply("❌ That's in the past. Send a future date.",
+                            parse_mode=enums.ParseMode.HTML)
+            return
+    except ValueError:
+        await msg.reply(
+            "❌ Invalid format. Use: <code>DD-MM-YYYY HH:MM</code>\n"
+            "Example: <code>12-04-2026 12:00</code>",
+            parse_mode=enums.ParseMode.HTML)
+        return
+
+    _schedule_waiting.pop(uid, None)
+    state["scheduled_ts"] = ts
+    state["day"] = "daily"  # daily ensures normal poller also picks it up
+    state["step"] = "uploader"
+
+    ts_display = parsed.strftime("%d-%m-%Y %H:%M")
+    st = await msg.reply(
+        f"🎯 Scheduled: <code>{ts_display}</code> ✅\n"
+        f"<i>Will poll every 5s starting at that time.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+    await _show_uploader_step(st, sid, state)
+    msg.stop_propagation()
+
+
 # ═════════════════════════════════════════════════════════════
-# /nyaa_list, /nyaa_remove, /nyaa_check
+# Management commands
 # ═════════════════════════════════════════════════════════════
 
-@colab_bot.on_message(filters.command("nyaa_list") & filters.private)
-async def cmd_list(client, message):
-    if message.chat.id != OWNER: return
-    entries = _WL.all()
+@Client.on_message(filters.command("nyaa_list") & filters.user(cfg.owner_id))
+async def cmd_nyaa_list(client: Client, msg: Message):
+    entries = watchlist.all_entries()
     if not entries:
-        return await message.reply_text("📡 <b>Watchlist empty.</b>\nUse /nyaa_add")
+        return await msg.reply("📡 <b>Empty</b> — /nyaa_add to start.",
+                               parse_mode=enums.ParseMode.HTML)
     lines = ["📡 <b>Nyaa Watchlist</b>", "━━━━━━━━━━━━━━━━━━━━━━━━", ""]
     for e in entries:
-        icon = "🟢" if e.active else "🔴"
-        snipe = f" 🎯 {e.snipe_at[5:16]}" if e.snipe_at else ""
+        ico = "🟢" if e.active else "🔴"
+        day = e.day.capitalize() if e.day != "daily" else "Daily"
+        up  = f"[{e.uploader}]" if e.uploader else ""
+        sched = ""
+        if e.scheduled_ts and not e.schedule_done:
+            import datetime as dt
+            sched = f"\n   🎯 {dt.datetime.fromtimestamp(e.scheduled_ts).strftime('%d-%m %H:%M')}"
         lines.append(
-            f"{icon} <b>#{e.id}</b>  <code>{e.name[:25]}</code>\n"
-            f"   📅 {e.day.capitalize()}  📐 {e.quality}  [{e.uploader or 'Any'}]{snipe}"
+            f"{ico} <b>#{e.id}</b> <code>{e.display_name[:25]}</code>\n"
+            f"   📅{day} 📐{e.quality or 'Any'} {up}"
+            f"\n   🔑{len(e.titles)} · 📦{len(e.seen_hashes)} seen{sched}"
         )
         lines.append("")
-    await message.reply_text("\n".join(lines)[:4000])
+    await msg.reply("\n".join(lines)[:4000], parse_mode=enums.ParseMode.HTML)
 
 
-@colab_bot.on_message(filters.command("nyaa_remove") & filters.private)
-async def cmd_remove(client, message):
-    if message.chat.id != OWNER: return
-    args = message.command[1:]
+@Client.on_message(filters.command("nyaa_remove") & filters.user(cfg.owner_id))
+async def cmd_nyaa_remove(client: Client, msg: Message):
+    args = msg.command[1:]
     if not args or not args[0].isdigit():
-        return await message.reply_text("Usage: <code>/nyaa_remove 1</code>")
+        return await msg.reply("Usage: <code>/nyaa_remove &lt;id&gt;</code>",
+                               parse_mode=enums.ParseMode.HTML)
     eid = int(args[0])
-    e = _WL.get(eid)
-    if not e: return await message.reply_text(f"❌ #{eid} not found.")
-    _WL.remove(eid)
-    await message.reply_text(f"✅ Removed #{eid} — {e.name}")
+    e = watchlist.get(eid)
+    if not e:
+        return await msg.reply(f"❌ #{eid} not found.")
+    await watchlist.remove(eid)
+    await msg.reply(f"✅ Removed #{eid} — {e.display_name}", parse_mode=enums.ParseMode.HTML)
 
 
-@colab_bot.on_message(filters.command("nyaa_check") & filters.private)
-async def cmd_check(client, message):
-    if message.chat.id != OWNER: return
-    entries = [e for e in _WL.all() if e.active]
-    if not entries: return await message.reply_text("No active entries.")
-    st = await message.reply_text(f"🔍 Checking {len(entries)} entries…")
+@Client.on_message(filters.command("nyaa_toggle") & filters.user(cfg.owner_id))
+async def cmd_nyaa_toggle(client: Client, msg: Message):
+    args = msg.command[1:]
+    if not args or not args[0].isdigit():
+        return await msg.reply("Usage: <code>/nyaa_toggle &lt;id&gt;</code>",
+                               parse_mode=enums.ParseMode.HTML)
+    eid = int(args[0])
+    e = watchlist.get(eid)
+    if not e:
+        return await msg.reply(f"❌ #{eid} not found.")
+    new = not e.active
+    await watchlist.update(eid, active=new)
+    await msg.reply(f"{'🟢' if new else '🔴'} #{eid} {'Enabled' if new else 'Disabled'}",
+                    parse_mode=enums.ParseMode.HTML)
+
+
+@Client.on_message(filters.command("nyaa_dump") & filters.user(cfg.owner_id))
+async def cmd_nyaa_dump(client: Client, msg: Message):
+    args = msg.command[1:]
+    if not args:
+        return await msg.reply(f"📢 Dump: <code>{_config.get('dump_channel', 0) or 'Not set'}</code>",
+                               parse_mode=enums.ParseMode.HTML)
+    target = args[0]
+    if target == "0":
+        _config["dump_channel"] = 0
+        _save_config()
+        return await msg.reply("📢 Disabled.")
+    try:
+        ch_id = int(target) if target.lstrip("-").isdigit() else (await client.get_chat(target)).id
+        _config["dump_channel"] = ch_id
+        _save_config()
+        await msg.reply(f"✅ Dump: <code>{ch_id}</code>", parse_mode=enums.ParseMode.HTML)
+    except Exception as exc:
+        await msg.reply(f"❌ {exc}", parse_mode=enums.ParseMode.HTML)
+
+
+@Client.on_message(filters.command("nyaa_check") & filters.user(cfg.owner_id))
+async def cmd_nyaa_check(client: Client, msg: Message):
+    entries = [e for e in watchlist.all_entries() if e.active]
+    if not entries:
+        return await msg.reply("📡 No active entries.")
+    st = await msg.reply(f"🔍 Checking {len(entries)}…", parse_mode=enums.ParseMode.HTML)
+    _ensure_poller()
     found = 0
-    for e in entries:
-        n = await _check_entry(e)
-        found += n
+    for i, e in enumerate(entries, 1):
+        try:
+            n = await _check_entry(e)
+            found += n
+        except Exception as exc:
+            log.warning("[Check] %s: %s", e.display_name, exc)
         await asyncio.sleep(2)
-    await st.edit_text(f"✅ Done — {found} new matches")
+    await st.edit(f"✅ {len(entries)} checked, {found} new", parse_mode=enums.ParseMode.HTML)
 
 
 # ═════════════════════════════════════════════════════════════
-# Poller (daily + snipe)
+# Poller — normal + scheduled date+time (5s)
 # ═════════════════════════════════════════════════════════════
 
-_poller_task = None
+_poller_task: Optional[asyncio.Task] = None
+
 
 def _ensure_poller():
     global _poller_task
-    if _poller_task and not _poller_task.done(): return
-    _poller_task = asyncio.get_event_loop().create_task(_poll_loop())
+    if _poller_task and not _poller_task.done():
+        return
+    _poller_task = asyncio.create_task(_poll_loop())
+
 
 async def _poll_loop():
-    await asyncio.sleep(30)
+    await asyncio.sleep(15)
     while True:
-        # ── Snipe mode: check entries with specific datetime every 5s ──
-        for e in _WL.snipers():
-            try:
-                target = datetime.fromisoformat(e.snipe_at)
-                now = datetime.now()
-                if now >= target:
-                    log.info("[Nyaa] Snipe active for '%s' — polling every 5s", e.name)
-                    # Poll aggressively for 10 minutes
-                    deadline = now + timedelta(minutes=10)
-                    while datetime.now() < deadline:
-                        n = await _check_entry(e)
-                        if n > 0:
-                            log.info("[Nyaa] Snipe hit for '%s'!", e.name)
-                            _WL.update(e.id, snipe_done=True)
-                            break
-                        await asyncio.sleep(5)
-                    else:
-                        _WL.update(e.id, snipe_done=True)
-                        try:
-                            await colab_bot.send_message(
-                                OWNER,
-                                f"🎯 <b>Snipe expired</b> — {e.name}\n"
-                                f"No match found within 10 min of {e.snipe_at}",
-                            )
-                        except Exception: pass
-            except Exception as exc:
-                log.warning("[Nyaa] Snipe error: %s", exc)
-
-        # ── Daily entries ─────────────────────────────────────
         try:
-            today = datetime.now().strftime("%A").lower()
-            for e in _WL.for_day(today):
-                try: await _check_entry(e)
-                except Exception as exc: log.warning("[Nyaa] %s: %s", e.name, exc)
+            # ── Normal day-based polling ──────────────────────
+            import datetime as dt
+            today = dt.datetime.now().strftime("%A").lower()
+            for e in watchlist.entries_for_day(today):
+                try:
+                    await _check_entry(e)
+                except Exception as exc:
+                    log.error("[Poll] %s: %s", e.display_name, exc)
                 await asyncio.sleep(3)
+
+            # ── Scheduled date+time entries (5s precision) ────
+            scheduled = watchlist.scheduled_entries()
+            for e in scheduled:
+                log.info("[NyaaTracker] Scheduled check triggered for '%s'", e.display_name)
+                found = await _rapid_check(e, duration=7200, interval=5)
+                if found:
+                    log.info("[NyaaTracker] Scheduled match found for '%s'", e.display_name)
+                await watchlist.update(e.id, schedule_done=True)
+
         except Exception as exc:
-            log.error("[Nyaa] Poll: %s", exc)
+            log.error("[Poll] %s", exc, exc_info=True)
 
-        await asyncio.sleep(600)
+        await asyncio.sleep(_config.get("poll_interval", 600))
 
 
-async def _check_entry(entry: WatchEntry) -> int:
-    results = await search_nyaa(entry.name)
-    matched = []
-    for r in results:
-        if r.info_hash in entry.seen: continue
-        # Title match
-        nt = r.title.lower()
-        if entry.uploader and entry.uploader.lower() not in nt: continue
-        if entry.quality and entry.quality.lower() not in nt: continue
-        name_match = any(t.lower() in nt for t in entry.titles if len(t) >= 3)
-        if not name_match: continue
-        matched.append(r)
+async def _rapid_check(entry: WatchlistEntry, duration: int = 7200, interval: int = 5) -> bool:
+    """Poll every `interval` seconds for up to `duration` seconds until a match is found."""
+    from core.session import get_client
+    client = get_client()
+
+    deadline = time.time() + duration
+    attempt = 0
+
+    try:
+        await client.send_message(
+            cfg.owner_id,
+            f"🎯 <b>Scheduled check started</b>\n\n"
+            f"📺 <b>{entry.display_name}</b>\n"
+            f"⏱ Polling every {interval}s for up to {duration//60} min\n"
+            f"<i>I'll notify you when a match is found.</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            n = await _check_entry(entry)
+            if n > 0:
+                return True
+        except Exception as exc:
+            log.warning("[RapidCheck] %s attempt %d: %s", entry.display_name, attempt, exc)
+        await asyncio.sleep(interval)
+
+    try:
+        await client.send_message(
+            cfg.owner_id,
+            f"⏰ <b>Scheduled check expired</b>\n\n"
+            f"📺 {entry.display_name}\n"
+            f"Checked {attempt} times over {duration//60} min — no new match.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception:
+        pass
+    return False
+
+
+async def _check_entry(entry: WatchlistEntry) -> int:
+    from services.nyaa import search_nyaa, match_title, extract_episode
+
+    terms = [entry.display_name]
+    for t in entry.titles:
+        if t.lower().strip() not in [s.lower().strip() for s in terms]:
+            terms.append(t)
+            if len(terms) >= 3:
+                break
+
+    all_r = []
+    seen_h: set = set()
+    for term in terms:
+        for r in await search_nyaa(term, category=entry.category):
+            if r.info_hash and r.info_hash not in seen_h:
+                seen_h.add(r.info_hash)
+                all_r.append(r)
+        await asyncio.sleep(1)
+
+    await watchlist.update(entry.id, last_check=time.time())
+
+    matched = [
+        r for r in all_r
+        if r.info_hash not in entry.seen_hashes
+        and match_title(r.title, entry.titles, entry.uploader, entry.quality)
+    ]
+    if not matched:
+        return 0
+
+    from core.session import get_client
+    client  = get_client()
+    dump_ch = _config.get("dump_channel", 0)
 
     for r in matched:
-        h = r.info_hash[:12] or hashlib.md5(r.title.encode()).hexdigest()[:12]
-        if r.magnet: _magnets[h] = r.magnet
+        ep = extract_episode(r.title)
+        ep_s = f"Ep {ep}" if ep else "Batch"
+        h12 = r.info_hash[:12] if r.info_hash else hashlib.md5(r.title.encode()).hexdigest()[:12]
+        if r.magnet:
+            _magnet_cache[h12] = r.magnet
 
         text = (
             f"🔔 <b>Nyaa Match</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📺 <b>{entry.name}</b>\n"
+            f"📺 <b>{entry.display_name}</b> ({ep_s})\n"
             f"📦 <code>{r.title[:65]}</code>\n\n"
-            f"💾 {r.size}  🌱 {r.seeders}  👤 {r.uploader or '—'}"
+            f"💾{r.size} 🌱{r.seeders} 📅{_short_date(r.pub_date)} 👤{r.uploader or '—'}"
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧲 Magnet", callback_data=f"nyt|m|{h}"),
-             InlineKeyboardButton("📥 DL",     callback_data=f"nyt|dl|{h}")],
+            [InlineKeyboardButton("☁️ Seedr+HS", callback_data=f"nyt|sr|{entry.id}|{h12}"),
+             InlineKeyboardButton("📥 DL",       callback_data=f"nyt|dl|{entry.id}|{h12}")],
+            [InlineKeyboardButton("☁️ Seedr+CC🗜️", callback_data=f"nyt|sc|{entry.id}|{h12}"),
+             InlineKeyboardButton("🧲 Magnet",   callback_data=f"nyt|mg|{entry.id}|{h12}")],
+            [InlineKeyboardButton("❌ Skip",     callback_data=f"nyt|sk|{entry.id}|{h12}")],
         ])
+
+        if dump_ch:
+            try:
+                await client.send_message(dump_ch, text, parse_mode=enums.ParseMode.HTML,
+                                          reply_markup=kb, disable_web_page_preview=True)
+            except Exception as exc:
+                log.warning("[Dump] %s", exc)
         try:
-            await colab_bot.send_message(OWNER, text, reply_markup=kb, disable_web_page_preview=True)
-        except Exception: pass
-        _WL.mark_seen(entry.id, r.info_hash)
+            await client.send_message(cfg.owner_id, text, parse_mode=enums.ParseMode.HTML,
+                                      reply_markup=kb, disable_web_page_preview=True)
+        except Exception:
+            pass
+        await watchlist.mark_seen(entry.id, r.info_hash)
 
     return len(matched)
 
 
-# Match notification callbacks
-@colab_bot.on_callback_query(filters.regex(r"^nyt\|"))
-async def nyt_cb(client, cq):
-    parts = cq.data.split("|")
-    action, h = parts[1], parts[2]
-    uid = cq.message.chat.id
-    await cq.answer()
+# ─────────────────────────────────────────────────────────────
+# Poller match callbacks
+# ─────────────────────────────────────────────────────────────
 
-    magnet = _magnets.get(h, "")
+@Client.on_callback_query(filters.regex(r"^nyt\|"))
+async def nyt_cb(client: Client, cb: CallbackQuery):
+    parts = cb.data.split("|")
+    if len(parts) < 4:
+        return await cb.answer("Invalid.", show_alert=True)
+    action, h12 = parts[1], parts[3]
+    uid = cb.from_user.id
+    await cb.answer()
+
+    if action == "sk":
+        try:
+            await cb.message.edit(cb.message.text + "\n\n❌ <b>Skipped</b>",
+                                  parse_mode=enums.ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    magnet = _magnet_cache.get(h12, "")
+
+    if action == "mg":
+        if not magnet:
+            return await client.send_message(uid, "❌ Magnet expired.")
+        await client.send_message(uid, f"🧲\n\n<code>{magnet}</code>",
+                                  parse_mode=enums.ParseMode.HTML)
+        return
+
     if not magnet:
         return await client.send_message(uid, "❌ Magnet expired.")
 
-    if action == "m":
-        await client.send_message(uid, f"🧲 <code>{magnet}</code>")
+    if action == "sr":
+        from plugins.url_handler import _seedr_download
+        st = await client.send_message(uid, "☁️ Seedr…", parse_mode=enums.ParseMode.HTML)
+        asyncio.create_task(_seedr_download(client, st, magnet, uid))
+        try:
+            await cb.message.edit(cb.message.text + "\n\n☁️ <b>→ Seedr</b>",
+                                  parse_mode=enums.ParseMode.HTML)
+        except Exception:
+            pass
+
     elif action == "dl":
-        from colab_leecher.utility.variables import BOT
-        BOT.SOURCE = [magnet]; BOT.Mode.ytdl = False; BOT.State.started = True
-        await cq.message.edit_text(
-            cq.message.text + "\n\n📥 <b>Queued for download</b>",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📄 Normal", callback_data="normal"),
-            ]])
+        from plugins.url_handler import _launch_download
+        st = await client.send_message(uid, "📥 Downloading…", parse_mode=enums.ParseMode.HTML)
+        asyncio.create_task(_launch_download(client, st, magnet, uid))
+        try:
+            await cb.message.edit(cb.message.text + "\n\n📥 <b>DL started</b>",
+                                  parse_mode=enums.ParseMode.HTML)
+        except Exception:
+            pass
+
+    elif action == "sc":
+        api_key = os.environ.get("CC_API_KEY", "").strip()
+        if not api_key:
+            return await client.send_message(uid, "❌ CC_API_KEY not set.")
+        _magnet_cache[h12] = magnet
+        await client.send_message(
+            uid,
+            "☁️ <b>Seedr+CC Compress</b>\nChoose resolution:",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔵 1080p", callback_data=f"nyc|1080|{h12}"),
+                 InlineKeyboardButton("🟢 720p",  callback_data=f"nyc|720|{h12}")],
+                [InlineKeyboardButton("🟡 480p",  callback_data=f"nyc|480|{h12}"),
+                 InlineKeyboardButton("🎬 Original", callback_data=f"nyc|0|{h12}")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="nyc|x|0")],
+            ]),
         )
 
 
-# Auto-start poller
-if any(e.active for e in _WL.all()):
-    try: _ensure_poller()
-    except Exception: pass
+# ═════════════════════════════════════════════════════════════
+# Auto-start
+# ═════════════════════════════════════════════════════════════
+
+def start_nyaa_poller():
+    if any(e.active for e in watchlist.all_entries()):
+        _ensure_poller()
