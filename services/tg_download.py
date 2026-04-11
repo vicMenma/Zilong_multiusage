@@ -1,12 +1,12 @@
 """
 services/tg_download.py
-Download a Telegram file with inline per-task progress (new panel design).
+Download a Telegram file with non-blocking 1s progress panel.
 
 REWRITE:
-  - Edits msg directly with the new progress_panel() format
-  - No tracker registration (handled by callers if needed)
-  - 1.5 s edit throttle
-  - Pulls system stats from _stats_cache for CPU/RAM/Disk display
+  - PanelUpdater decouples Telegram edits from Pyrogram's progress callback.
+  - Progress callback is now O(1) non-blocking: just ticks shared state.
+  - Background task edits the panel every 1 s.
+  - FloodWaits handled in PanelUpdater, never block the download.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import time
 
 from pyrogram import Client, enums
 
-from services.utils import progress_panel, safe_edit
+from services.utils import PanelUpdater, progress_panel
 from core.session import settings
 
 
@@ -33,39 +33,35 @@ async def tg_download(
 
     display_name = fname or label or os.path.basename(dest_path) or "file"
     start        = time.time()
-    last_edit    = [start - 4.0]   # allow first edit immediately
 
     user_cfg     = await settings.get(user_id)
     panel_style  = user_cfg.get("progress_style", "B")
 
-    async def _prog(current: int, total: int) -> None:
-        now = time.time()
-        if now - last_edit[0] < 4.0:
-            return
-        last_edit[0] = now
-
-        elapsed = now - start
-        speed   = current / elapsed if elapsed else 0.0
-        eta     = int((total - current) / speed) if (speed and total > current) else 0
-
-        s = _stats_cache
-        text = progress_panel(
-            mode        = "dl",
-            fname       = display_name,
-            done        = current,
-            total       = total or fsize,
-            speed       = speed,
-            eta         = eta,
-            elapsed     = elapsed,
-            engine      = "telegram",
-            link_label  = "Telegram",
-            cpu         = float(s.get("cpu", 0)),
-            ram_used    = int(s.get("ram_used", 0)),
-            disk_free   = int(s.get("disk_free", 0)),
-            style       = panel_style,
+    def _build(state: dict) -> str:
+        return progress_panel(
+            mode       = "dl",
+            fname      = display_name,
+            done       = state.get("done", 0),
+            total      = state.get("total", fsize),
+            speed      = state.get("speed", 0.0),
+            eta        = state.get("eta", 0),
+            elapsed    = time.time() - start,
+            engine     = "telegram",
+            link_label = "Telegram",
+            cpu        = float(_stats_cache.get("cpu", 0)),
+            ram_used   = int(_stats_cache.get("ram_used", 0)),
+            disk_free  = int(_stats_cache.get("disk_free", 0)),
+            style      = panel_style,
         )
-        await safe_edit(msg, text, parse_mode=enums.ParseMode.HTML)
 
-    path = await client.download_media(file_id, file_name=dest_path, progress=_prog)
+    async with PanelUpdater(msg, _build, interval=1.0) as pu:
+
+        async def _prog(current: int, total: int) -> None:
+            elapsed = time.time() - start
+            speed   = current / elapsed if elapsed else 0.0
+            eta     = int((total - current) / speed) if (speed and total > current) else 0
+            pu.tick(done=current, total=total or fsize, speed=speed, eta=eta)
+
+        path = await client.download_media(file_id, file_name=dest_path, progress=_prog)
 
     return path

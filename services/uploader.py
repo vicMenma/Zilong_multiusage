@@ -330,6 +330,7 @@ async def _upload_single(
     user_id:        int        = 0,
 ) -> None:
     from services.task_runner import _stats_cache
+    from services.utils import PanelUpdater
 
     chat_id     = _chat_id(msg)
     fname       = os.path.basename(path)
@@ -353,42 +354,15 @@ async def _upload_single(
                 if is_temp:
                     auto_thumb = t
 
-    # Delete placeholder message; panel is now the upload progress message
+    # Delete placeholder message
     try:
         await msg.delete()
     except Exception:
         pass
 
-    start        = time.time()
-    last_edit    = [start - 4.0]
+    start = time.time()
 
-    async def progress(current: int, total: int) -> None:
-        now = time.time()
-        if now - last_edit[0] < 4.0:
-            return
-        last_edit[0] = now
-        elapsed = now - start
-        speed   = current / elapsed if elapsed else 0.0
-        eta     = int((total - current) / speed) if (speed and total > current) else 0
-        s = _stats_cache
-        text = progress_panel(
-            mode       = "ul",
-            fname      = fname,
-            done       = current,
-            total      = total or file_size,
-            speed      = speed,
-            eta        = eta,
-            elapsed    = elapsed,
-            engine     = "telegram",
-            link_label = "Telegram",
-            cpu        = float(s.get("cpu", 0)),
-            ram_used   = int(s.get("ram_used", 0)),
-            disk_free  = int(s.get("disk_free", 0)),
-            style      = panel_style,
-        )
-        await safe_edit(status_msg, text, parse_mode=enums.ParseMode.HTML)
-
-    # Send progress message
+    # Send the initial progress panel
     status_msg = await client.send_message(
         chat_id,
         progress_panel(
@@ -400,50 +374,88 @@ async def _upload_single(
         parse_mode=enums.ParseMode.HTML,
     )
 
-    common = dict(
-        caption    = cap,
-        thumb      = thumb,
-        parse_mode = enums.ParseMode.HTML,
-        progress   = progress,
-    )
+    def _build_panel(state: dict) -> str:
+        elapsed = time.time() - start
+        return progress_panel(
+            mode      = "ul",
+            fname     = fname,
+            done      = state.get("done", 0),
+            total     = state.get("total", file_size),
+            speed     = state.get("speed", 0.0),
+            eta       = state.get("eta", 0),
+            elapsed   = elapsed,
+            engine    = "telegram",
+            link_label= "Telegram",
+            cpu       = float(_stats_cache.get("cpu", 0)),
+            ram_used  = int(_stats_cache.get("ram_used", 0)),
+            disk_free = int(_stats_cache.get("disk_free", 0)),
+            style     = panel_style,
+        )
 
     sent  = None
     error = None
 
-    for attempt in range(4):
-        try:
-            if ftype == "video":
-                sent = await client.send_video(
-                    chat_id, path,
-                    supports_streaming = True,
-                    width              = meta["width"],
-                    height             = meta["height"],
-                    duration           = meta["duration"],
-                    **common,
-                )
-            elif ftype == "audio":
-                sent = await client.send_audio(chat_id, path, **common)
-            elif ftype == "photo":
-                sent = await client.send_photo(
-                    chat_id, path,
-                    caption    = cap,
-                    parse_mode = enums.ParseMode.HTML,
-                    progress   = progress,
-                )
-            else:
-                sent = await client.send_document(
-                    chat_id, path, force_document=True, **common,
-                )
-            error = None
-            break
-        except FloodWait as fw:
-            log.warning("FloodWait %ds on upload (attempt %d/4)", fw.value, attempt + 1)
-            await asyncio.sleep(fw.value + 2)
-            continue
-        except Exception as exc:
-            error = exc
-            break
+    async with PanelUpdater(status_msg, _build_panel, interval=1.0) as pu:
 
+        def _make_progress():
+            # Returns a progress callback whose only job is to tick the updater.
+            # Completely non-blocking — no awaits, no Telegram calls.
+            def _cb_factory():
+                async def progress(current: int, total: int) -> None:
+                    elapsed = time.time() - start
+                    speed   = current / elapsed if elapsed else 0.0
+                    eta     = int((total - current) / speed) if (speed and total > current) else 0
+                    pu.tick(done=current, total=total, speed=speed, eta=eta)
+                return progress
+            return _cb_factory()
+
+        progress_cb = _make_progress()
+
+        common = dict(
+            caption    = cap,
+            thumb      = thumb,
+            parse_mode = enums.ParseMode.HTML,
+            progress   = progress_cb,
+        )
+
+        for attempt in range(4):
+            try:
+                if ftype == "video":
+                    sent = await client.send_video(
+                        chat_id, path,
+                        supports_streaming = True,
+                        width              = meta["width"],
+                        height             = meta["height"],
+                        duration           = meta["duration"],
+                        **common,
+                    )
+                elif ftype == "audio":
+                    sent = await client.send_audio(chat_id, path, **common)
+                elif ftype == "photo":
+                    sent = await client.send_photo(
+                        chat_id, path,
+                        caption    = cap,
+                        parse_mode = enums.ParseMode.HTML,
+                        progress   = progress_cb,
+                    )
+                else:
+                    sent = await client.send_document(
+                        chat_id, path, force_document=True, **common,
+                    )
+                error = None
+                break
+            except FloodWait as fw:
+                log.warning("FloodWait %ds on upload (attempt %d/4)", fw.value, attempt + 1)
+                await asyncio.sleep(fw.value + 2)
+                continue
+            except asyncio.CancelledError:
+                error = None  # cancelled — don't propagate as upload error
+                break
+            except Exception as exc:
+                error = exc
+                break
+
+    # PanelUpdater.stop() already did a final edit — just clean up
     elapsed = time.time() - start
     speed   = file_size / elapsed if elapsed else 0.0
 
@@ -477,7 +489,7 @@ async def _upload_single(
         except Exception:
             pass
 
-    # Auto-forward to user's saved channels (if enabled in Settings)
+    # Auto-forward to user's saved channels
     if sent and user_id:
         try:
             s = await settings.get(user_id)

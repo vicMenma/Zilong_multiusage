@@ -667,40 +667,47 @@ async def smart_download(
     await tracker.register(record)
 
     from services.task_runner import _stats_cache
+    from services.utils import PanelUpdater
 
-    _last_edit  = [0.0]
     user_cfg    = await settings.get(record.user_id)
     panel_style = user_cfg.get("progress_style", "B")
+    start_time  = time.time()
+
+    def _build_dl_panel(state: dict) -> str:
+        return progress_panel(
+            mode       = record.mode,
+            fname      = record.fname or clean_label,
+            done       = state.get("done", 0),
+            total      = state.get("total", 0),
+            speed      = state.get("speed", 0.0),
+            eta        = state.get("eta", 0),
+            elapsed    = time.time() - start_time,
+            engine     = engine,
+            link_label = clean_label[:20],
+            cpu        = float(_stats_cache.get("cpu", 0)),
+            ram_used   = int(_stats_cache.get("ram_used", 0)),
+            disk_free  = int(_stats_cache.get("disk_free", 0)),
+            seeds      = state.get("seeds", 0),
+            style      = panel_style,
+        )
+
+    # PanelUpdater is None-safe: if msg is None it's a no-op updater
+    _updater = PanelUpdater(msg, _build_dl_panel, interval=1.0)
 
     async def _tracked_progress(done: int, total: int, speed: float, eta: int) -> None:
+        """
+        O(1) non-blocking — just updates shared state.
+        PanelUpdater background task handles all actual Telegram edits.
+        """
         record.update(done=done, total=total, speed=speed, eta=eta, state="📥 Downloading")
         if msg is not None:
-            now = time.time()
-            if now - _last_edit[0] < 4.0:
-                return
-            _last_edit[0] = now
-            s = _stats_cache
-            text = progress_panel(
-                mode        = record.mode,
-                fname       = record.fname or clean_label,
-                done        = done,
-                total       = total,
-                speed       = speed,
-                eta         = eta,
-                elapsed     = record.elapsed,
-                engine      = engine,
-                link_label  = clean_label[:20],
-                cpu         = float(s.get("cpu", 0)),
-                ram_used    = int(s.get("ram_used", 0)),
-                disk_free   = int(s.get("disk_free", 0)),
-                style       = panel_style,
-            )
-            from pyrogram import enums as _enums
-            await safe_edit(msg, text, parse_mode=_enums.ParseMode.HTML)
+            _updater.tick(done=done, total=total, speed=speed, eta=eta,
+                          seeds=getattr(record, "seeds", 0))
         if progress:
             await progress(done, total, speed, eta)
 
     try:
+        await _updater.start()
         result = await _dispatch(
             url, dest, kind, audio_only, fmt_id, sa_json,
             _tracked_progress, record,
@@ -710,6 +717,8 @@ async def smart_download(
     except Exception as exc:
         record.update(state=f"❌ {str(exc)[:50]}")
         raise
+    finally:
+        await _updater.stop()
 
 
 async def _dispatch(

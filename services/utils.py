@@ -446,28 +446,160 @@ _EDIT_SUPPRESSED = frozenset({
     "MESSAGE_TOO_LONG",
 })
 
+
 async def safe_edit(msg, text: str, **kwargs) -> None:
-    import re as _re2
+    """
+    Non-blocking fire-and-forget edit.
+    NEVER sleeps — skips the edit on FloodWait instead of blocking the caller.
+    Use PanelUpdater for high-frequency progress updates.
+    """
     if len(text) > _TG_MAX:
         text = text[:_TG_MAX - 64] + "\n\n<i>⚠️ Truncated</i>"
-    for _attempt in range(3):
-        try:
-            await msg.edit(text, **kwargs)
+    try:
+        await msg.edit(text, **kwargs)
+    except Exception as e:
+        err = str(e)
+        # These are all expected / harmless — swallow silently
+        if any(x in err for x in _EDIT_SUPPRESSED):
             return
-        except Exception as e:
-            err = str(e)
-            if any(x in err for x in _EDIT_SUPPRESSED):
+        if "FLOOD_WAIT" in err:
+            # Don't sleep — just drop this edit. PanelUpdater handles backoff.
+            return
+        if "peer_id_invalid" in err.lower() or "Chat not found" in err:
+            return
+        # Unexpected — log once but never raise (never crash a download for a UI edit)
+        log.debug("safe_edit unexpected error: %s", err[:120])
+
+
+# ─────────────────────────────────────────────────────────────
+# PanelUpdater — non-blocking progress panel
+# ─────────────────────────────────────────────────────────────
+
+class PanelUpdater:
+    """
+    Completely decouples Telegram message edits from progress callbacks.
+
+    HOW IT WORKS
+    ────────────
+    1. Progress callbacks call updater.tick(done=x, total=y, speed=s, eta=e)
+       — this is a plain dict update, O(1), never awaited, never blocks.
+    2. A background asyncio.Task wakes up every `interval` seconds,
+       calls build_fn(state) to render the panel, and edits the message.
+    3. FloodWait → back off by the required seconds, skip edits silently.
+    4. MESSAGE_NOT_MODIFIED → content unchanged, skip silently.
+    5. Message deleted / invalid → stop the task gracefully.
+
+    USAGE
+    ─────
+        async with PanelUpdater(msg, build_fn) as pu:
+            async def on_progress(current, total):
+                elapsed = time.time() - start
+                speed = current / elapsed if elapsed else 0.0
+                eta = int((total - current) / speed) if speed and total > current else 0
+                pu.tick(done=current, total=total, speed=speed, eta=eta)
+
+            await client.send_video(..., progress=on_progress)
+        # __aexit__ cancels the background task and does one final edit.
+    """
+
+    def __init__(
+        self,
+        msg,
+        build_fn,        # callable(state: dict) -> str
+        interval: float = 1.0,
+        start_state: Optional[dict] = None,
+    ):
+        self._msg       = msg
+        self._build     = build_fn
+        self._interval  = interval
+        self._state:    dict = dict(start_state or {})
+        self._task:     Optional[asyncio.Task] = None
+        self._last_text: str = ""
+        self._flood_until: float = 0.0
+        self._stopped:  bool = False
+
+    # ── Non-blocking state update (called from progress callbacks) ──
+
+    def tick(self, **kw) -> None:
+        """Update shared state. Non-blocking — safe to call from any callback."""
+        self._state.update(kw)
+
+    # ── Lifecycle ────────────────────────────────────────────────────
+
+    async def start(self) -> "PanelUpdater":
+        self._task = asyncio.get_running_loop().create_task(self._loop())
+        return self
+
+    async def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Final edit with latest state
+        await self._try_edit()
+
+    async def __aenter__(self) -> "PanelUpdater":
+        return await self.start()
+
+    async def __aexit__(self, *_) -> None:
+        await self.stop()
+
+    # ── Background loop ──────────────────────────────────────────────
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self._interval)
+            except asyncio.CancelledError:
                 return
+            await self._try_edit()
+
+    async def _try_edit(self) -> None:
+        if self._msg is None:
+            return
+        if time.time() < self._flood_until:
+            return  # still in backoff window
+        try:
+            text = self._build(self._state)
+            if not text:
+                return
+            if len(text) > _TG_MAX:
+                text = text[:_TG_MAX - 64] + "\n\n<i>⚠️ Truncated</i>"
+            if text == self._last_text:
+                return   # nothing changed — no-op, saves an API round-trip
+            from pyrogram import enums as _pe
+            await self._msg.edit(text, parse_mode=_pe.ParseMode.HTML,
+                                 disable_web_page_preview=True)
+            self._last_text = text
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            err = str(exc)
             if "FLOOD_WAIT" in err:
-                m = _re2.search(r"FLOOD_WAIT_(\d+)", err)
-                wait = min(int(m.group(1)) if m else 30, 60)  # cap at 60s
-                log.warning("safe_edit FLOOD_WAIT %ds — backing off", wait)
-                await asyncio.sleep(wait)
-                continue  # retry after sleep
-            if "peer_id_invalid" in err.lower():
-                log.debug("safe_edit suppressed: %s", err[:100])
-                return
-            raise
+                import re as _re_fw
+                m = _re_fw.search(r"FLOOD_WAIT_(\d+)", err)
+                wait = int(m.group(1)) if m else 30
+                self._flood_until = time.time() + wait
+                log.debug("PanelUpdater flood-wait %ds", wait)
+            elif any(x in err for x in (
+                "MESSAGE_NOT_MODIFIED", "message was not modified",
+                "Bad Request: message is not modified",
+            )):
+                self._last_text = ""  # force re-render next tick
+            elif any(x in err for x in (
+                "MESSAGE_ID_INVALID", "message to edit not found",
+                "peer_id_invalid", "Chat not found",
+            )):
+                # Message was deleted — stop updating
+                if self._task and not self._task.done():
+                    self._task.cancel()
+            else:
+                log.debug("PanelUpdater edit error: %s", err[:120])
 
 
 # ─────────────────────────────────────────────────────────────
