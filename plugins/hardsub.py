@@ -2,8 +2,14 @@
 plugins/hardsub.py
 CloudConvert-powered hardsubbing — batch multi-video support.
 
-PATCH: _submit_one_job() now uses build_cc_output_name() from cc_sanitize
-  instead of re.sub(r'[^\w\s\-\[\]()]', ...) which kept [] and spaces —
+FIX BUG-04: hardsub_url_handler now handles kind == "scrape".
+  services/downloader.classify() returns "scrape" for vidmoli.com, sbnet.*,
+  streamtape, mixdrop, and other hosters not in yt-dlp.
+  The previous elif only covered ("magnet","torrent","ytdlp","gdrive","mediafire").
+  Scrape URLs silently fell through, stalling the hardsub state machine.
+
+PATCH: _submit_one_job() uses build_cc_output_name() from cc_sanitize
+  instead of re.sub(r'[^\\w\\s\\-\\[\\]()]', ...) which kept [] and spaces —
   both of which silently break CloudConvert's FFmpeg subtitles filter.
 """
 from __future__ import annotations
@@ -474,7 +480,10 @@ async def hardsub_url_handler(client: Client, msg: Message):
                             parse_mode=enums.ParseMode.HTML)
         msg.stop_propagation()
 
-    elif kind in ("magnet", "torrent", "ytdlp", "gdrive", "mediafire"):
+    # FIX BUG-04: Added "scrape" to the elif tuple.
+    # classify() returns "scrape" for vidmoli.com, sbnet.*, streamtape, etc.
+    # Previously these fell through silently, stalling the hardsub flow.
+    elif kind in ("magnet", "torrent", "ytdlp", "gdrive", "mediafire", "scrape"):
         st = await msg.reply(
             f"⬇️ Downloading video via {kind}…\n"
             "<i>This may take a while for magnets.</i>",
