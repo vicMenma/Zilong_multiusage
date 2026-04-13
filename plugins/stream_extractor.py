@@ -1386,65 +1386,40 @@ async def se_mag_cb(client: Client, cb: CallbackQuery):
         return
 
     if action == "file":
+        # FIX BUG-03: Replaced broken aria2p select-file + follow-torrent=mem pattern.
+        # Root cause: with follow-torrent=mem, aria2c fires is_complete=True after the
+        # metadata phase (~30 MB), never downloading the actual file.  Every "select file
+        # from magnet" delivered a silently truncated ~30 MB blob.
+        # Fix: use smart_download (aria2c subprocess) which handles metadata transparently
+        # and waits for the real file to finish before returning.
         file_idx = extra
         files    = _cache.get(f"mag_files|{tok}", [])
         selected = next((f for f in files if str(f.get("index")) == str(file_idx)), None)
         fname    = selected["path"] if selected else f"file_{file_idx}"
 
-        st  = await cb.message.edit(
-            f"🧲 Downloading <code>{fname[:50]}</code>…",
+        st = await cb.message.edit(
+            f"🧲 <b>Downloading</b> <code>{fname[:50]}</code>…\n"
+            "<i>Full download via aria2c subprocess — no 30 MB limit.</i>",
             parse_mode=enums.ParseMode.HTML,
         )
         tmp = make_tmp(cfg.download_dir, uid)
-        start = time.time(); last = [start]
-
-        async def _file_prog(done: int, total: int, speed: float, eta: int) -> None:
-            now = time.time()
-            if now - last[0] < 3.0: return
-            last[0] = now
-
         try:
-            api = aria2p.API(aria2p.Client(
-                host=cfg.aria2_host, port=cfg.aria2_port, secret=cfg.aria2_secret,
-            ))
-            opts = {
-                "dir":           tmp,
-                "seed-time":     "0",
-                "select-file":   str(file_idx),
-                "follow-torrent":"mem",
-            }
-            dl = api.add_magnet(magnet, options=opts)
-            start_dl = time.time()
-            while True:
-                await asyncio.sleep(3)
-                try:
-                    dl = api.get_download(dl.gid)
-                except Exception:
-                    continue
-                if dl.error_message:
-                    raise RuntimeError(dl.error_message)
-                if dl.is_complete:
-                    break
-                done_b  = dl.completed_length or 0
-                total_b = dl.total_length     or 0
-                speed   = dl.download_speed   or 0.0
-                eta_val = int((total_b - done_b) / speed) if speed else 0
-                await _file_prog(done_b, total_b, speed, eta_val)
-                if time.time() - start_dl > 3600 * 6:
-                    raise TimeoutError("Torrent timeout (6h)")
-
-            from services.utils import largest_file
-            path = largest_file(tmp)
-            if not path:
+            from services.downloader import smart_download as _se_dl
+            _dl_path = await _se_dl(magnet, tmp, user_id=uid, label=fname, msg=st)
+            if os.path.isdir(_dl_path):
+                _resolved = largest_file(_dl_path)
+                if not _resolved:
+                    raise FileNotFoundError("No output file found in torrent download")
+                _dl_path = _resolved
+            elif not os.path.isfile(_dl_path):
                 raise FileNotFoundError("No output file found")
-
         except Exception as exc:
             cleanup(tmp)
             return await safe_edit(st,
                 f"❌ Download failed: <code>{exc}</code>",
                 parse_mode=enums.ParseMode.HTML)
 
-        await upload_file(client, st, path)
+        await upload_file(client, st, _dl_path)
         cleanup(tmp)
 
 

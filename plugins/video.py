@@ -36,12 +36,18 @@ log = logging.getLogger(__name__)
 from services.utils import LANG_NAME as LANG
 
 _IGNORED = {
+    # Core / admin
     "start","help","settings","info","broadcast","stats","log","restart",
     "mergedone","admin","ban_user","unban_user","banned_list","status",
     "forward","createarchive","archiveddone","bulk_url","usettings",
     "show_thumb","del_thumb","json_formatter","stream",
+    # Nyaa tracker
     "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
     "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit",
+    # FIX BUG-07: added missing commands so text_reply_handler never tries to
+    # parse a slash command as a trim timestamp / split chunk / etc.
+    "resize","compress","hardsub","botname","ccstatus","convert",
+    "captiontemplate","usage","allow","deny","allowed","cancel",
 }
 
 

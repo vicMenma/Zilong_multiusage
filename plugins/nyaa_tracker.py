@@ -207,7 +207,36 @@ _load_config()
 
 _search_cache: dict[str, dict] = {}
 _CACHE_TTL = 1800
-_magnet_cache: dict[str, str] = {}
+
+# FIX BUG-10: _magnet_cache now stores (timestamp, magnet) tuples with a 2-hour TTL.
+# The old bare dict grew without bound — long-running bots accumulated thousands of
+# entries as every Nyaa search and poller match added entries that were never removed.
+_MAGNET_CACHE_TTL = 7200  # 2 hours
+_magnet_cache: dict[str, tuple[float, str]] = {}
+
+
+def _magnet_cache_put(key: str, magnet: str) -> None:
+    """Store a magnet with the current timestamp."""
+    import time as _time
+    # Evict expired entries on every write (amortised O(1) cleanup)
+    now = _time.time()
+    dead = [k for k, (ts, _) in _magnet_cache.items() if now - ts > _MAGNET_CACHE_TTL]
+    for k in dead:
+        _magnet_cache.pop(k, None)
+    _magnet_cache[key] = (now, magnet)
+
+
+def _magnet_cache_get(key: str) -> str:
+    """Return the magnet for key, or "" if expired / not found."""
+    import time as _time
+    entry = _magnet_cache.get(key)
+    if not entry:
+        return ""
+    ts, magnet = entry
+    if _time.time() - ts > _MAGNET_CACHE_TTL:
+        _magnet_cache.pop(key, None)
+        return ""
+    return magnet
 
 
 def _cache_key(query: str) -> str:
@@ -342,7 +371,7 @@ async def cmd_nyaa_search(client: Client, msg: Message):
     _cache_put(key, results, query)
     for i, r in enumerate(results):
         if r.magnet:
-            _magnet_cache[f"{key}_{i}"] = r.magnet
+            _magnet_cache_put(f"{key}_{i}", r.magnet)
 
     text, kb = _render_page(key, 0, query, results)
     await st.edit(text, parse_mode=enums.ParseMode.HTML, reply_markup=kb)
@@ -396,7 +425,7 @@ async def nys_cb(client: Client, cb: CallbackQuery):
     if idx >= len(results):
         return
     r = results[idx]
-    magnet = r.magnet or _magnet_cache.get(f"{key}_{idx}", "")
+    magnet = r.magnet or _magnet_cache_get(f"{key}_{idx}")
 
     if action == "m":
         if not magnet:
@@ -433,7 +462,7 @@ async def nys_cb(client: Client, cb: CallbackQuery):
                 uid, "❌ CC_API_KEY not set.", parse_mode=enums.ParseMode.HTML)
         # Ask for target resolution
         h12 = hashlib.md5(magnet.encode()).hexdigest()[:12]
-        _magnet_cache[h12] = magnet
+        _magnet_cache_put(h12, magnet)
         await client.send_message(
             uid,
             f"☁️ <b>Seedr + CC Compress</b>\n"
@@ -467,7 +496,7 @@ async def nyc_cb(client: Client, cb: CallbackQuery):
     if height_s == "x":
         return await cb.message.delete()
 
-    magnet = _magnet_cache.get(h12, "")
+    magnet = _magnet_cache_get(h12)
     if not magnet:
         return await cb.message.edit("❌ Magnet expired.", parse_mode=enums.ParseMode.HTML)
 
@@ -1182,7 +1211,7 @@ async def nyt_cb(client: Client, cb: CallbackQuery):
             pass
         return
 
-    magnet = _magnet_cache.get(h12, "")
+    magnet = _magnet_cache_get(h12)
 
     if action == "mg":
         if not magnet:
@@ -1218,7 +1247,7 @@ async def nyt_cb(client: Client, cb: CallbackQuery):
         api_key = os.environ.get("CC_API_KEY", "").strip()
         if not api_key:
             return await client.send_message(uid, "❌ CC_API_KEY not set.")
-        _magnet_cache[h12] = magnet
+        _magnet_cache_put(h12, magnet)
         await client.send_message(
             uid,
             "☁️ <b>Seedr+CC Compress</b>\nChoose resolution:",

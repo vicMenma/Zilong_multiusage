@@ -597,8 +597,13 @@ async def _do_resize(
         f"⬆️ Uploading…",
         parse_mode=enums.ParseMode.HTML,
     )
-    await upload_file(client, st, out, user_id=uid)
-    cleanup(tmp)
+    # FIX BUG-08: cleanup in finally so it runs even if upload_file raises
+    # (FloodWait exhausted, network drop, etc.).  Previously cleanup() was only
+    # reached on the happy path, leaking multi-GB temp dirs on upload failure.
+    try:
+        await upload_file(client, st, out, user_id=uid)
+    finally:
+        cleanup(tmp)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -652,5 +657,8 @@ async def _do_compress(
         f"⬆️ Uploading…",
         parse_mode=enums.ParseMode.HTML,
     )
-    await upload_file(client, st, out, user_id=uid)
-    cleanup(tmp)
+    # FIX BUG-08: cleanup in finally (mirrors _do_resize fix above)
+    try:
+        await upload_file(client, st, out, user_id=uid)
+    finally:
+        cleanup(tmp)

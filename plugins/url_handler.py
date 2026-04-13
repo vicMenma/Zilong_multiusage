@@ -999,11 +999,15 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
 
     except Exception as exc:
         log.error("[Convert] Failed: %s", exc, exc_info=True)
-        cleanup(tmp_conv)
         await safe_edit(cb.message,
             f"❌ <b>Convert failed</b>\n\n<code>{str(exc)[:200]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
+    finally:
+        # FIX BUG-02b: always clean up the downloaded video (1-2 GB) whether
+        # the CC job submission succeeded or failed.  Previously cleanup() was
+        # only called in the except branch, leaking the full file on success.
+        cleanup(tmp_conv)
 
 
 # ─────────────────────────────────────────────────────────────

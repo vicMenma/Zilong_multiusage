@@ -230,6 +230,8 @@ async def cmd_botname(client: Client, msg: Message):
         "cancel", "show_thumb", "del_thumb", "json_formatter", "bulk_url",
         "hardsub", "stream", "forward", "createarchive", "archiveddone",
         "mergedone", "botname", "ccstatus", "convert",
+        # FIX BUG-09
+        "resize", "compress", "captiontemplate", "usage", "allow", "deny", "allowed",
         "nyaa_add", "nyaa_list", "nyaa_remove", "nyaa_check",
         "nyaa_search", "nyaa_dump", "nyaa_toggle", "nyaa_edit",
     ]),
