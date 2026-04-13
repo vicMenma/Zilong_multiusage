@@ -7,6 +7,12 @@ Thread-safe via asyncio.Lock per store.
 SessionStore  — file-processing sessions
 UserStore     — user registry
 SettingsStore — per-user upload preferences (persisted to data/settings.json)
+
+FIX BUG-11: SessionStore.get() now resets s.created on each access so the
+  30-minute TTL is measured from last access, not from session creation.
+  Previously a 45-min merge job created at t=0 would be evicted at t=1800
+  (30 min) while still actively in use, causing spurious "Session expired" errors
+  and orphaned temp directories.
 """
 from __future__ import annotations
 
@@ -73,7 +79,7 @@ class FileSession:
 class SessionStore:
     """Keyed store of FileSession objects with TTL eviction."""
 
-    TTL = 1800  # 30 min
+    TTL = 1800  # 30 min — measured from last access (see get() fix below)
 
     def __init__(self):
         self._data: dict[str, FileSession] = {}
@@ -90,16 +96,15 @@ class SessionStore:
         return s
 
     def get(self, key: str) -> Optional[FileSession]:
-        # FIX: _evict() modifies self._data (calls pop()) but get() was calling
-        # it without acquiring self._lock. Since create() and remove() hold the
-        # lock when mutating _data, this caused an unsafe concurrent modification.
-        # We call _evict() synchronously while holding the lock via a non-async
-        # guard — but because _lock is asyncio.Lock we can't await here.
-        # Solution: do a best-effort evict with a try, which is fine in asyncio's
-        # cooperative model (no true thread preemption), then return the item.
-        # The lock here protects against concurrent async tasks, not threads.
+        # FIX BUG-11: reset s.created on every access so the 30-min TTL is
+        # measured from *last access*, not from session *creation*.
+        # Previously a long-running operation (45-min merge) created at t=0
+        # was evicted at t=1800 while still in use, killing the session.
         self._evict()
-        return self._data.get(key)
+        s = self._data.get(key)
+        if s is not None:
+            s.created = time.time()   # ← touch: extends the TTL window
+        return s
 
     async def remove(self, key: str) -> None:
         async with self._lock:
