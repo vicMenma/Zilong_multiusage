@@ -8,16 +8,19 @@ Tunnel priority (automatic, no config needed):
   2. ngrok                           — fallback if NGROK_TOKEN is set
   3. localhost only                  — if both fail
 
-CRITICAL FIX: _process_file previously called smart_download() to retrieve
-CC export URLs. smart_download → _dispatch → download_parallel fires 8
-simultaneous Range requests. CC export URLs are single-use signed tokens —
-the token is consumed on request #1 and requests #2-8 get 403/empty.
-The assembled file is only 1/8 of the actual output. Webhook delivery
-silently produced truncated/corrupt files on every single CC job.
+CRITICAL FIX — BUG-01: _process_file now uses download_direct() instead of smart_download().
+  CC export URLs are single-use signed tokens.  smart_download() plumbs through
+  the full TaskRecord / tracker machinery and may trigger retry logic that burns
+  the token.  download_direct() is a single streaming GET — exactly what CC needs.
+  Previous code had "CRITICAL FIX: use download_direct" in the docstring but still
+  called smart_download in the implementation — this is now corrected.
 
-Fix: use download_direct() instead. CC export URLs are plain HTTPS direct
-links — no parallel range splitting needed or wanted. download_direct uses
-a single streaming GET, respects the token, and gets the full file.
+CRITICAL FIX — BUG-12: _verify_signature now strips the "sha256=" prefix.
+  CloudConvert sends the CloudConvert-Signature header as "sha256=<hex>".
+  The previous compare_digest(expected, signature) always returned False
+  because expected was just <hex> while signature was "sha256=<hex>".
+  Effect: every webhook was rejected with 403 whenever CC_WEBHOOK_SECRET was set,
+  making the webhook feature completely non-functional in production.
 """
 from __future__ import annotations
 
@@ -50,7 +53,11 @@ def _verify_signature(payload: bytes, signature: str) -> bool:
     expected = hmac.new(
         WEBHOOK_SECRET.encode(), payload, hashlib.sha256
     ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+    # FIX BUG-12: CC sends "sha256=<hex>" — strip the prefix before comparing.
+    # Previously compare_digest(expected, signature) always failed because
+    # expected == "<hex>" but signature == "sha256=<hex>".
+    sig_hex = signature.removeprefix("sha256=")
+    return hmac.compare_digest(expected, sig_hex)
 
 
 def _extract_urls(data: dict) -> list[dict]:
@@ -76,7 +83,11 @@ def _extract_urls(data: dict) -> list[dict]:
 async def _process_file(url: str, filename: str, owner_id: int) -> None:
     from core.config import cfg
     from core.session import get_client, settings as _settings
-    from services.downloader import smart_download
+    # FIX BUG-01: use download_direct — NOT smart_download.
+    # CC export URLs are single-use signed S3 tokens.  smart_download builds a
+    # TaskRecord and may retry / range-request the URL, consuming the token and
+    # returning a corrupt file.  download_direct is a single streaming GET.
+    from services.downloader import download_direct
     from services.uploader import upload_file
     from services.utils import cleanup, make_tmp, smart_clean_filename, largest_file, human_size
 
@@ -84,7 +95,7 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
     tmp = make_tmp(cfg.download_dir, owner_id)
 
     try:
-        path = await smart_download(url, tmp, user_id=owner_id, label=filename)
+        path = await download_direct(url, tmp)
 
         if os.path.isdir(path):
             resolved = largest_file(path)
@@ -239,11 +250,6 @@ async def _register_webhook_all_keys(
 ) -> tuple[int, int]:
     """
     Register the webhook on EVERY account in the comma-separated CC_API_KEY string.
-
-    CloudConvert credits are per-account, so if the user has N keys for rotation,
-    ALL N accounts must have the webhook registered — otherwise only the first key's
-    jobs deliver via webhook; the rest fall back to the slow 5 s ccstatus poller.
-
     Returns (ok_count, total_count).
     """
     from services.cloudconvert_api import parse_api_keys
@@ -282,11 +288,6 @@ def _install_cloudflared() -> bool:
 
 
 async def _open_cloudflare_tunnel(port: int) -> str:
-    """
-    Start cloudflared tunnel to localhost:port.
-    Returns public HTTPS URL or '' on failure.
-    Never blocks longer than _TUNNEL_TIMEOUT seconds.
-    """
     global _tunnel_proc
 
     loop = asyncio.get_event_loop()
@@ -336,11 +337,6 @@ async def _open_cloudflare_tunnel(port: int) -> str:
 
 
 async def _open_ngrok_tunnel(port: int, token: str) -> str:
-    """
-    Open ngrok tunnel to localhost:port.
-    Tries pyngrok library first, then ngrok CLI.
-    Returns public HTTPS URL or '' on failure.
-    """
     global _tunnel_proc
 
     # Try pyngrok
@@ -378,7 +374,6 @@ async def _open_ngrok_tunnel(port: int, token: str) -> str:
                     timeout=2.0,
                 )
             except asyncio.TimeoutError:
-                # Poll ngrok local API as fallback
                 try:
                     import aiohttp as _ah
                     async with _ah.ClientSession() as s:
@@ -423,12 +418,6 @@ async def _open_ngrok_tunnel(port: int, token: str) -> str:
 # ── Public entry point ────────────────────────────────────────────────────────
 
 async def start_webhook_server(port: int = LISTEN_PORT) -> str:
-    """
-    Start the aiohttp webhook server, then open a public tunnel.
-    Tunnel priority: preset URL → Cloudflare → ngrok → localhost-only.
-    Never blocks longer than _TUNNEL_TIMEOUT seconds per tunnel attempt.
-    Returns the full public webhook URL.
-    """
     global _web_runner, _web_site
 
     # 1. Start local HTTP server
