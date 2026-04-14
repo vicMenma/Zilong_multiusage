@@ -8,11 +8,17 @@ SessionStore  — file-processing sessions
 UserStore     — user registry
 SettingsStore — per-user upload preferences (persisted to data/settings.json)
 
-FIX BUG-11: SessionStore.get() now resets s.created on each access so the
+FIX BUG-11 (prior): SessionStore.get() resets s.created on each access so the
   30-minute TTL is measured from last access, not from session creation.
-  Previously a 45-min merge job created at t=0 would be evicted at t=1800
-  (30 min) while still actively in use, causing spurious "Session expired" errors
-  and orphaned temp directories.
+
+FIX C-01 (audit v3): SessionStore.get() no longer calls _evict() outside the
+  lock. Previously, multiple concurrent handlers calling get() simultaneously
+  could corrupt the dict mid-iteration (RuntimeError: dictionary changed size
+  during iteration). Now _evict() is only called inside locked async methods,
+  and get() uses a simple age check per-key instead of a full sweep.
+
+FIX M-04 (audit v3): is_downloaded() now also checks os.path.isfile() so a
+  stale local_path pointing to a deleted file returns False.
 """
 from __future__ import annotations
 
@@ -72,14 +78,19 @@ class FileSession:
         return self._lock
 
     def is_downloaded(self) -> bool:
-        import os
-        return bool(self.local_path and os.path.exists(self.local_path))
+        # FIX M-04: also verify the file still exists on disk
+        return bool(self.local_path and os.path.isfile(self.local_path))
 
 
 class SessionStore:
-    """Keyed store of FileSession objects with TTL eviction."""
+    """Keyed store of FileSession objects with TTL eviction.
 
-    TTL = 1800  # 30 min — measured from last access (see get() fix below)
+    FIX C-01: get() is now safe to call from multiple concurrent handlers.
+    _evict() is only called inside async methods that hold self._lock.
+    get() does a per-key age check without mutating the dict during iteration.
+    """
+
+    TTL = 1800  # 30 min — measured from last access
 
     def __init__(self):
         self._data: dict[str, FileSession] = {}
@@ -96,14 +107,20 @@ class SessionStore:
         return s
 
     def get(self, key: str) -> Optional[FileSession]:
-        # FIX BUG-11: reset s.created on every access so the 30-min TTL is
-        # measured from *last access*, not from session *creation*.
-        # Previously a long-running operation (45-min merge) created at t=0
-        # was evicted at t=1800 while still in use, killing the session.
-        self._evict()
+        """
+        Thread-safe read: no dict mutation, no _evict() sweep.
+        Just checks if the specific key exists and is still alive.
+        Touches s.created to extend the TTL window.
+        """
         s = self._data.get(key)
-        if s is not None:
-            s.created = time.time()   # ← touch: extends the TTL window
+        if s is None:
+            return None
+        now = time.time()
+        if now - s.created > self.TTL:
+            # Expired — don't remove here (let _evict() in locked methods handle it)
+            return None
+        # Touch: extends the TTL window (BUG-11 fix preserved)
+        s.created = now
         return s
 
     async def remove(self, key: str) -> None:
@@ -111,20 +128,29 @@ class SessionStore:
             self._data.pop(key, None)
 
     def user_sessions(self, user_id: int) -> list[FileSession]:
-        return [s for s in self._data.values() if s.user_id == user_id]
+        now = time.time()
+        return [s for s in self._data.values()
+                if s.user_id == user_id and now - s.created <= self.TTL]
 
     def waiting_session(self, user_id: int) -> Optional[FileSession]:
         """Return the first session for user_id that is waiting for input."""
+        now = time.time()
         for s in self._data.values():
-            if s.user_id == user_id and s.waiting:
+            if s.user_id == user_id and s.waiting and now - s.created <= self.TTL:
                 return s
         return None
 
     def _evict(self):
+        """Remove expired sessions. MUST be called inside self._lock."""
         now = time.time()
         dead = [k for k, s in self._data.items() if now - s.created > self.TTL]
         for k in dead:
             self._data.pop(k, None)
+
+    async def periodic_cleanup(self):
+        """Run _evict() under lock. Call from a periodic background task."""
+        async with self._lock:
+            self._evict()
 
 
 # ─────────────────────────────────────────────────────────────
