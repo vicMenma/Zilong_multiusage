@@ -1,22 +1,39 @@
 """
 plugins/forwarder.py
 Forward files to any channel/group without the "forwarded from" tag.
+
+FIX H-06 (audit v3): _FWD_STATE now has TTL eviction so abandoned
+/forward sessions (and their downloaded files) are cleaned up.
 """
 import os
+import time as _time
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from core.config import cfg
 from services.utils import make_tmp, cleanup
 
 _FWD_STATE: dict = {}
+_FWD_TTL = 600  # 10 min
 _VIDEO_EXTS = {".mp4",".mkv",".avi",".mov",".webm",".flv"}
 _AUDIO_EXTS = {".mp3",".aac",".flac",".m4a",".opus",".ogg"}
+
+
+def _evict_fwd_states() -> None:
+    """FIX H-06: clean stale forward sessions and their temp files."""
+    now = _time.time()
+    dead = [uid for uid, s in _FWD_STATE.items()
+            if now - s.get("_ts", 0) > _FWD_TTL]
+    for uid in dead:
+        s = _FWD_STATE.pop(uid, {})
+        if s.get("tmp"):
+            cleanup(s["tmp"])
 
 
 @Client.on_message(filters.private & filters.command("forward"))
 async def cmd_forward(client: Client, msg: Message):
     uid = msg.from_user.id
-    _FWD_STATE[uid] = {"step": "waiting_file"}
+    _evict_fwd_states()
+    _FWD_STATE[uid] = {"step": "waiting_file", "_ts": _time.time()}
     await msg.reply(
         "📨 <b>Media Forwarder</b> (no forward tag)\n\n"
         "Send me the file you want to forward.\n"
@@ -68,7 +85,7 @@ async def handle_fwd_file(client: Client, msg: Message, uid: int):
         await msg.reply(f"❌ Download failed: <code>{exc}</code>",
                         parse_mode=enums.ParseMode.HTML)
         return
-    _FWD_STATE[uid] = {"step": "waiting_target", "path": path, "tmp": tmp}
+    _FWD_STATE[uid] = {"step": "waiting_target", "path": path, "tmp": tmp, "_ts": _time.time()}
     await msg.reply(
         "✅ File received!\n\nSend the channel username or ID:\n"
         "<code>@mychannel</code> or <code>-100123456789</code>\n\n"

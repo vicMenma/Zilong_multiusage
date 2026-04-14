@@ -13,6 +13,11 @@ FIXED:
   - Same for compress (all 4 paths)
   - vid_resize_cb and vid_compress_ask_cb keep stop_propagation() to
     prevent video_cb from double-firing
+
+FIX H-05 (audit v3): _interactive_mode now stores (mode_str, timestamp) tuples
+  with a 10-minute TTL. Previously, if a user started /resize or /compress
+  interactively and then abandoned the flow, the state persisted forever.
+  _compress_waiting is cleaned alongside _interactive_mode on eviction.
 """
 from __future__ import annotations
 
@@ -89,10 +94,22 @@ def _get_token(tok: str) -> dict | None:
 
 # ─────────────────────────────────────────────────────────────
 # Interactive state
+# FIX H-05 (audit v3): tuples with timestamps + TTL eviction
 # ─────────────────────────────────────────────────────────────
 
-_interactive_mode:  dict[int, str]  = {}   # uid → "resize" | "compress"
+_interactive_mode:  dict[int, tuple[str, float]]  = {}  # uid → ("resize"|"compress", ts)
 _compress_waiting:  dict[int, dict] = {}   # uid → source info dict
+_RESIZE_STATE_TTL = 600  # 10 min
+
+
+def _evict_resize_states() -> None:
+    """FIX H-05 (audit v3): clean stale interactive states."""
+    now = time.time()
+    dead = [uid for uid, (_, ts) in _interactive_mode.items()
+            if now - ts > _RESIZE_STATE_TTL]
+    for uid in dead:
+        _interactive_mode.pop(uid, None)
+        _compress_waiting.pop(uid, None)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -116,7 +133,8 @@ async def cmd_resize(client: Client, msg: Message):
         )
         return
 
-    _interactive_mode[uid] = "resize"
+    _evict_resize_states()  # FIX H-05
+    _interactive_mode[uid] = ("resize", time.time())
     _compress_waiting.pop(uid, None)
     await msg.reply(
         "📐 <b>Resize Video</b>\n\n"
@@ -182,7 +200,8 @@ async def cmd_compress(client: Client, msg: Message):
             await _do_compress(client, st, path, fname, tmp, target_mb, uid)
             return
 
-    _interactive_mode[uid] = "compress"
+    _evict_resize_states()  # FIX H-05
+    _interactive_mode[uid] = ("compress", time.time())
     _compress_waiting.pop(uid, None)
     await msg.reply(
         "🗜️ <b>Compress Video</b>\n\n"
@@ -277,9 +296,11 @@ async def handle_url_compress(client: Client, cb: CallbackQuery, url: str, uid: 
 )
 async def resize_compress_file_receiver(client: Client, msg: Message):
     uid  = msg.from_user.id
-    mode = _interactive_mode.get(uid)
-    if not mode:
+    # FIX H-05: extract mode from (mode_str, timestamp) tuple
+    _entry = _interactive_mode.get(uid)
+    if not _entry:
         return
+    mode = _entry[0]
 
     media = msg.video or msg.document
     if not media:
@@ -329,9 +350,11 @@ async def resize_compress_file_receiver(client: Client, msg: Message):
 )
 async def resize_url_receiver(client: Client, msg: Message):
     uid  = msg.from_user.id
-    mode = _interactive_mode.get(uid)
-    if mode != "resize":
+    # FIX H-05: extract mode from (mode_str, timestamp) tuple
+    _entry = _interactive_mode.get(uid)
+    if not _entry or _entry[0] != "resize":
         return
+    mode = _entry[0]
 
     text = msg.text.strip()
     if not text.startswith("http"):
@@ -598,8 +621,6 @@ async def _do_resize(
         parse_mode=enums.ParseMode.HTML,
     )
     # FIX BUG-08: cleanup in finally so it runs even if upload_file raises
-    # (FloodWait exhausted, network drop, etc.).  Previously cleanup() was only
-    # reached on the happy path, leaking multi-GB temp dirs on upload failure.
     try:
         await upload_file(client, st, out, user_id=uid)
     finally:

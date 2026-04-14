@@ -9,6 +9,12 @@ CHANGES vs original:
   • Added /botname command (same as zilong-leech) to rename at any time
   • /start header shows "{NAME} MULTIUSAGE BOT" not "ZILONG BOT"
   • Welcome message redesigned to match zilong-leech's clean style
+
+FIX C-02 (audit v3): Added 7 missing commands to the exclusion lists
+  in prefix_suffix_collector (group=8) and af_channel_collector (group=9).
+  Previously /resize, /compress, /allow, /deny, /allowed, /usage,
+  /captiontemplate typed while waiting for a prefix/suffix/channel value
+  were silently saved as the setting value instead of being ignored.
 ═══════════════════════════════════════════════════════════════════
 """
 from pyrogram import Client, filters, enums
@@ -457,6 +463,9 @@ async def cq_st_clrsuffix(client: Client, cb: CallbackQuery):
          "broadcast","admin","ban_user","unban_user","banned_list",
          "cancel","show_thumb","del_thumb","json_formatter","bulk_url",
          "hardsub","botname","ccstatus","convert",
+         # FIX C-02 (audit v3): added missing commands so /resize etc. typed while
+         # waiting for a prefix value are not saved as the prefix string.
+         "resize","compress","captiontemplate","usage","allow","deny","allowed",
          "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
          "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit"]
     ),
@@ -598,6 +607,8 @@ async def cq_af_del(client: Client, cb: CallbackQuery):
          "admin","ban_user","unban_user","banned_list","cancel",
          "show_thumb","del_thumb","json_formatter","bulk_url","hardsub",
          "botname","ccstatus","convert",
+         # FIX C-02 (audit v3)
+         "resize","compress","captiontemplate","usage","allow","deny","allowed",
          "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
          "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit"]
     ),

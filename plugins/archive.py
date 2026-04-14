@@ -1,12 +1,17 @@
 """
 plugins/archive.py
 Extract and create archives (zip / rar / 7z / tar.gz).
+
+FIX H-07 (audit v3): _CREATE_STATE and _EXTRACT_STATE now have TTL eviction.
+Previously, if a user started /createarchive and never sent /archiveddone,
+the collected files in temp dirs were never cleaned up.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 
 from pyrogram import Client, filters, enums
@@ -22,8 +27,21 @@ from services.utils import cleanup, human_size, make_tmp, safe_edit
 log = logging.getLogger(__name__)
 
 # ── State dicts ──────────────────────────────────────────────
-_CREATE_STATE:  dict = {}   # uid → {"files": [...], "tmp": str}
-_EXTRACT_STATE: dict = {}   # key → {"path": str, "tmp": str}
+_CREATE_STATE:  dict = {}   # uid → {"files": [...], "tmp": str, "_ts": float}
+_EXTRACT_STATE: dict = {}   # key → {"path": str, "tmp": str, "_ts": float}
+_ARCHIVE_STATE_TTL = 1800  # 30 min
+
+
+def _evict_archive_states() -> None:
+    """FIX H-07 (audit v3): clean stale archive sessions and their temp dirs."""
+    now = time.time()
+    for store in (_CREATE_STATE, _EXTRACT_STATE):
+        dead = [k for k, v in store.items()
+                if now - v.get("_ts", 0) > _ARCHIVE_STATE_TTL]
+        for k in dead:
+            s = store.pop(k, None)
+            if s and s.get("tmp"):
+                cleanup(s["tmp"])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -188,7 +206,8 @@ async def handle_archive_file(
         preview += f"\n  …and {len(contents)-20} more"
 
     key = f"{uid}_{media.file_id[:10]}"
-    _EXTRACT_STATE[key] = {"path": path, "tmp": tmp}
+    _evict_archive_states()  # FIX H-07
+    _EXTRACT_STATE[key] = {"path": path, "tmp": tmp, "_ts": time.time()}
     await st.edit(
         f"<b>{fname}</b>  <code>{human_size(fsize)}</code>\n\n"
         + (f"<pre>{preview}</pre>\n\n" if preview else "")
@@ -259,7 +278,8 @@ async def arc_cb(client: Client, cb: CallbackQuery):
 async def cmd_createarchive(client: Client, msg: Message):
     uid = msg.from_user.id
     tmp = make_tmp(cfg.download_dir, uid)
-    _CREATE_STATE[uid] = {"files": [], "tmp": tmp}
+    _evict_archive_states()  # FIX H-07
+    _CREATE_STATE[uid] = {"files": [], "tmp": tmp, "_ts": time.time()}
     await msg.reply(
         "📦 <b>Create Archive</b>\n\n"
         "Send files one by one.\nWhen done, send /archiveddone.",

@@ -23,12 +23,17 @@ Example custom template:
   📐 {resolution}  🎵 {audio_langs}  💬 {sub_langs}
   💾 {filesize}  ⏱ {duration}
   ✨ via @MyChannel
+
+FIX H-08 (audit v3): _WAITING dict now stores (channel_id, timestamp) tuples
+with a 5-minute TTL. Previously, if a user clicked "edit template" and never
+sent the new template text, the entry persisted forever.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
@@ -207,9 +212,19 @@ async def build_caption(path: str, channel_id: int) -> str:
 
 # ─────────────────────────────────────────────────────────────
 # State for /captiontemplate command
+# FIX H-08 (audit v3): now stores (channel_id, timestamp) with TTL
 # ─────────────────────────────────────────────────────────────
 
-_WAITING: dict[int, int] = {}   # uid → channel_id being edited
+_WAITING: dict[int, tuple[int, float]] = {}   # uid → (channel_id, timestamp)
+_WAITING_TTL = 300  # 5 min
+
+
+def _evict_caption_waiting() -> None:
+    """FIX H-08 (audit v3): clean stale caption template edit states."""
+    now = time.time()
+    dead = [uid for uid, (_, ts) in _WAITING.items() if now - ts > _WAITING_TTL]
+    for uid in dead:
+        _WAITING.pop(uid, None)
 
 
 async def _channels_with_templates(uid: int) -> list[dict]:
@@ -320,7 +335,8 @@ async def ctpl_cb(client: Client, cb: CallbackQuery):
         return
 
     if action == "edit":
-        _WAITING[uid] = ch_id
+        _evict_caption_waiting()  # FIX H-08
+        _WAITING[uid] = (ch_id, time.time())  # FIX H-08: tuple with timestamp
         cur = get_template(ch_id)
         await cb.message.edit(
             f"✏️ <b>Edit Template</b>\n\n"
@@ -352,7 +368,7 @@ async def ctpl_input_receiver(client: Client, msg: Message):
     if uid not in _WAITING:
         return
 
-    ch_id = _WAITING.pop(uid)
+    ch_id, _ts = _WAITING.pop(uid)  # FIX H-08: unpack tuple
     text  = msg.text.strip()
 
     if text.lower() in ("/cancel", "cancel"):

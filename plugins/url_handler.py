@@ -14,6 +14,11 @@ Other fixes (unchanged from prior audit):
 SEEDR+HARDSUB PATCH:
   - Added "🔥 Seedr+Hardsub" button to magnet/torrent keyboard
   - Uses shs| callback prefix → handled by plugins/seedr_hardsub.py
+
+FIX C-03 (audit v3): _magnet_probe sessions now have TTL eviction on read.
+  Previously, _evict_magnet_probes() was only called inside _probe_magnet_file().
+  If no new magnet probes happened, old sessions (with multi-GB temp dirs) lingered
+  forever. Now every .get() call also triggers eviction.
 """
 from __future__ import annotations
 
@@ -55,6 +60,13 @@ _cache: dict[str, str] = {}
 _CACHE_MAX = 500
 
 _magnet_probe: dict[str, dict] = {}
+_MAGNET_PROBE_TTL = 1800  # 30 min
+
+
+def _get_magnet_probe(tok: str) -> dict | None:
+    """FIX C-03 (audit v3): evict expired probes on every read."""
+    _evict_magnet_probes()
+    return _magnet_probe.get(tok)
 
 
 def _store(url: str) -> str:
@@ -111,7 +123,6 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
              InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
         ])
     elif kind in ("magnet", "torrent"):
-        # ── PATCHED: added Seedr+Hardsub button ──────────────
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🟢 Download (local)",    callback_data=f"dl|video|{token}"),
              InlineKeyboardButton("☁️ Download via Seedr",  callback_data=f"dl|seedr|{token}")],
@@ -136,7 +147,7 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🟢 Download",           callback_data=f"dl|video|{token}"),
              InlineKeyboardButton("❌ Cancel",             callback_data=f"dl|cancel|{token}")],
         ])
-    else:  # direct / http
+    else:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🟢 Download File",      callback_data=f"dl|video|{token}"),
              InlineKeyboardButton("🔵 Stream Extractor",   callback_data=f"dl|stream|{token}")],
@@ -332,18 +343,12 @@ async def _hardsub_magnet_dl(st, url: str, uid: int, tmp: str, fname: str) -> No
 
 
 # ─────────────────────────────────────────────────────────────
-# yt-dlp quality picker  (NEW)
+# yt-dlp quality picker
 # ─────────────────────────────────────────────────────────────
 
 async def _show_ytdlp_quality_picker(
     client: Client, st, url: str, token: str, uid: int,
 ) -> None:
-    """
-    Fetch yt-dlp format info and display quality-bucket buttons inline.
-    Reuses _parse_yt_formats / _QUALITY_ORDER / _QUALITY_ICON from
-    stream_extractor so there is zero duplication of parsing logic.
-    Falls back to best-quality download if format fetch fails.
-    """
     import yt_dlp as _yt_dlp
     from plugins.stream_extractor import _parse_yt_formats, _QUALITY_ORDER, _QUALITY_ICON
 
@@ -388,7 +393,6 @@ async def _show_ytdlp_quality_picker(
         "<i>Tap a quality to see formats:</i>",
     ]
 
-    # Serialise format groups into cache so bucket callback can read without re-fetch
     _cache[f"ytinfo|{token}"] = _json.dumps({
         "url":   url,
         "title": title,
@@ -439,25 +443,15 @@ async def _show_ytdlp_quality_picker(
 
 
 # ─────────────────────────────────────────────────────────────
-# Download callback
-# ─────────────────────────────────────────────────────────────
-
-
-# ─────────────────────────────────────────────────────────────
-# Seedr cloud download pipeline  (NEW)
+# Seedr cloud download pipeline
 # ─────────────────────────────────────────────────────────────
 
 async def _seedr_download(client, st, magnet: str, uid: int) -> None:
-    """
-    Full Seedr pipeline with live status panel.
-    Self-registers with GlobalTracker so /status can cancel it.
-    """
     from services.seedr import download_via_seedr
     from services.utils import make_tmp, cleanup, human_size
     from core.session import settings as _settings
     from services.task_runner import tracker, runner, TaskRecord
 
-    # ── Self-register so /status cancel works ─────────────────
     import re as _re
     _dn = _re.search(r"[&?]dn=([^&]+)", magnet)
     _lbl = _dn.group(1)[:40] if _dn else "Seedr Download"
@@ -465,18 +459,11 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
     _rec = TaskRecord(tid=_tid, user_id=uid, label=_lbl, mode="seedr", engine="seedr")
     await tracker.register(_rec)
     runner.register_raw(_tid, asyncio.current_task())
-    # ──────────────────────────────────────────────────────────
 
     tmp = make_tmp(cfg.download_dir, uid)
 
     async def _progress(stage: str, pct: float, detail: str) -> None:
-        icons = {
-            "adding":      "⬆️",
-            "waiting":     "⏳",
-            "downloading": "☁️",
-            "fetching":    "🔗",
-            "dl_file":     "⬇️",
-        }
+        icons = {"adding": "⬆️", "waiting": "⏳", "downloading": "☁️", "fetching": "🔗", "dl_file": "⬇️"}
         icon = icons.get(stage, "⏳")
         bar  = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
         await safe_edit(
@@ -489,9 +476,7 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
         )
 
     try:
-        local_paths = await download_via_seedr(
-            magnet, tmp, progress_cb=_progress, timeout_s=7200,
-        )
+        local_paths = await download_via_seedr(magnet, tmp, progress_cb=_progress, timeout_s=7200)
     except asyncio.CancelledError:
         await tracker.finish(_tid, success=False, msg="Cancelled")
         cleanup(tmp)
@@ -501,29 +486,18 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
         await tracker.finish(_tid, success=False, msg=str(exc)[:50])
         log.error("[Seedr] Pipeline failed: %s", exc, exc_info=True)
         cleanup(tmp)
-        return await safe_edit(
-            st,
-            f"❌ <b>Seedr download failed</b>\n\n<code>{str(exc)[:300]}</code>",
-            parse_mode=enums.ParseMode.HTML,
-        )
+        return await safe_edit(st, f"❌ <b>Seedr download failed</b>\n\n<code>{str(exc)[:300]}</code>", parse_mode=enums.ParseMode.HTML)
 
     if not local_paths:
         await tracker.finish(_tid, success=False, msg="No files")
         cleanup(tmp)
-        return await safe_edit(
-            st, "❌ <b>Seedr: no files downloaded.</b>",
-            parse_mode=enums.ParseMode.HTML,
-        )
+        return await safe_edit(st, "❌ <b>Seedr: no files downloaded.</b>", parse_mode=enums.ParseMode.HTML)
 
     await tracker.update(_tid, state="📤 Uploading", done=1, total=len(local_paths))
 
     total = len(local_paths)
     if total > 1:
-        await safe_edit(
-            st,
-            f"✅ <b>Seedr done — {total} files</b>\n📤 <i>Uploading…</i>",
-            parse_mode=enums.ParseMode.HTML,
-        )
+        await safe_edit(st, f"✅ <b>Seedr done — {total} files</b>\n📤 <i>Uploading…</i>", parse_mode=enums.ParseMode.HTML)
 
     s      = await _settings.get(uid)
     prefix = s.get("prefix", "").strip()
@@ -533,13 +507,7 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
         for i, fpath in enumerate(local_paths, 1):
             fsize = os.path.getsize(fpath)
             if fsize > cfg.file_limit_b:
-                await client.send_message(
-                    uid,
-                    f"⚠️ <b>Skipped ({i}/{total})</b>\n"
-                    f"<code>{os.path.basename(fpath)}</code>\n"
-                    f"<code>{human_size(fsize)}</code> exceeds limit",
-                    parse_mode=enums.ParseMode.HTML,
-                )
+                await client.send_message(uid, f"⚠️ <b>Skipped ({i}/{total})</b>\n<code>{os.path.basename(fpath)}</code>\n<code>{human_size(fsize)}</code> exceeds limit", parse_mode=enums.ParseMode.HTML)
                 continue
 
             fname     = os.path.basename(fpath)
@@ -553,12 +521,7 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
                 except OSError:
                     pass
 
-            upload_st = await client.send_message(
-                uid,
-                f"📤 <b>Uploading {i}/{total}</b>\n"
-                f"<code>{os.path.basename(fpath)}</code>",
-                parse_mode=enums.ParseMode.HTML,
-            )
+            upload_st = await client.send_message(uid, f"📤 <b>Uploading {i}/{total}</b>\n<code>{os.path.basename(fpath)}</code>", parse_mode=enums.ParseMode.HTML)
             await upload_file(client, upload_st, fpath, user_id=uid)
 
             if i < total:
@@ -583,6 +546,11 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
     finally:
         cleanup(tmp)
 
+
+# ─────────────────────────────────────────────────────────────
+# Download callback
+# ─────────────────────────────────────────────────────────────
+
 @Client.on_callback_query(filters.regex(r"^dl\|"))
 async def dl_cb(client: Client, cb: CallbackQuery):
     parts = cb.data.split("|")
@@ -605,7 +573,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
     uid = cb.from_user.id
     await cb.answer()
 
-    # ── Thumbnail ─────────────────────────────────────────────
     if mode == "thumb":
         st = await cb.message.edit("🖼️ Fetching thumbnail…")
         try:
@@ -615,19 +582,13 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             tu = info.get("thumbnail")
             if not tu:
                 return await safe_edit(st, "❌ No thumbnail found.")
-            await client.send_photo(
-                cb.message.chat.id, tu,
-                caption=f"🖼️ <b>{info.get('title','')[:60]}</b>",
-                parse_mode=enums.ParseMode.HTML,
-            )
+            await client.send_photo(cb.message.chat.id, tu, caption=f"🖼️ <b>{info.get('title','')[:60]}</b>", parse_mode=enums.ParseMode.HTML)
             await st.delete()
         except Exception as exc:
-            await safe_edit(st, f"❌ Thumbnail fetch failed: <code>{exc}</code>",
-                            parse_mode=enums.ParseMode.HTML)
+            await safe_edit(st, f"❌ Thumbnail fetch failed: <code>{exc}</code>", parse_mode=enums.ParseMode.HTML)
         _cache.pop(token, None)
         return
 
-    # ── Info ──────────────────────────────────────────────────
     if mode == "info":
         kind_i = classify(url)
         if kind_i in ("magnet", "torrent"):
@@ -636,7 +597,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             await _handle_info(client, cb, url, token)
         return
 
-    # ── Magnet Stream Extractor ───────────────────────────────
     if mode == "magnet_stream":
         st   = await cb.message.edit("🧲 Preparing magnet stream extractor…")
         path, tmp, probe = await _probe_magnet_file(url, uid, st)
@@ -646,45 +606,24 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         dur   = probe.get("duration", 0)
         fname = probe.get("fname", os.path.basename(path))
         sess_tok = hashlib.md5(path.encode()).hexdigest()[:10]
-        _magnet_probe[sess_tok] = {
-            "path": path, "tmp": tmp, "streams": sd,
-            "fname": fname, "created": time.time(),
-        }
+        _magnet_probe[sess_tok] = {"path": path, "tmp": tmp, "streams": sd, "fname": fname, "created": time.time()}
         _evict_magnet_probes()
         await _show_magnet_streams(client, st, sess_tok, sd, dur, fname, uid)
         return
 
-    # ── Seedr cloud download ──────────────────────────────────
     if mode == "seedr":
         username = os.environ.get("SEEDR_USERNAME", "").strip()
         password = os.environ.get("SEEDR_PASSWORD", "").strip()
         if not username or not password:
-            return await safe_edit(
-                cb.message,
-                "❌ <b>Seedr not configured</b>\n\n"
-                "Add to your .env:\n"
-                "<code>SEEDR_USERNAME=your@email.com</code>\n"
-                "<code>SEEDR_PASSWORD=yourpassword</code>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-        st = await cb.message.edit(
-            "☁️ <b>Seedr Cloud Download</b>\n"
-            "──────────────────────\n\n"
-            "⬆️ <i>Submitting to Seedr servers…</i>",
-            parse_mode=enums.ParseMode.HTML,
-        )
+            return await safe_edit(cb.message, "❌ <b>Seedr not configured</b>\n\nAdd to your .env:\n<code>SEEDR_USERNAME=your@email.com</code>\n<code>SEEDR_PASSWORD=yourpassword</code>", parse_mode=enums.ParseMode.HTML)
+        st = await cb.message.edit("☁️ <b>Seedr Cloud Download</b>\n──────────────────────\n\n⬆️ <i>Submitting to Seedr servers…</i>", parse_mode=enums.ParseMode.HTML)
         asyncio.create_task(_seedr_download(client, st, url, uid))
         return
 
-    # ── Hardsub ───────────────────────────────────────────────
     if mode == "hardsub":
         api_key = os.environ.get("CC_API_KEY", "").strip()
         if not api_key:
-            return await safe_edit(cb.message,
-                "❌ <b>CloudConvert API key not set</b>\n\n"
-                "Add <code>CC_API_KEY=your_key</code> to your .env or Colab secrets.",
-                parse_mode=enums.ParseMode.HTML,
-            )
+            return await safe_edit(cb.message, "❌ <b>CloudConvert API key not set</b>\n\nAdd <code>CC_API_KEY=your_key</code> to your .env or Colab secrets.", parse_mode=enums.ParseMode.HTML)
         from plugins.hardsub import _STATE, _clear, start_hardsub_for_url
         _clear(uid)
         tmp    = make_tmp(cfg.download_dir, uid)
@@ -699,38 +638,19 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             fname = "video.mkv"
 
         if kind_h in ("magnet", "torrent"):
-            _STATE[uid] = {
-                "step": "_downloading_for_hardsub", "tmp": tmp,
-                "videos": [{"path": None, "url": None, "fname": fname, "resolution": 0}],
-                "sub_path": None, "sub_fname": None, "_res_idx": 0,
-            }
-            st = await cb.message.edit(
-                f"🔥 <b>Hardsub</b>\n\n"
-                f"⬇️ Downloading video via {kind_h}…\n"
-                "<i>I'll ask for the subtitle once done.</i>",
-                parse_mode=enums.ParseMode.HTML,
-            )
+            _STATE[uid] = {"step": "_downloading_for_hardsub", "tmp": tmp, "videos": [{"path": None, "url": None, "fname": fname, "resolution": 0}], "sub_path": None, "sub_fname": None, "_res_idx": 0}
+            st = await cb.message.edit(f"🔥 <b>Hardsub</b>\n\n⬇️ Downloading video via {kind_h}…\n<i>I'll ask for the subtitle once done.</i>", parse_mode=enums.ParseMode.HTML)
             asyncio.create_task(_hardsub_magnet_dl(st, url, uid, tmp, fname))
             return
 
-        st = await cb.message.edit(
-            f"🔥 <b>Hardsub</b>\n──────────────────────\n\n"
-            f"📁 <code>{fname[:45]}</code>\n\n"
-            "<i>Starting download…</i>",
-            parse_mode=enums.ParseMode.HTML,
-        )
+        st = await cb.message.edit(f"🔥 <b>Hardsub</b>\n──────────────────────\n\n📁 <code>{fname[:45]}</code>\n\n<i>Starting download…</i>", parse_mode=enums.ParseMode.HTML)
         asyncio.create_task(start_hardsub_for_url(client, st, uid, url, fname))
         return
 
-    # ── Convert ───────────────────────────────────────────────
     if mode == "convert":
         api_key = os.environ.get("CC_API_KEY", "").strip()
         if not api_key:
-            return await safe_edit(cb.message,
-                "❌ <b>CloudConvert API key not set</b>\n\n"
-                "Add <code>CC_API_KEY=your_key</code> to your .env or Colab secrets.",
-                parse_mode=enums.ParseMode.HTML,
-            )
+            return await safe_edit(cb.message, "❌ <b>CloudConvert API key not set</b>\n\nAdd <code>CC_API_KEY=your_key</code> to your .env or Colab secrets.", parse_mode=enums.ParseMode.HTML)
         kind_c = classify(url)
         if kind_c == "direct":
             fname = _up.unquote_plus(url.split("/")[-1].split("?")[0])[:50] or "video.mkv"
@@ -741,8 +661,7 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             fname = "video.mkv"
 
         await cb.message.edit(
-            f"🔄 <b>CloudConvert — Convert</b>\n──────────────────────\n\n"
-            f"🎬 <code>{fname[:45]}</code>\n\nChoose target resolution:",
+            f"🔄 <b>CloudConvert — Convert</b>\n──────────────────────\n\n🎬 <code>{fname[:45]}</code>\n\nChoose target resolution:",
             parse_mode=enums.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🎬 Original",  callback_data=f"ccv|0|{token}"),
@@ -755,7 +674,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         )
         return
 
-    # ── Stream selector ───────────────────────────────────────
     if mode == "stream":
         kind_s = classify(url)
         if kind_s in ("magnet", "torrent"):
@@ -768,7 +686,6 @@ async def dl_cb(client: Client, cb: CallbackQuery):
             await extract_url_streams(client, st, url, uid, edit=False)
         return
 
-    # ── Stream download ───────────────────────────────────────
     if mode == "stream_dl":
         raw = _get(token)
         if "|||" in raw:
@@ -780,25 +697,18 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         asyncio.create_task(_launch_download(client, cb.message, url2, uid, fmt_id=fmt_id))
         return
 
-    # ── Standard download ─────────────────────────────────────
     if mode in ("video", "audio"):
         audio_only = (mode == "audio")
-
-        # For yt-dlp sites in video mode: show resolution/format picker first
         if not audio_only and classify(url) == "ytdlp":
             st = await cb.message.edit("📡 Fetching available resolutions…")
             await _show_ytdlp_quality_picker(client, st, url, token, uid)
             return
-
-        # Audio mode or non-ytdlp: download immediately (best quality / best audio)
         _cache.pop(token, None)
-        asyncio.create_task(
-            _launch_download(client, cb.message, url, uid, audio_only=audio_only)
-        )
+        asyncio.create_task(_launch_download(client, cb.message, url, uid, audio_only=audio_only))
 
 
 # ─────────────────────────────────────────────────────────────
-# yt-dlp quality / format picker callbacks  (NEW)
+# yt-dlp quality / format picker callbacks
 # ─────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^dlq\|"))
@@ -813,28 +723,20 @@ async def dl_quality_cb(client: Client, cb: CallbackQuery):
 
     url = _get(token)
     if not url:
-        return await safe_edit(
-            cb.message,
-            "❌ Session expired. Resend the link.",
-            parse_mode=enums.ParseMode.HTML,
-        )
+        return await safe_edit(cb.message, "❌ Session expired. Resend the link.", parse_mode=enums.ParseMode.HTML)
 
     if action in ("best", "audio"):
         audio_only = (action == "audio")
         _cache.pop(token, None)
         _cache.pop(f"ytinfo|{token}", None)
-        asyncio.create_task(
-            _launch_download(client, cb.message, url, uid, audio_only=audio_only)
-        )
+        asyncio.create_task(_launch_download(client, cb.message, url, uid, audio_only=audio_only))
         return
 
     if action == "fmt":
         fmt_id = extra or None
         _cache.pop(token, None)
         _cache.pop(f"ytinfo|{token}", None)
-        asyncio.create_task(
-            _launch_download(client, cb.message, url, uid, fmt_id=fmt_id)
-        )
+        asyncio.create_task(_launch_download(client, cb.message, url, uid, fmt_id=fmt_id))
         return
 
     if action == "back":
@@ -845,12 +747,10 @@ async def dl_quality_cb(client: Client, cb: CallbackQuery):
     if action == "bucket":
         bucket = extra
         raw    = _cache.get(f"ytinfo|{token}")
-
         if not raw:
             st = await cb.message.edit("📡 Re-fetching formats…")
             await _show_ytdlp_quality_picker(client, st, url, token, uid)
             return
-
         try:
             data  = _json.loads(raw)
             fmts  = data.get("groups", {}).get(bucket, [])
@@ -858,39 +758,15 @@ async def dl_quality_cb(client: Client, cb: CallbackQuery):
         except Exception:
             fmts  = []
             title = ""
-
         if not fmts:
             await safe_edit(cb.message, f"❌ No formats available for {bucket}.")
             return
-
-        lines = [
-            f"📥 <b>{bucket} — select format</b>",
-            "──────────────────────",
-            f"<code>{title[:50]}</code>" if title else "",
-            "──────────────────────",
-        ]
-
+        lines = [f"📥 <b>{bucket} — select format</b>", "──────────────────────", f"<code>{title[:50]}</code>" if title else "", "──────────────────────"]
         rows = []
         for f in fmts:
-            rows.append([InlineKeyboardButton(
-                f["label"][:56],
-                callback_data=f"dlq|fmt|{token}|{f['fmt_id']}",
-            )])
-
-        rows.append([
-            InlineKeyboardButton(
-                "🔙 Back to qualities",
-                callback_data=f"dlq|back|{token}|",
-            ),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"dl|cancel|{token}"),
-        ])
-
-        await safe_edit(
-            cb.message,
-            "\n".join(l for l in lines if l),
-            parse_mode=enums.ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
+            rows.append([InlineKeyboardButton(f["label"][:56], callback_data=f"dlq|fmt|{token}|{f['fmt_id']}")])
+        rows.append([InlineKeyboardButton("🔙 Back to qualities", callback_data=f"dlq|back|{token}|"), InlineKeyboardButton("❌ Cancel", callback_data=f"dl|cancel|{token}")])
+        await safe_edit(cb.message, "\n".join(l for l in lines if l), parse_mode=enums.ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
         return
 
     await cb.answer("Unknown action.", show_alert=True)
@@ -933,13 +809,7 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
     api_key = os.environ.get("CC_API_KEY", "").strip()
 
     tmp_conv = make_tmp(cfg.download_dir, uid)
-    await safe_edit(cb.message,
-        f"⬇️ <b>Downloading for Convert…</b>\n"
-        "──────────────────────\n\n"
-        f"🎬 <code>{fname[:40]}</code>\n"
-        f"📐 → <b>{res_label}</b>\n\n"
-        "<i>Download-first ensures reliable CC file upload.</i>",
-        parse_mode=enums.ParseMode.HTML)
+    await safe_edit(cb.message, f"⬇️ <b>Downloading for Convert…</b>\n──────────────────────\n\n🎬 <code>{fname[:40]}</code>\n📐 → <b>{res_label}</b>\n\n<i>Download-first ensures reliable CC file upload.</i>", parse_mode=enums.ParseMode.HTML)
 
     try:
         video_path_raw = await smart_download(url, tmp_conv, user_id=uid, label=fname)
@@ -951,13 +821,10 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
             raise FileNotFoundError("No output file found after download")
         video_path = video_path_raw
         fname      = os.path.basename(video_path)
-        log.info("[Convert] Downloaded %s (%s) for CC job",
-                 fname, human_size(os.path.getsize(video_path)))
+        log.info("[Convert] Downloaded %s (%s) for CC job", fname, human_size(os.path.getsize(video_path)))
     except Exception as exc:
         cleanup(tmp_conv)
-        return await safe_edit(cb.message,
-            f"❌ <b>Download failed</b>\n\n<code>{str(exc)[:200]}</code>",
-            parse_mode=enums.ParseMode.HTML)
+        return await safe_edit(cb.message, f"❌ <b>Download failed</b>\n\n<code>{str(exc)[:200]}</code>", parse_mode=enums.ParseMode.HTML)
 
     try:
         from services.cloudconvert_api import parse_api_keys, pick_best_key, submit_convert
@@ -968,45 +835,18 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
         else:
             key_info = "🔑 1 API key"
 
-        await safe_edit(cb.message,
-            f"☁️ <b>Submitting Convert job…</b>\n"
-            "──────────────────────\n\n"
-            f"🎬 <code>{fname[:40]}</code>\n"
-            f"📐 → <b>{res_label}</b>\n\n"
-            "<i>Checking API keys…</i>",
-            parse_mode=enums.ParseMode.HTML)
+        await safe_edit(cb.message, f"☁️ <b>Submitting Convert job…</b>\n──────────────────────\n\n🎬 <code>{fname[:40]}</code>\n📐 → <b>{res_label}</b>\n\n<i>Checking API keys…</i>", parse_mode=enums.ParseMode.HTML)
 
-        job_id = await submit_convert(
-            api_key,
-            video_path=video_path,
-            video_url=None,
-            output_name=output_name,
-            scale_height=scale_height,
-        )
+        job_id = await submit_convert(api_key, video_path=video_path, video_url=None, output_name=output_name, scale_height=scale_height)
         mode_s = "📤 File upload (download-first)"
 
-        await safe_edit(cb.message,
-            f"✅ <b>Convert Job Submitted!</b>\n"
-            "──────────────────────\n\n"
-            f"🆔 <code>{job_id}</code>\n"
-            f"🎬 <code>{fname[:38]}</code>\n"
-            f"📐 → <b>{res_label}</b>\n"
-            f"📦 → <code>{output_name[:40]}</code>\n"
-            f"⚙️ {mode_s}\n{key_info}\n\n"
-            "⏳ <i>CloudConvert is processing…</i>",
-            parse_mode=enums.ParseMode.HTML,
-        )
+        await safe_edit(cb.message, f"✅ <b>Convert Job Submitted!</b>\n──────────────────────\n\n🆔 <code>{job_id}</code>\n🎬 <code>{fname[:38]}</code>\n📐 → <b>{res_label}</b>\n📦 → <code>{output_name[:40]}</code>\n⚙️ {mode_s}\n{key_info}\n\n⏳ <i>CloudConvert is processing…</i>", parse_mode=enums.ParseMode.HTML)
 
     except Exception as exc:
         log.error("[Convert] Failed: %s", exc, exc_info=True)
-        await safe_edit(cb.message,
-            f"❌ <b>Convert failed</b>\n\n<code>{str(exc)[:200]}</code>",
-            parse_mode=enums.ParseMode.HTML,
-        )
+        await safe_edit(cb.message, f"❌ <b>Convert failed</b>\n\n<code>{str(exc)[:200]}</code>", parse_mode=enums.ParseMode.HTML)
     finally:
-        # FIX BUG-02b: always clean up the downloaded video (1-2 GB) whether
-        # the CC job submission succeeded or failed.  Previously cleanup() was
-        # only called in the except branch, leaking the full file on success.
+        # FIX BUG-02b: always clean up the downloaded video
         cleanup(tmp_conv)
 
 
@@ -1014,34 +854,21 @@ async def ccv_resolution_cb(client: Client, cb: CallbackQuery):
 # Magnet stream display + extraction
 # ─────────────────────────────────────────────────────────────
 
-async def _show_magnet_streams(
-    client: Client, st, sess_tok: str,
-    sd: dict, dur: int, fname: str, uid: int,
-) -> None:
+async def _show_magnet_streams(client: Client, st, sess_tok: str, sd: dict, dur: int, fname: str, uid: int) -> None:
     from services.utils import fmt_hms
-
-    v_streams = sd.get("video",    [])
-    a_streams = sd.get("audio",    [])
+    v_streams = sd.get("video", [])
+    a_streams = sd.get("audio", [])
     s_streams = sd.get("subtitle", [])
 
-    lines = [
-        "📡 <b>Magnet Stream Extractor</b>",
-        f"📄 <code>{fname[:50]}</code>",
-        f"⏱ <code>{fmt_hms(dur)}</code>",
-        "──────────────────────",
-    ]
-
+    lines = ["📡 <b>Magnet Stream Extractor</b>", f"📄 <code>{fname[:50]}</code>", f"⏱ <code>{fmt_hms(dur)}</code>", "──────────────────────"]
     for s in v_streams:
         codec = s.get("codec_name","?").upper()
         w, h  = s.get("width",0), s.get("height",0)
         fr    = s.get("r_frame_rate","0/1")
         try:
-            n2, d2 = fr.split("/")
-            fps = f"{float(n2)/max(float(d2),1):.0f}fps"
-        except Exception:
-            fps = ""
+            n2, d2 = fr.split("/"); fps = f"{float(n2)/max(float(d2),1):.0f}fps"
+        except Exception: fps = ""
         lines.append(f"  🎬 <code>{codec}  {w}x{h}  {fps}</code>")
-
     for s in a_streams:
         codec = s.get("codec_name","?").upper()
         tags  = s.get("tags",{}) or {}
@@ -1049,64 +876,32 @@ async def _show_magnet_streams(
         ch    = s.get("channels",0)
         ch_s  = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch, f"{ch}ch") if ch else ""
         lines.append(f"  🎵 {_flag(lang)} <code>{codec}  {ch_s}</code>  {_lname(lang)}")
-
     for s in s_streams:
         codec = s.get("codec_name","?").upper()
         tags  = s.get("tags",{}) or {}
         lang  = (tags.get("language","und")).lower()
         lines.append(f"  💬 {_flag(lang)} <code>{codec}</code>  {_lname(lang)}")
-
     if not any([v_streams, a_streams, s_streams]):
         lines.append("⚠️ <i>No streams detected in this file.</i>")
-
     lines += ["──────────────────────", "<i>Tap a stream to extract it:</i>"]
 
     rows: list = []
     for s in v_streams:
-        idx   = s.get("index", 0)
-        codec = s.get("codec_name","?").upper()
-        w, h  = s.get("width",0), s.get("height",0)
-        rows.append([InlineKeyboardButton(
-            f"🎬 Video #{idx}  {codec}  {w}x{h}",
-            callback_data=f"mse|v|{sess_tok}|{idx}|{uid}",
-        )])
+        idx = s.get("index", 0); codec = s.get("codec_name","?").upper(); w, h = s.get("width",0), s.get("height",0)
+        rows.append([InlineKeyboardButton(f"🎬 Video #{idx}  {codec}  {w}x{h}", callback_data=f"mse|v|{sess_tok}|{idx}|{uid}")])
     for s in a_streams:
-        idx   = s.get("index", 0)
-        codec = s.get("codec_name","?").upper()
-        tags  = s.get("tags",{}) or {}
-        lang  = (tags.get("language","und")).lower()
-        ch    = s.get("channels",0)
-        ch_s  = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch, f"{ch}ch") if ch else ""
-        rows.append([InlineKeyboardButton(
-            f"🎵 Audio #{idx}  {_flag(lang)}  {codec}  {ch_s}",
-            callback_data=f"mse|a|{sess_tok}|{idx}|{uid}",
-        )])
+        idx = s.get("index", 0); codec = s.get("codec_name","?").upper(); tags = s.get("tags",{}) or {}; lang = (tags.get("language","und")).lower(); ch = s.get("channels",0); ch_s = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch, f"{ch}ch") if ch else ""
+        rows.append([InlineKeyboardButton(f"🎵 Audio #{idx}  {_flag(lang)}  {codec}  {ch_s}", callback_data=f"mse|a|{sess_tok}|{idx}|{uid}")])
     for s in s_streams:
-        idx   = s.get("index", 0)
-        codec = s.get("codec_name","?").upper()
-        tags  = s.get("tags",{}) or {}
-        lang  = (tags.get("language","und")).lower()
-        rows.append([InlineKeyboardButton(
-            f"💬 Sub #{idx}  {_flag(lang)}  {_lname(lang)}  {codec}",
-            callback_data=f"mse|s|{sess_tok}|{idx}|{uid}",
-        )])
-
+        idx = s.get("index", 0); codec = s.get("codec_name","?").upper(); tags = s.get("tags",{}) or {}; lang = (tags.get("language","und")).lower()
+        rows.append([InlineKeyboardButton(f"💬 Sub #{idx}  {_flag(lang)}  {_lname(lang)}  {codec}", callback_data=f"mse|s|{sess_tok}|{idx}|{uid}")])
     if len(a_streams) > 1:
-        rows.append([InlineKeyboardButton(
-            "🎵 Extract ALL audio tracks",
-            callback_data=f"mse|a_all|{sess_tok}|all|{uid}",
-        )])
+        rows.append([InlineKeyboardButton("🎵 Extract ALL audio tracks", callback_data=f"mse|a_all|{sess_tok}|all|{uid}")])
     if len(s_streams) > 1:
-        rows.append([InlineKeyboardButton(
-            "💬 Extract ALL subtitle tracks",
-            callback_data=f"mse|s_all|{sess_tok}|all|{uid}",
-        )])
+        rows.append([InlineKeyboardButton("💬 Extract ALL subtitle tracks", callback_data=f"mse|s_all|{sess_tok}|all|{uid}")])
     rows.append([InlineKeyboardButton("❌ Close", callback_data=f"mse|cancel|{sess_tok}|0|{uid}")])
 
-    await safe_edit(st, "\n".join(lines),
-        parse_mode=enums.ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+    await safe_edit(st, "\n".join(lines), parse_mode=enums.ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
 
 
 @Client.on_callback_query(filters.regex(r"^mse\|"))
@@ -1125,10 +920,10 @@ async def mse_cb(client: Client, cb: CallbackQuery):
             cleanup(sess["tmp"])
         return await cb.message.delete()
 
-    sess = _magnet_probe.get(sess_tok)
+    # FIX C-03: use _get_magnet_probe which evicts expired entries
+    sess = _get_magnet_probe(sess_tok)
     if not sess:
-        return await safe_edit(cb.message, "❌ Session expired. Re-run Stream Extractor.",
-                               parse_mode=enums.ParseMode.HTML)
+        return await safe_edit(cb.message, "❌ Session expired. Re-run Stream Extractor.", parse_mode=enums.ParseMode.HTML)
 
     path  = sess["path"]
     tmp   = sess["tmp"]
@@ -1160,13 +955,10 @@ async def mse_cb(client: Client, cb: CallbackQuery):
                     caption = f"💬 <b>Subtitle #{idx}</b>  {_flag(lang)} {_lname(lang)}\n<code>{codec.upper()}</code>"
                 try:
                     await FF.stream_op(path, out, ["-map", f"0:{idx}", "-c", "copy"])
-                    await client.send_document(
-                        user_id, out, caption=caption, parse_mode=enums.ParseMode.HTML,
-                    )
+                    await client.send_document(user_id, out, caption=caption, parse_mode=enums.ParseMode.HTML)
                 except Exception as exc:
                     log.warning("mse all extract idx=%d: %s", idx, exc)
             await st.delete()
-
         else:
             all_streams = sd.get("video",[]) + sd.get("audio",[]) + sd.get("subtitle",[])
             target = next((s for s in all_streams if str(s.get("index")) == idx_str), None)
@@ -1202,8 +994,7 @@ async def mse_cb(client: Client, cb: CallbackQuery):
 
     except Exception as exc:
         log.error("mse extraction failed: %s", exc, exc_info=True)
-        await safe_edit(st, f"❌ Extraction failed: <code>{exc}</code>",
-                        parse_mode=enums.ParseMode.HTML)
+        await safe_edit(st, f"❌ Extraction failed: <code>{exc}</code>", parse_mode=enums.ParseMode.HTML)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1216,7 +1007,6 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
     path, tmp, probe = await _probe_magnet_file(url, uid, st)
     if not path:
         return
-
     sd    = probe.get("streams", {})
     dur   = probe.get("duration", 0)
     fname = probe.get("fname", os.path.basename(path))
@@ -1224,71 +1014,41 @@ async def _handle_magnet_info(client: Client, cb: CallbackQuery, url: str, token
 
     from services.utils import fmt_hms
     from services import ffmpeg as FF
-
-    v_streams = sd.get("video",    [])
-    a_streams = sd.get("audio",    [])
-    s_streams = sd.get("subtitle", [])
-
-    lines = [
-        "📊 <b>Magnet Media Info</b>", "──────────────────────",
-        f"📄 <code>{fname[:50]}</code>",
-        f"💾 <code>{human_size(fsize)}</code>  ⏱ <code>{fmt_hms(dur)}</code>",
-        "──────────────────────",
-    ]
+    v_streams = sd.get("video", []); a_streams = sd.get("audio", []); s_streams = sd.get("subtitle", [])
+    lines = ["📊 <b>Magnet Media Info</b>", "──────────────────────", f"📄 <code>{fname[:50]}</code>", f"💾 <code>{human_size(fsize)}</code>  ⏱ <code>{fmt_hms(dur)}</code>", "──────────────────────"]
     for s in v_streams:
-        codec = s.get("codec_name","?").upper()
-        w, h  = s.get("width",0), s.get("height",0)
-        fr    = s.get("r_frame_rate","0/1")
-        try:
-            n2, d2 = fr.split("/")
-            fps = f"{float(n2)/max(float(d2),1):.3f}fps"
-        except Exception:
-            fps = "?"
-        pix   = s.get("pix_fmt","")
-        hdr_s = " HDR" if "10" in pix else ""
+        codec = s.get("codec_name","?").upper(); w, h = s.get("width",0), s.get("height",0); fr = s.get("r_frame_rate","0/1")
+        try: n2, d2 = fr.split("/"); fps = f"{float(n2)/max(float(d2),1):.3f}fps"
+        except Exception: fps = "?"
+        pix = s.get("pix_fmt",""); hdr_s = " HDR" if "10" in pix else ""
         lines.append(f"🎬 <code>{codec}  {w}x{h}  {fps}{hdr_s}</code>")
     for s in a_streams:
-        codec = s.get("codec_name","?").upper()
-        ch    = s.get("channels",0)
-        ch_s  = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch, f"{ch}ch") if ch else ""
-        tags  = s.get("tags",{}) or {}
-        lang  = (tags.get("language","und")).lower()
+        codec = s.get("codec_name","?").upper(); ch = s.get("channels",0); ch_s = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch, f"{ch}ch") if ch else ""; tags = s.get("tags",{}) or {}; lang = (tags.get("language","und")).lower()
         lines.append(f"🎵 <code>{codec}  {ch_s}</code>  {_flag(lang)} {_lname(lang)}")
     for s in s_streams[:6]:
-        codec = s.get("codec_name","?").upper()
-        tags  = s.get("tags",{}) or {}
-        lang  = (tags.get("language","und")).lower()
+        codec = s.get("codec_name","?").upper(); tags = s.get("tags",{}) or {}; lang = (tags.get("language","und")).lower()
         lines.append(f"💬 <code>{codec}</code>  {_flag(lang)} {_lname(lang)}")
     if not any([v_streams, a_streams, s_streams]):
         lines.append("⚠️ <i>No media streams detected.</i>")
-
     kb_rows: list = []
     try:
         raw = await FF.get_mediainfo(path)
         from services.telegraph import post_mediainfo
         tph = await post_mediainfo(fname, raw)
         kb_rows.append([InlineKeyboardButton("📋 Full MediaInfo →", url=tph)])
-    except Exception:
-        pass
-    kb_rows += [
-        [InlineKeyboardButton("🟢 Download File", callback_data=f"dl|video|{token}"),
-         InlineKeyboardButton("❌ Close",         callback_data=f"dl|cancel|{token}")],
-    ]
+    except Exception: pass
+    kb_rows += [[InlineKeyboardButton("🟢 Download File", callback_data=f"dl|video|{token}"), InlineKeyboardButton("❌ Close", callback_data=f"dl|cancel|{token}")]]
     cleanup(tmp)
-    await safe_edit(st, "\n".join(lines),
-        parse_mode=enums.ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(kb_rows),
-    )
+    await safe_edit(st, "\n".join(lines), parse_mode=enums.ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb_rows))
 
 
 # ─────────────────────────────────────────────────────────────
-# Upload + cleanup helper  (used by handle_torrent_file)
+# Upload + cleanup helper
 # ─────────────────────────────────────────────────────────────
 
 async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
     from services.utils import all_video_files as _avf, smart_clean_filename
     from core.session import settings as _settings
-    from core.config import cfg
 
     if os.path.isdir(path):
         all_files = _avf(path)
@@ -1301,104 +1061,54 @@ async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
         all_files = []
 
     if not all_files:
-        try:
-            await client.send_message(
-                uid, "❌ <b>Upload failed</b>\n\n<code>No output files found</code>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-        except Exception:
-            pass
-        cleanup(tmp)
-        return
+        try: await client.send_message(uid, "❌ <b>Upload failed</b>\n\n<code>No output files found</code>", parse_mode=enums.ParseMode.HTML)
+        except Exception: pass
+        cleanup(tmp); return
 
     total_files = len(all_files)
-
     if total_files > 1:
-        try:
-            await client.send_message(
-                uid,
-                f"✅ <b>Download complete — {total_files} files</b>\n"
-                f"📤 <i>Starting batch upload…</i>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-        except Exception:
-            pass
+        try: await client.send_message(uid, f"✅ <b>Download complete — {total_files} files</b>\n📤 <i>Starting batch upload…</i>", parse_mode=enums.ParseMode.HTML)
+        except Exception: pass
 
-    s      = await _settings.get(uid)
+    s = await _settings.get(uid)
     prefix = s.get("prefix", "").strip()
     suffix = s.get("suffix", "").strip()
 
     try:
         for i, fpath in enumerate(all_files, 1):
             fsize = os.path.getsize(fpath)
-
             if fsize > cfg.file_limit_b:
                 log.warning("Skipping %s — exceeds file limit", fpath)
-                try:
-                    await client.send_message(
-                        uid,
-                        f"⚠️ <b>Skipped ({i}/{total_files})</b>\n"
-                        f"<code>{os.path.basename(fpath)}</code>\n"
-                        f"Size <code>{human_size(fsize)}</code> exceeds "
-                        f"limit <code>{human_size(cfg.file_limit_b)}</code>",
-                        parse_mode=enums.ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
+                try: await client.send_message(uid, f"⚠️ <b>Skipped ({i}/{total_files})</b>\n<code>{os.path.basename(fpath)}</code>\nSize <code>{human_size(fsize)}</code> exceeds limit <code>{human_size(cfg.file_limit_b)}</code>", parse_mode=enums.ParseMode.HTML)
+                except Exception: pass
                 continue
-
-            fname     = os.path.basename(fpath)
-            cleaned   = smart_clean_filename(fname)
+            fname = os.path.basename(fpath)
+            cleaned = smart_clean_filename(fname)
             name, ext = os.path.splitext(cleaned)
             final_name = f"{prefix}{name}{suffix}{ext}"
             if final_name != fname:
                 new_path = os.path.join(os.path.dirname(fpath), final_name)
-                try:
-                    os.rename(fpath, new_path)
-                    fpath = new_path
-                except OSError as rename_err:
-                    log.warning("Rename failed: %s", rename_err)
-
-            progress_label = (
-                f"📤 <b>Uploading {i}/{total_files}</b>\n"
-                f"<code>{os.path.basename(fpath)}</code>"
-            )
-            st = await client.send_message(
-                uid, progress_label,
-                parse_mode=enums.ParseMode.HTML,
-            )
-            try:
-                await upload_file(client, st, fpath, user_id=uid)
-            except Exception as exc:
-                log.error("Upload failed for %s: %s", fpath, exc)
-
-            if i < total_files:
-                await asyncio.sleep(2)
-
+                try: os.rename(fpath, new_path); fpath = new_path
+                except OSError as rename_err: log.warning("Rename failed: %s", rename_err)
+            progress_label = f"📤 <b>Uploading {i}/{total_files}</b>\n<code>{os.path.basename(fpath)}</code>"
+            st = await client.send_message(uid, progress_label, parse_mode=enums.ParseMode.HTML)
+            try: await upload_file(client, st, fpath, user_id=uid)
+            except Exception as exc: log.error("Upload failed for %s: %s", fpath, exc)
+            if i < total_files: await asyncio.sleep(2)
     finally:
         cleanup(tmp)
 
 
 async def _safe_delete(msg) -> None:
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    try: await msg.delete()
+    except Exception: pass
 
 
 # ─────────────────────────────────────────────────────────────
-# _launch_download — live download panel
+# _launch_download
 # ─────────────────────────────────────────────────────────────
 
-async def _launch_download(
-    client: Client,
-    panel_msg,
-    url: str,
-    uid: int,
-    audio_only: bool = False,
-    fmt_id: str | None = None,
-) -> None:
-    # ── Self-register with tracker so /status cancel works ────
+async def _launch_download(client: Client, panel_msg, url: str, uid: int, audio_only: bool = False, fmt_id: str | None = None) -> None:
     from services.task_runner import tracker, runner, TaskRecord
     _tid = tracker.new_tid()
     _kind_pre = classify(url)
@@ -1408,168 +1118,91 @@ async def _launch_download(
     _rec = TaskRecord(tid=_tid, user_id=uid, label=_lbl_pre, mode=_mode_pre, engine=_eng_pre)
     await tracker.register(_rec)
     runner.register_raw(_tid, asyncio.current_task())
-    # ──────────────────────────────────────────────────────────
 
     tmp  = make_tmp(cfg.download_dir, uid)
     kind = classify(url)
 
     if kind in ("magnet", "torrent"):
         dn_match = re.search(r"[&?]dn=([^&]+)", url)
-        if dn_match:
-            label = _up.unquote_plus(dn_match.group(1))[:50]
+        if dn_match: label = _up.unquote_plus(dn_match.group(1))[:50]
         else:
             ih_match = re.search(r"xt=urn:btih:([a-fA-F0-9]{6,}|[A-Za-z2-7]{6,})", url)
-            label = (
-                f"Magnet {ih_match.group(1)[:12].upper()}"
-                if ih_match else "Magnet Download"
-            )
-        engine = "magnet"
-        mode   = "magnet"
+            label = f"Magnet {ih_match.group(1)[:12].upper()}" if ih_match else "Magnet Download"
+        engine = "magnet"; mode = "magnet"
     else:
-        raw    = url.split("/")[-1].split("?")[0]
-        label  = _up.unquote_plus(raw)[:50] or "Download"
-        engine = "ytdlp" if kind == "ytdlp" else kind
-        mode   = "dl"
+        raw = url.split("/")[-1].split("?")[0]
+        label = _up.unquote_plus(raw)[:50] or "Download"
+        engine = "ytdlp" if kind == "ytdlp" else kind; mode = "dl"
+
+    try: await panel_msg.delete()
+    except Exception: pass
+
+    st = await client.send_message(uid, progress_panel(mode=mode, fname=label, done=0, total=0, engine=engine, link_label=label[:24]), parse_mode=enums.ParseMode.HTML)
 
     try:
-        await panel_msg.delete()
-    except Exception:
-        pass
-
-    st = await client.send_message(
-        uid,
-        progress_panel(
-            mode=mode, fname=label, done=0, total=0,
-            engine=engine, link_label=label[:24],
-        ),
-        parse_mode=enums.ParseMode.HTML,
-    )
-
-    try:
-        path = await smart_download(
-            url, tmp,
-            audio_only=audio_only,
-            fmt_id=fmt_id,
-            user_id=uid,
-            label=label,
-            msg=st,
-        )
+        path = await smart_download(url, tmp, audio_only=audio_only, fmt_id=fmt_id, user_id=uid, label=label, msg=st)
     except asyncio.CancelledError:
-        await tracker.finish(_tid, success=False, msg="Cancelled")
-        cleanup(tmp)
-        try:
-            await st.edit("❌ <b>Download cancelled.</b>", parse_mode=enums.ParseMode.HTML)
-        except Exception:
-            pass
+        await tracker.finish(_tid, success=False, msg="Cancelled"); cleanup(tmp)
+        try: await st.edit("❌ <b>Download cancelled.</b>", parse_mode=enums.ParseMode.HTML)
+        except Exception: pass
         return
     except Exception as exc:
         await tracker.finish(_tid, success=False, msg=str(exc)[:50])
-        log.error("_launch_download uid=%d failed: %s", uid, exc, exc_info=True)
-        cleanup(tmp)
-        try:
-            await st.edit(
-                f"❌ <b>Download failed</b>\n\n<code>{exc}</code>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-        except Exception:
-            pass
+        log.error("_launch_download uid=%d failed: %s", uid, exc, exc_info=True); cleanup(tmp)
+        try: await st.edit(f"❌ <b>Download failed</b>\n\n<code>{exc}</code>", parse_mode=enums.ParseMode.HTML)
+        except Exception: pass
         return
 
     from services.utils import all_video_files as _all_videos
     if os.path.isdir(path):
         all_files = _all_videos(path)
         if not all_files:
-            resolved = largest_file(path)
-            all_files = [resolved] if resolved else []
-    elif os.path.isfile(path):
-        all_files = [path]
-    else:
-        all_files = []
+            resolved = largest_file(path); all_files = [resolved] if resolved else []
+    elif os.path.isfile(path): all_files = [path]
+    else: all_files = []
 
     if not all_files:
         await tracker.finish(_tid, success=False, msg="No output files")
-        log.error("_launch_download uid=%d: no output files in %s", uid, tmp)
-        cleanup(tmp)
-        try:
-            await st.edit(
-                "❌ <b>Download failed</b>\n\n<code>Output file not found</code>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-        except Exception:
-            pass
+        log.error("_launch_download uid=%d: no output files in %s", uid, tmp); cleanup(tmp)
+        try: await st.edit("❌ <b>Download failed</b>\n\n<code>Output file not found</code>", parse_mode=enums.ParseMode.HTML)
+        except Exception: pass
         return
 
     total_files = len(all_files)
     if total_files > 1:
-        try:
-            await st.edit(
-                f"✅ <b>Download complete — {total_files} files</b>\n"
-                f"📤 <i>Starting batch upload…</i>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-        except Exception:
-            pass
+        try: await st.edit(f"✅ <b>Download complete — {total_files} files</b>\n📤 <i>Starting batch upload…</i>", parse_mode=enums.ParseMode.HTML)
+        except Exception: pass
 
     from core.session import settings as _settings
-    s      = await _settings.get(uid)
-    prefix = s.get("prefix", "").strip()
-    suffix = s.get("suffix", "").strip()
+    s = await _settings.get(uid)
+    prefix = s.get("prefix", "").strip(); suffix = s.get("suffix", "").strip()
 
     try:
         for i, fpath in enumerate(all_files, 1):
             fsize = os.path.getsize(fpath)
-
             if fsize > cfg.file_limit_b:
                 log.warning("Skipping %s — exceeds file limit", fpath)
-                try:
-                    await client.send_message(
-                        uid,
-                        f"⚠️ <b>Skipped ({i}/{total_files})</b>\n"
-                        f"<code>{os.path.basename(fpath)}</code>\n"
-                        f"Size <code>{human_size(fsize)}</code> exceeds "
-                        f"limit <code>{human_size(cfg.file_limit_b)}</code>",
-                        parse_mode=enums.ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
+                try: await client.send_message(uid, f"⚠️ <b>Skipped ({i}/{total_files})</b>\n<code>{os.path.basename(fpath)}</code>\nSize <code>{human_size(fsize)}</code> exceeds limit <code>{human_size(cfg.file_limit_b)}</code>", parse_mode=enums.ParseMode.HTML)
+                except Exception: pass
                 continue
-
-            fname     = os.path.basename(fpath)
-            cleaned   = smart_clean_filename(fname)
+            fname = os.path.basename(fpath)
+            cleaned = smart_clean_filename(fname)
             name, ext = os.path.splitext(cleaned)
             final_name = f"{prefix}{name}{suffix}{ext}"
             if final_name != fname:
                 new_path = os.path.join(os.path.dirname(fpath), final_name)
-                try:
-                    os.rename(fpath, new_path)
-                    fpath = new_path
-                except OSError as rename_err:
-                    log.warning("Rename failed: %s", rename_err)
-
-            upload_st = await client.send_message(
-                uid,
-                f"📤 <b>Uploading {i}/{total_files}</b>\n"
-                f"<code>{os.path.basename(fpath)}</code>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-            try:
-                await upload_file(client, upload_st, fpath, user_id=uid)
-            except Exception as exc:
-                log.error("Upload failed for %s: %s", fpath, exc)
-
-            if i < total_files:
-                await asyncio.sleep(2)
-
-        try:
-            await st.delete()
-        except Exception:
-            pass
+                try: os.rename(fpath, new_path); fpath = new_path
+                except OSError as rename_err: log.warning("Rename failed: %s", rename_err)
+            upload_st = await client.send_message(uid, f"📤 <b>Uploading {i}/{total_files}</b>\n<code>{os.path.basename(fpath)}</code>", parse_mode=enums.ParseMode.HTML)
+            try: await upload_file(client, upload_st, fpath, user_id=uid)
+            except Exception as exc: log.error("Upload failed for %s: %s", fpath, exc)
+            if i < total_files: await asyncio.sleep(2)
+        try: await st.delete()
+        except Exception: pass
     except asyncio.CancelledError:
         await tracker.finish(_tid, success=False, msg="Cancelled")
-        try:
-            await st.edit("❌ <b>Upload cancelled.</b>", parse_mode=enums.ParseMode.HTML)
-        except Exception:
-            pass
+        try: await st.edit("❌ <b>Upload cancelled.</b>", parse_mode=enums.ParseMode.HTML)
+        except Exception: pass
         return
     except Exception as exc:
         await tracker.finish(_tid, success=False, msg=str(exc)[:50])
@@ -1593,160 +1226,71 @@ async def _handle_info(client: Client, cb: CallbackQuery, url: str, token: str) 
             import yt_dlp
             with yt_dlp.YoutubeDL({"quiet":True,"skip_download":True,"noplaylist":True}) as ydl:
                 info = ydl.extract_info(url, download=False)
-            dur   = info.get("duration", 0)
-            title = info.get("title","N/A")
-            lines = [
-                "📊 <b>Media Info</b>", "──────────────────",
-                f"🎬 <b>{title[:55]}</b>",
-                f"👤 {info.get('uploader','N/A')}",
-                f"⏱ {_fmt_dur(dur)}",
-            ]
-            if info.get("view_count"):
-                lines.append(f"👁 {info['view_count']:,} views")
+            dur = info.get("duration", 0); title = info.get("title","N/A")
+            lines = ["📊 <b>Media Info</b>", "──────────────────", f"🎬 <b>{title[:55]}</b>", f"👤 {info.get('uploader','N/A')}", f"⏱ {_fmt_dur(dur)}"]
+            if info.get("view_count"): lines.append(f"👁 {info['view_count']:,} views")
             lines.append("──────────────────")
-            seen: set = set()
-            count = 0
+            seen: set = set(); count = 0
             for f in reversed(info.get("formats", [])):
-                note  = f.get("format_note") or f.get("resolution","")
-                vc    = f.get("vcodec","none")
-                ext_f = f.get("ext","?")
-                tbr   = int(f.get("tbr") or 0)
+                note = f.get("format_note") or f.get("resolution",""); vc = f.get("vcodec","none"); ext_f = f.get("ext","?"); tbr = int(f.get("tbr") or 0)
                 if note and note not in seen and vc != "none":
-                    seen.add(note)
-                    count += 1
-                    lines.append(f"📦 <code>{note}</code> [{ext_f}] {tbr}kbps")
-                if count >= 6:
-                    break
-            await safe_edit(st, "\n".join(lines),
-                parse_mode=enums.ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🟢 Download Video", callback_data=f"dl|video|{token}"),
-                     InlineKeyboardButton("🎵 Download Audio", callback_data=f"dl|audio|{token}")],
-                    [InlineKeyboardButton("❌ Close",          callback_data=f"dl|cancel|{token}")],
-                ]))
+                    seen.add(note); count += 1; lines.append(f"📦 <code>{note}</code> [{ext_f}] {tbr}kbps")
+                if count >= 6: break
+            await safe_edit(st, "\n".join(lines), parse_mode=enums.ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟢 Download Video", callback_data=f"dl|video|{token}"), InlineKeyboardButton("🎵 Download Audio", callback_data=f"dl|audio|{token}")], [InlineKeyboardButton("❌ Close", callback_data=f"dl|cancel|{token}")]]))
         except Exception as exc:
-            await safe_edit(st, f"❌ Info failed: <code>{exc}</code>",
-                            parse_mode=enums.ParseMode.HTML)
+            await safe_edit(st, f"❌ Info failed: <code>{exc}</code>", parse_mode=enums.ParseMode.HTML)
         return
 
-    # Direct URL — ffprobe on URL, zero bytes downloaded
     try:
-        cmd = [
-            "ffprobe", "-v", "quiet",
-            "-allowed_extensions", "ALL",
-            "-analyzeduration", "20000000",
-            "-probesize", "50000000",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
-            url,
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        cmd = ["ffprobe", "-v", "quiet", "-allowed_extensions", "ALL", "-analyzeduration", "20000000", "-probesize", "50000000", "-print_format", "json", "-show_format", "-show_streams", url]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try: out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
         except asyncio.TimeoutError:
             try: proc.kill()
             except Exception: pass
             raise RuntimeError("ffprobe timed out (30s)")
-
-        data    = _json.loads(out.decode(errors="replace") or "{}")
-        streams = data.get("streams", [])
-        fmt     = data.get("format", {})
-
+        data = _json.loads(out.decode(errors="replace") or "{}"); streams = data.get("streams", []); fmt = data.get("format", {})
         from pathlib import Path as _P
-        fn    = _P(url.split("?")[0]).name or "file"
-        fn    = fn[:50]
-        total = int(fmt.get("size", 0) or 0)
-
+        fn = _P(url.split("?")[0]).name or "file"; fn = fn[:50]; total = int(fmt.get("size", 0) or 0)
         if not total:
             try:
                 async with aiohttp.ClientSession() as sess:
-                    async with sess.head(url, allow_redirects=True,
-                                         timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    async with sess.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         total = int(resp.headers.get("Content-Length", 0))
                         cd = resp.headers.get("Content-Disposition", "")
                         if "filename=" in cd:
                             fn_cd = cd.split("filename=")[-1].strip().strip('"').strip("'")
-                            if fn_cd:
-                                fn = fn_cd[:50]
-            except Exception:
-                pass
-
+                            if fn_cd: fn = fn_cd[:50]
+            except Exception: pass
         dur_s = float(fmt.get("duration", 0) or 0)
         sd: dict = {"video": [], "audio": [], "subtitle": []}
         for s in streams:
             t = s.get("codec_type", "")
-            if t in sd:
-                sd[t].append(s)
-
-        lines = [
-            "📊 <b>Media Info (Direct)</b>", "──────────────────",
-            f"📄 <code>{fn}</code>",
-            f"💾 <code>{human_size(total) if total else '—'}</code>  "
-            f"⏱ <code>{_fmt_dur(int(dur_s))}</code>",
-            "──────────────────",
-        ]
+            if t in sd: sd[t].append(s)
+        lines = ["📊 <b>Media Info (Direct)</b>", "──────────────────", f"📄 <code>{fn}</code>", f"💾 <code>{human_size(total) if total else '—'}</code>  ⏱ <code>{_fmt_dur(int(dur_s))}</code>", "──────────────────"]
         for s in sd.get("video", []):
-            codec = s.get("codec_name","?").upper()
-            w, h  = s.get("width",0), s.get("height",0)
-            try:
-                n2, d2 = s.get("r_frame_rate","0/1").split("/")
-                fps = f"{float(n2)/max(float(d2),1):.2f}"
-            except Exception:
-                fps = "?"
+            codec = s.get("codec_name","?").upper(); w, h = s.get("width",0), s.get("height",0)
+            try: n2, d2 = s.get("r_frame_rate","0/1").split("/"); fps = f"{float(n2)/max(float(d2),1):.2f}"
+            except Exception: fps = "?"
             lines.append(f"🎬 <code>{codec} {w}x{h} @ {fps}fps</code>")
         for s in sd.get("audio", []):
-            codec = s.get("codec_name","?").upper()
-            ch    = s.get("channels",0)
-            ch_s  = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch,f"{ch}ch") if ch else ""
-            tags  = s.get("tags", {}) or {}
-            lang  = (tags.get("language","und") or "und").lower()
+            codec = s.get("codec_name","?").upper(); ch = s.get("channels",0); ch_s = {1:"Mono",2:"Stereo",6:"5.1",8:"7.1"}.get(ch,f"{ch}ch") if ch else ""; tags = s.get("tags", {}) or {}; lang = (tags.get("language","und") or "und").lower()
             lines.append(f"🎵 <code>{codec} {ch_s}</code>  {_flag(lang)} {_lname(lang)}")
         for s in sd.get("subtitle", [])[:4]:
-            codec = s.get("codec_name","?").upper()
-            tags  = s.get("tags", {}) or {}
-            lang  = (tags.get("language","und") or "und").lower()
+            codec = s.get("codec_name","?").upper(); tags = s.get("tags", {}) or {}; lang = (tags.get("language","und") or "und").lower()
             lines.append(f"💬 <code>{codec}</code>  {_flag(lang)} {_lname(lang)}")
-
-        if not any(sd.get(t) for t in ("video", "audio")):
-            lines.append("⚠️ <i>ffprobe could not read streams.</i>")
-
-        kb = [
-            [InlineKeyboardButton("🟢 Download", callback_data=f"dl|video|{token}"),
-             InlineKeyboardButton("❌ Close",    callback_data=f"dl|cancel|{token}")],
-        ]
+        if not any(sd.get(t) for t in ("video", "audio")): lines.append("⚠️ <i>ffprobe could not read streams.</i>")
+        kb = [[InlineKeyboardButton("🟢 Download", callback_data=f"dl|video|{token}"), InlineKeyboardButton("❌ Close", callback_data=f"dl|cancel|{token}")]]
         try:
             from services.telegraph import post_mediainfo
             mi_lines = [f"File: {fn}"]
-            if total:
-                mi_lines.append(f"Size: {human_size(total)}")
-            if dur_s:
-                mi_lines.append(f"Duration: {_fmt_dur(int(dur_s))}")
-            for s in sd.get("video", []):
-                mi_lines.append(
-                    f"Video: {s.get('codec_name','?').upper()} "
-                    f"{s.get('width',0)}x{s.get('height',0)}"
-                )
-            for s in sd.get("audio", []):
-                tags = s.get("tags", {}) or {}
-                lang = tags.get("language", "und")
-                mi_lines.append(f"Audio: {s.get('codec_name','?').upper()} [{lang}]")
+            if total: mi_lines.append(f"Size: {human_size(total)}")
+            if dur_s: mi_lines.append(f"Duration: {_fmt_dur(int(dur_s))}")
+            for s in sd.get("video", []): mi_lines.append(f"Video: {s.get('codec_name','?').upper()} {s.get('width',0)}x{s.get('height',0)}")
+            for s in sd.get("audio", []): tags = s.get("tags", {}) or {}; lang = tags.get("language", "und"); mi_lines.append(f"Audio: {s.get('codec_name','?').upper()} [{lang}]")
             tph = await post_mediainfo(fn, "\n".join(mi_lines))
             kb.insert(0, [InlineKeyboardButton("📋 Full MediaInfo →", url=tph)])
-        except Exception:
-            pass
-
-        await safe_edit(st, "\n".join(lines),
-                        parse_mode=enums.ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup(kb))
-
+        except Exception: pass
+        await safe_edit(st, "\n".join(lines), parse_mode=enums.ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
     except Exception as exc:
-        await safe_edit(st, f"❌ Could not probe: <code>{exc}</code>",
-                        parse_mode=enums.ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🟢 Download", callback_data=f"dl|video|{token}"),
-                             InlineKeyboardButton("❌ Close",    callback_data=f"dl|cancel|{token}")],
-                        ]))
+        await safe_edit(st, f"❌ Could not probe: <code>{exc}</code>", parse_mode=enums.ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🟢 Download", callback_data=f"dl|video|{token}"), InlineKeyboardButton("❌ Close", callback_data=f"dl|cancel|{token}")]]))

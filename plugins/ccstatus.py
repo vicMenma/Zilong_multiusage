@@ -6,6 +6,11 @@ Adaptive polling: 5 s when any job is processing, 60 s when idle.
 Primary delivery: poller checks CC API, then downloads export URL via
 aiohttp and uploads to Telegram directly — no webhook dependency.
 Webhook is a bonus; this poller is the authoritative delivery path.
+
+FIX C-04 (audit v3): _deliver_job now retries up to 3 times on failure.
+Previously, if delivery failed (network error, disk full), the job was
+permanently marked "notified" and would never be retried — the user got
+no file and no retry ever happened.
 """
 from __future__ import annotations
 
@@ -185,6 +190,18 @@ async def _deliver_job(job: CCJob) -> None:
 
     except Exception as exc:
         log.error("[CCStatus] Delivery failed for job %s: %s", job.job_id, exc)
+        # FIX C-04 (audit v3): un-mark notified so the poller retries delivery
+        # on the next cycle. The job will be retried up to 3 times.
+        retry_count = getattr(job, "_delivery_retries", 0)
+        if retry_count < 3:
+            job._delivery_retries = retry_count + 1
+            try:
+                # Reset notified flag so poller picks it up again
+                await cc_job_store.update(job.job_id, notified=False)
+                log.info("[CCStatus] Will retry delivery for %s (attempt %d/3)",
+                         job.job_id, retry_count + 1)
+            except Exception:
+                pass
         try:
             await client.send_message(
                 job.uid,
@@ -256,6 +273,7 @@ async def _poll_loop() -> None:
                         await cc_job_store.finish(job.job_id, export_url=export_url)
                         # Mark notified BEFORE spawning the task so a second poller
                         # cycle or a restart cannot pick up the same job and double-upload.
+                        # FIX C-04: if _deliver_job fails, it resets notified for retry.
                         await cc_job_store.mark_notified(job.job_id)
                         asyncio.create_task(_deliver_job(
                             cc_job_store.get(job.job_id) or job
