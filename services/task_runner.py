@@ -340,19 +340,24 @@ class TaskRunner:
         self._task_handles: dict[str, asyncio.Task] = {}  # submit()-based tasks
         self._raw_tasks:    dict[str, asyncio.Task] = {}  # self-registering tasks
         self._running = False
+        self._stats_task: Optional[asyncio.Task] = None    # FIX M-01
 
     def start(self) -> None:
         self._running = True
         global _task_semaphore
         _task_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         try:
-            asyncio.get_running_loop().create_task(_stats_updater())
+            # FIX M-01 (audit v3): store reference so stop() can cancel it
+            self._stats_task = asyncio.get_running_loop().create_task(_stats_updater())
             log.info("📊 Stats updater started")
         except Exception as e:
             log.warning("Could not start stats updater: %s", e)
 
     def stop(self) -> None:
         self._running = False
+        # FIX M-01: cancel the stats updater task
+        if self._stats_task and not self._stats_task.done():
+            self._stats_task.cancel()
         for handle in list(self._task_handles.values()) + list(self._raw_tasks.values()):
             if not handle.done():
                 handle.cancel()
