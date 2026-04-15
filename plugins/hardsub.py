@@ -367,10 +367,11 @@ async def _submit_one_fc(
         # Resolve webhook URL from running tunnel
         webhook_url: str | None = None
         try:
-            from core.config import cfg as _cfg
-            if hasattr(_cfg, "tunnel_url") and _cfg.tunnel_url:
-                from services.freeconvert_api import fc_webhook_url
-                webhook_url = fc_webhook_url(_cfg.tunnel_url)
+            from core.config import get_tunnel_url
+            from services.freeconvert_api import fc_webhook_url
+            _turl = get_tunnel_url()
+            if _turl:
+                webhook_url = fc_webhook_url(_turl)
         except Exception:
             pass
 
