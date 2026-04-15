@@ -90,6 +90,10 @@ class Config:
     cc_api_key: str = field(default_factory=lambda:
         os.environ.get("CC_API_KEY", ""))
 
+    # FreeConvert API key (for /convert, /compress, /fchardsub)
+    fc_api_key: str = field(default_factory=lambda:
+        os.environ.get("FC_API_KEY", ""))
+
     @property
     def file_limit_b(self) -> int:
         return self.file_limit_mb * 1024 * 1024
@@ -103,3 +107,18 @@ class Config:
 
 
 cfg = Config()
+
+# ── Mutable runtime state (cfg is frozen, so runtime values go here) ──────────
+# tunnel_url: set once the Cloudflare/ngrok tunnel comes up.
+# Plugins read this via get_tunnel_url() to embed in per-job FC webhook URLs.
+_state: dict = {"tunnel_url": ""}
+
+
+def get_tunnel_url() -> str:
+    """Return the current public tunnel base URL (e.g. https://abc.trycloudflare.com)."""
+    return _state.get("tunnel_url", "")
+
+
+def set_tunnel_url(url: str) -> None:
+    """Store the tunnel base URL once it is known at startup."""
+    _state["tunnel_url"] = url.rstrip("/") if url else ""
