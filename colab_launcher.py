@@ -1,20 +1,15 @@
 # @title ⚡ Zilong Bot — Colab Launcher
-# @markdown ## Credentials
+# @markdown Credentials go here OR in 🔑 Secrets panel (Secrets always win)
 # @markdown
-# @markdown **Recommended:** Store credentials in the 🔑 Secrets panel (left sidebar)
-# @markdown and toggle **"Notebook access"** ON for each one.
-# @markdown The form fields below are a fallback — Secrets always win.
-# @markdown
-# @markdown | Secret | Required | Example |
-# @markdown |---|---|---|
-# @markdown | `API_ID` | ✅ | `12345678` |
-# @markdown | `API_HASH` | ✅ | `abcdef…` |
-# @markdown | `BOT_TOKEN` | ✅ | `123456:ABC…` |
-# @markdown | `OWNER_ID` | ✅ | `987654321` |
-# @markdown | `GITHUB_TOKEN` | private repo | PAT with `repo` scope |
-# @markdown | `CC_API_KEY` | hardsub | CloudConvert key |
-# @markdown | `NGROK_TOKEN` | webhook (legacy) | ngrok authtoken |
-# @markdown | `WEBHOOK_BASE_URL` | webhook | auto-set by launcher via Serveo; override for VPS |
+# @markdown | Secret | Required |
+# @markdown |--------|----------|
+# @markdown | `API_ID` | ✅ |
+# @markdown | `API_HASH` | ✅ |
+# @markdown | `BOT_TOKEN` | ✅ |
+# @markdown | `OWNER_ID` | ✅ |
+# @markdown | `CC_API_KEY` | CloudConvert hardsub |
+# @markdown | `FC_API_KEY` | FreeConvert convert/compress (comma-sep for multiple) |
+# @markdown | `GITHUB_TOKEN` | private repo |
 
 API_ID    = 0      # @param {type:"integer"}
 API_HASH  = ""     # @param {type:"string"}
@@ -27,11 +22,10 @@ LOG_CHANNEL   = 0      # @param {type:"integer"}
 NGROK_TOKEN       = ""  # @param {type:"string"}
 CC_WEBHOOK_SECRET = ""  # @param {type:"string"}
 CC_API_KEY        = ""  # @param {type:"string"}
-FC_API_KEY        = ""  # @param {type:"string"}
+FC_API_KEY        = ""  # @param {type:"string"}  ← supports key1,key2,key3
 SEEDR_USERNAME    = ""  # @param {type:"string"}
 SEEDR_PASSWORD    = ""  # @param {type:"string"}
 GITHUB_TOKEN      = ""  # @param {type:"string"}
-# Set manually only for VPS/EC2 — on Colab this is auto-filled via Serveo tunnel
 WEBHOOK_BASE_URL  = ""  # @param {type:"string"}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -49,7 +43,6 @@ def _log(level: str, msg: str) -> None:
 
 
 def _secret(name: str) -> str:
-    """Colab Secrets → env var fallback."""
     try:
         from google.colab import userdata
         val = userdata.get(name)
@@ -67,7 +60,6 @@ def _secret_int(name: str, default: int = 0) -> int:
         return default
 
 
-# ── Resolve credentials — Secrets always win over form params ─────────────
 print("⚡ Zilong Bot — Colab Launcher")
 print("─" * 50)
 _log("STEP", "Resolving credentials…")
@@ -81,6 +73,7 @@ LOG_CHANNEL       = _secret_int("LOG_CHANNEL")   or LOG_CHANNEL
 NGROK_TOKEN       = _secret("NGROK_TOKEN") or _secret("NGROK_AUTHTOKEN") or NGROK_TOKEN
 CC_WEBHOOK_SECRET = _secret("CC_WEBHOOK_SECRET") or CC_WEBHOOK_SECRET
 CC_API_KEY        = _secret("CC_API_KEY")        or CC_API_KEY
+FC_API_KEY        = _secret("FC_API_KEY")        or FC_API_KEY   # FIX: was missing
 SEEDR_USERNAME    = _secret("SEEDR_USERNAME")    or SEEDR_USERNAME
 SEEDR_PASSWORD    = _secret("SEEDR_PASSWORD")    or SEEDR_PASSWORD
 GITHUB_TOKEN      = _secret("GITHUB_TOKEN")      or GITHUB_TOKEN
@@ -92,565 +85,641 @@ if not API_HASH:  errors.append("API_HASH is required")
 if not BOT_TOKEN: errors.append("BOT_TOKEN is required")
 if not OWNER_ID:  errors.append("OWNER_ID is required")
 if errors:
-    print()
-    for e in errors:
-        print(f"  ❌ {e}")
-    print()
-    print("👆 Add missing secrets via the 🔑 panel (left sidebar).")
+    for e in errors: print(f"  ❌ {e}")
     raise SystemExit("Missing required credentials.")
 
 _log("OK", f"API_ID={API_ID}  OWNER_ID={OWNER_ID}")
-if WEBHOOK_BASE_URL: _log("OK", f"CloudConvert webhook URL set: {WEBHOOK_BASE_URL}")
-elif NGROK_TOKEN:    _log("OK", "NGROK_TOKEN set (ngrok fallback enabled)")
-if CC_API_KEY:       _log("OK", "CloudConvert hardsub enabled (CC_API_KEY set)")
-if GITHUB_TOKEN:     _log("OK", "GitHub token set — will clone private repo")
+if CC_API_KEY: _log("OK", f"CC_API_KEY: {len(CC_API_KEY.split(','))} key(s)")
+if FC_API_KEY: _log("OK", f"FC_API_KEY: {len(FC_API_KEY.split(','))} key(s)")
+if WEBHOOK_BASE_URL: _log("OK", f"WEBHOOK_BASE_URL: {WEBHOOK_BASE_URL}")
 
-# ── System packages ───────────────────────────────────────────────────────
 _log("STEP", "Installing system packages…")
 subprocess.run(
-    "apt-get update -qq && "
-    "apt-get install -y -qq ffmpeg aria2 mediainfo p7zip-full unrar 2>/dev/null",
+    "apt-get update -qq && apt-get install -y -qq ffmpeg aria2 mediainfo p7zip-full unrar 2>/dev/null",
     shell=True, capture_output=True,
 )
 _log("OK", "System packages ready")
 
-# ── Clone ─────────────────────────────────────────────────────────────────
 _log("STEP", "Cloning repository…")
 if os.path.exists(BASE_DIR):
     shutil.rmtree(BASE_DIR)
 
 REPO_URL = (
     f"https://{GITHUB_TOKEN}@github.com/vicMenma/{REPO_NAME}.git"
-    if GITHUB_TOKEN
-    else f"https://github.com/vicMenma/{REPO_NAME}.git"
+    if GITHUB_TOKEN else
+    f"https://github.com/vicMenma/{REPO_NAME}.git"
 )
-r = subprocess.run(
-    ["git", "clone", "--depth=1", REPO_URL, BASE_DIR],
-    capture_output=True, text=True,
-)
+r = subprocess.run(["git", "clone", "--depth=1", REPO_URL, BASE_DIR], capture_output=True, text=True)
 if r.returncode != 0:
     err_clean = r.stderr.replace(GITHUB_TOKEN, "***") if GITHUB_TOKEN else r.stderr
     raise SystemExit(f"❌ Clone failed:\n{err_clean[:300]}")
 _log("OK", f"Cloned {REPO_NAME} → {BASE_DIR}")
 
-
 # ════════════════════════════════════════════════════════════════════════════
-# POST-CLONE PATCHES — applied every run after clone
-#
-# WHY: The git clone gets the latest GitHub commit. These patches fix bugs
-# that are structural (aria2p API misuse) and must be applied regardless
-# of what's in the repo.
-#
-# PATCH A — url_handler.py: _probe_magnet_file
-#   Root cause of the 30 MB bug:
-#   Old code used aria2p API with TWO separate magnet adds:
-#     dl  = api.add_magnet(magnet, {"bt-metadata-only": "true"})  ← metadata fetch
-#     dl2 = api.add_magnet(magnet, {"select-file": "1",
-#                                    "follow-torrent": "mem"})    ← file download
-#   With follow-torrent=mem, dl2 had no cached metadata → re-fetched trackers.
-#   aria2c fired is_complete=True after metadata phase (~30 MB) → loop broke.
-#   The actual file NEVER downloaded. PROBE_ENOUGH was irrelevant.
-#   Fix: smart_download uses aria2c subprocess which handles metadata
-#   transparently and waits for the real file to complete.
-#
-# PATCH B — stream_extractor.py: se_mag_cb action="file"
-#   Same broken aria2p pattern — same fix.
+# POST-CLONE FILE INJECTION + PATCHES
 # ════════════════════════════════════════════════════════════════════════════
 
 import re as _patch_re
 import ast as _patch_ast
 
-_log("STEP", "Applying post-clone patches…")
+_log("STEP", "Injecting critical service files…")
 
-# ── PATCH A: url_handler.py ───────────────────────────────────────────────
 
-_URL_HANDLER = os.path.join(BASE_DIR, "plugins", "url_handler.py")
-
-_NEW_PROBE_FUNC = '''async def _probe_magnet_file(magnet: str, uid: int, st) -> tuple:
-    """
-    Download complete magnet file then probe streams locally.
-    Uses smart_download (aria2c subprocess) — NOT aria2p API.
-
-    Root cause of 30 MB bug: aria2p 2-add pattern fires is_complete=True
-    after metadata phase (~30 MB), never downloading the actual file.
-    """
-    from services import ffmpeg as FF
-    from services.downloader import smart_download as _smart_dl
-    from services.utils import largest_file, all_video_files, make_tmp, cleanup, human_size
-
-    tmp = make_tmp(cfg.download_dir, uid)
-
-    await safe_edit(st,
-        "🧲 <b>Magnet — Downloading Complete File</b>\\n"
-        "──────────────────────\\n\\n"
-        "<i>Using aria2c subprocess for reliable full download.\\n"
-        "Stream analysis will be 100% accurate.</i>",
-        parse_mode=enums.ParseMode.HTML,
-    )
-
+def _write_file(rel_path: str, content: str, label: str) -> None:
+    full = os.path.join(BASE_DIR, rel_path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
     try:
-        path_or_dir = await _smart_dl(
-            magnet, tmp,
-            user_id=uid,
-            label="Magnet Probe",
-            msg=st,
-        )
+        _patch_ast.parse(content)
+    except SyntaxError as e:
+        _log("ERR", f"{label}: syntax error — {e}")
+        return
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(content)
+    _log("OK", f"✅ {rel_path} ({label})")
 
-        if os.path.isdir(path_or_dir):
-            path = largest_file(path_or_dir)
-            if not path:
-                files = all_video_files(path_or_dir, min_bytes=0)
-                path = files[0] if files else None
-        else:
-            path = path_or_dir
 
-        if not path or not os.path.isfile(path):
-            await safe_edit(st,
-                "❌ <b>No file found after download.</b>",
-                parse_mode=enums.ParseMode.HTML,
-            )
-            cleanup(tmp)
-            return None, None, {}
-
-        fname = os.path.basename(path)
-        fsize = os.path.getsize(path)
-
-        await safe_edit(st,
-            f"🔍 <b>Probing streams…</b>\\n\\n"
-            f"📄 <code>{fname[:50]}</code>\\n"
-            f"💾 <code>{human_size(fsize)}</code>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-
-        sd, dur = await asyncio.gather(
-            FF.probe_streams(path),
-            FF.probe_duration(path),
-        )
-        return path, tmp, {"streams": sd, "duration": dur, "fname": fname}
-
-    except Exception as exc:
-        import logging as _lg
-        _lg.getLogger(__name__).error("[MagnetProbe] %s", exc, exc_info=True)
-        await safe_edit(st,
-            f"❌ <b>Magnet download failed</b>\\n\\n<code>{str(exc)[:300]}</code>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-        cleanup(tmp)
-        return None, None, {}
-'''
-
-try:
-    with open(_URL_HANDLER, "r", encoding="utf-8") as _f:
-        _uh_src = _f.read()
-
-    # Replace the entire _probe_magnet_file function
-    # Pattern: from "async def _probe_magnet_file" to next top-level async def
-    _fn_pat = _patch_re.compile(
-        r"async def _probe_magnet_file\(.*?(?=\n(?:async def |def |class |# ─{10}))",
-        _patch_re.DOTALL,
-    )
-
-    if _fn_pat.search(_uh_src):
-        _uh_patched = _fn_pat.sub(_NEW_PROBE_FUNC.strip(), _uh_src, count=1)
-    else:
-        # Fallback: insert before _hardsub_magnet_dl
-        _marker = "\nasync def _hardsub_magnet_dl("
-        if _marker in _uh_src:
-            _uh_patched = _uh_src.replace(
-                _marker,
-                "\n\n" + _NEW_PROBE_FUNC.strip() + "\n" + _marker,
-                1,
-            )
-        else:
-            _uh_patched = _uh_src
-            _log("WARN", "PATCH A: _probe_magnet_file insertion point not found")
-
-    # Verify syntax before writing
+def _patch_file(rel_path: str, old: str, new: str, label: str) -> bool:
+    full = os.path.join(BASE_DIR, rel_path)
     try:
-        _patch_ast.parse(_uh_patched)
-        with open(_URL_HANDLER, "w", encoding="utf-8") as _f:
-            _f.write(_uh_patched)
-        _log("OK", "PATCH A: url_handler.py — _probe_magnet_file → smart_download ✅")
-    except SyntaxError as _se:
-        _log("ERR", f"PATCH A: syntax error, skipping — {_se}")
+        with open(full, "r", encoding="utf-8") as f:
+            src = f.read()
+    except FileNotFoundError:
+        _log("WARN", f"{label}: not found")
+        return False
+    if old not in src:
+        if new in src:
+            _log("INFO", f"{label}: already applied")
+            return True
+        _log("WARN", f"{label}: pattern not found")
+        return False
+    patched = src.replace(old, new, 1)
+    try:
+        _patch_ast.parse(patched)
+    except SyntaxError as e:
+        _log("ERR", f"{label}: syntax error — {e}")
+        return False
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(patched)
+    _log("OK", f"✅ {label}")
+    return True
 
-except Exception as _pe:
-    _log("ERR", f"PATCH A failed: {_pe}")
+
+# ── INJECT 1: services/fc_job_store.py ────────────────────────────────────
+_write_file("services/fc_job_store.py", """\
+from __future__ import annotations
+import asyncio, json, logging, os, time
+from dataclasses import asdict, dataclass, field
+from typing import Optional
+
+log = logging.getLogger(__name__)
+_STORE_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "data", "fc_jobs.json"))
+_JOB_TTL = 48 * 3600
 
 
-# ── PATCH B: stream_extractor.py se_mag_cb action="file" ─────────────────
+@dataclass
+class FCJob:
+    job_id: str; uid: int; fname: str; output_name: str
+    status: str = "processing"; job_type: str = "hardsub"
+    sub_fname: str = ""; api_key: str = ""
+    created_at: float = field(default_factory=time.time); error: str = ""
 
-_STREAM_EXT = os.path.join(BASE_DIR, "plugins", "stream_extractor.py")
 
-_NEW_SE_FILE_ACTION = '''        # PATCHED: use smart_download instead of broken aria2p select-file
-        # Old code: api.add_magnet + follow-torrent=mem → stops at 30 MB (metadata phase)
-        st = await cb.message.edit(
-            f"🧲 Downloading <code>{fname[:50]}</code>…\\n"
-            "<i>Full download — no 30 MB limit.</i>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-        tmp = make_tmp(cfg.download_dir, uid)
-        try:
-            from services.downloader import smart_download as _se_dl
-            _dl_path = await _se_dl(magnet, tmp, user_id=uid, label=fname, msg=st)
-            if os.path.isdir(_dl_path):
-                _resolved = largest_file(_dl_path)
-                if not _resolved:
-                    raise FileNotFoundError("No output file found in torrent download")
-                _dl_path = _resolved
-            elif not os.path.isfile(_dl_path):
-                raise FileNotFoundError("No output file found")
-        except Exception as exc:
-            cleanup(tmp)
-            return await safe_edit(st,
-                f"❌ Download failed: <code>{exc}</code>",
-                parse_mode=enums.ParseMode.HTML)
+class FCJobStore:
+    def __init__(self, path=_STORE_PATH):
+        self._path = path; self._jobs: dict[str, FCJob] = {}; self._lock = asyncio.Lock()
 
-        await upload_file(client, st, _dl_path)
-        cleanup(tmp)
-        return'''
-
-try:
-    with open(_STREAM_EXT, "r", encoding="utf-8") as _f:
-        _se_src = _f.read()
-
-    # Find the broken aria2p block inside se_mag_cb action=="file"
-    # It starts after the file_idx/fname lines and contains api.add_magnet
-    _broken_marker = 'api.add_magnet(magnet, options'
-    if _broken_marker in _se_src:
-        # Find the action=="file" block containing it
-        _block_pat = _patch_re.compile(
-            r'(        st\s+=\s+await cb\.message\.edit\(\s*\n'
-            r'.*?'
-            r'api\.add_magnet\(magnet.*?'
-            r'cleanup\(tmp\)\s*\n)',
-            _patch_re.DOTALL,
-        )
-        _se_patched = _block_pat.sub(_NEW_SE_FILE_ACTION + "\n", _se_src, count=1)
-        if _se_patched != _se_src:
+    async def load(self):
+        async with self._lock:
             try:
-                _patch_ast.parse(_se_patched)
-                with open(_STREAM_EXT, "w", encoding="utf-8") as _f:
-                    _f.write(_se_patched)
-                _log("OK", "PATCH B: stream_extractor.py — se_mag_cb file action → smart_download ✅")
-            except SyntaxError as _se2:
-                _log("WARN", f"PATCH B: syntax error after patch, skipping — {_se2}")
-        else:
-            _log("INFO", "PATCH B: stream_extractor.py — pattern not found, may already be patched")
+                with open(self._path, encoding="utf-8") as fh:
+                    self._jobs = {k: FCJob(**v) for k, v in json.load(fh).items()}
+                log.info("[FC-Store] Loaded %d job(s)", len(self._jobs))
+            except FileNotFoundError:
+                self._jobs = {}
+            except Exception as exc:
+                log.warning("[FC-Store] Load error: %s", exc); self._jobs = {}
+            now = time.time()
+            expired = [k for k, v in self._jobs.items() if v.created_at < now - _JOB_TTL]
+            for k in expired: del self._jobs[k]
+
+    async def _save(self):
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        try:
+            with open(self._path + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump({k: asdict(v) for k, v in self._jobs.items()}, fh, indent=2)
+            os.replace(self._path + ".tmp", self._path)
+        except Exception as exc:
+            log.error("[FC-Store] Save error: %s", exc)
+
+    async def add(self, job: FCJob):
+        async with self._lock: self._jobs[job.job_id] = job; await self._save()
+
+    async def get(self, job_id: str) -> Optional[FCJob]:
+        async with self._lock: return self._jobs.get(job_id)
+
+    async def update(self, job_id: str, **kw) -> Optional[FCJob]:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if not job: return None
+            [setattr(job, k, v) for k, v in kw.items() if hasattr(job, k)]
+            await self._save(); return job
+
+    async def remove(self, job_id: str):
+        async with self._lock:
+            if job_id in self._jobs: del self._jobs[job_id]; await self._save()
+
+    async def list_by_uid(self, uid: int) -> list[FCJob]:
+        async with self._lock:
+            return sorted([j for j in self._jobs.values() if j.uid == uid], key=lambda j: j.created_at, reverse=True)
+
+    async def list_processing(self) -> list[FCJob]:
+        async with self._lock: return [j for j in self._jobs.values() if j.status == "processing"]
+
+    async def count(self) -> int:
+        async with self._lock: return len(self._jobs)
+
+
+fc_job_store = FCJobStore()
+""", "fc_job_store.py (NEW)")
+
+
+# ── INJECT 2: plugins/fc_webhook.py ───────────────────────────────────────
+_write_file("plugins/fc_webhook.py", """\
+from __future__ import annotations
+import asyncio, logging, os
+from aiohttp import web
+from pyrogram import enums
+from services.fc_job_store import fc_job_store
+
+log = logging.getLogger(__name__)
+
+
+async def handle_fc_webhook(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        log.warning("[FC-WH] Bad JSON: %s", exc); return web.Response(status=400, text="bad json")
+    data = payload.get("data") or payload
+    job_id = data.get("id", ""); status = (data.get("status") or "").lower()
+    if not job_id: return web.Response(status=200, text="ok")
+    log.info("[FC-WH] job=%s status=%s", job_id, status)
+    asyncio.create_task(_process_webhook(job_id, status, data))
+    return web.Response(status=200, text="ok")
+
+
+async def _process_webhook(job_id, status, data):
+    job = await fc_job_store.get(job_id)
+    if not job: return
+    if status == "processing": return
+    if status in ("failed", "error", "cancelled"):
+        err = data.get("message") or f"Job {status}"
+        await fc_job_store.update(job_id, status="failed", error=err[:200])
+        await _notify_failure(job, err)
+    elif status == "completed":
+        await fc_job_store.update(job_id, status="completed")
+        await _handle_completion(job, data)
+
+
+async def _handle_completion(job, data):
+    from services.downloader import download_direct
+    from services.uploader import upload_file
+    from services.utils import cleanup, make_tmp, human_size
+    from core.config import cfg
+    url = _extract_url(data)
+    if not url:
+        await _notify_failure(job, "Completed but no output URL"); return
+    tmp = make_tmp(cfg.download_dir, job.uid)
+    try:
+        path = await download_direct(url, tmp)
+        fname = job.output_name or os.path.basename(path)
+        if os.path.basename(path) != fname:
+            try: os.rename(path, os.path.join(tmp, fname)); path = os.path.join(tmp, fname)
+            except OSError: pass
+        client = _get_client()
+        if client:
+            lbl = {"hardsub":"🔥 Hardsub","convert":"🔄 Convert","compress":"📐 Compress"}.get(job.job_type,"✅")
+            st = await _fw_send(client, job.uid,
+                f"{lbl} <b>done!</b>\\n<code>{job.fname[:42]}</code>\\n"
+                f"<code>{human_size(os.path.getsize(path))}</code>\\n⬆️ Uploading…")
+            await upload_file(client, st, path, user_id=job.uid)
+    except Exception as exc:
+        log.error("[FC-WH] %s", exc)
+        await _notify_failure(job, str(exc)[:200])
+    finally:
+        cleanup(tmp)
+    await fc_job_store.remove(job.job_id)
+
+
+async def _notify_failure(job, msg):
+    client = _get_client()
+    if client:
+        try:
+            await _fw_send(client, job.uid,
+                f"❌ <b>FreeConvert failed</b>\\n<code>{job.fname[:42]}</code>\\n<code>{msg[:300]}</code>")
+        except Exception: pass
+
+
+def _extract_url(data):
+    for task in (data.get("tasks") or []):
+        op = (task.get("operation") or task.get("name") or "").lower()
+        if "export" in op and (task.get("status") or "").lower() == "completed":
+            result = task.get("result") or {}
+            for key in ("files","output","outputs"):
+                files = result.get(key) or []
+                if isinstance(files, list) and files: return files[0].get("url","")
+    return ""
+
+
+def _get_client():
+    try:
+        from core.session import get_client; return get_client()
+    except Exception: return None
+
+
+async def _fw_send(client, uid, text, retries=5):
+    from pyrogram.errors import FloodWait
+    for i in range(retries):
+        try:
+            return await client.send_message(uid, text, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True)
+        except FloodWait as fw:
+            if i < retries-1: await asyncio.sleep(min(fw.value+2, 90))
+            else: raise
+        except Exception: raise
+
+
+async def startup_load():
+    await fc_job_store.load()
+    _log_count = await fc_job_store.count()
+    log.info("[FC-WH] Store ready — %d job(s)", _log_count)
+""", "fc_webhook.py (NEW)")
+
+
+# ── INJECT 3: services/webhook_sync.py ────────────────────────────────────
+_write_file("services/webhook_sync.py", """\
+\"\"\"
+services/webhook_sync.py
+BUG-WS-04 FIX: cc_path default was /webhook, correct is /webhook/cloudconvert
+BUG-WS-01 FIX: active_jobs() is sync — no await
+BUG-WS-02 FIX: import from services.cloudconvert_hook
+BUG-WS-03 FIX: status=error not failed
+\"\"\"
+from __future__ import annotations
+import asyncio, logging, os
+log = logging.getLogger(__name__)
+
+
+async def on_tunnel_ready(tunnel_url: str, *, notify_uid=None, cc_path="/webhook/cloudconvert") -> dict:
+    if not tunnel_url: return {"tunnel": "", "cc": []}
+    tunnel_url = tunnel_url.rstrip("/")
+    log.info("[WH-Sync] Syncing CC → %s%s", tunnel_url, cc_path)
+    from services.cc_webhook_mgr import sync_cc_webhooks
+    cc_results = await sync_cc_webhooks(tunnel_url, webhook_path=cc_path)
+    try:
+        from core.config import set_tunnel_url; set_tunnel_url(tunnel_url)
+    except Exception: pass
+    uid = notify_uid or _admin_uid()
+    if uid: asyncio.create_task(_notify(uid, tunnel_url, cc_results, cc_path))
+    return {"tunnel": tunnel_url, "cc": cc_results}
+
+
+async def on_tunnel_reconnected(new_url): await on_tunnel_ready(new_url)
+
+
+async def poll_pending_jobs():
+    await asyncio.gather(_poll_cc(), _poll_fc(), return_exceptions=True)
+
+
+async def _poll_cc():
+    try:
+        from services.cc_job_store import cc_job_store
+        pending = cc_job_store.active_jobs()   # BUG-WS-01: sync, no await
+        if not pending: return
+        import aiohttp as _ah
+        api_key = os.environ.get("CC_API_KEY","").strip()
+        if not api_key: return
+        for job in pending:
+            try:
+                async with _ah.ClientSession(timeout=_ah.ClientTimeout(total=10)) as s:
+                    async with s.get(f"https://api.cloudconvert.com/v2/jobs/{job.job_id}",
+                                     headers={"Authorization": f"Bearer {api_key}"}) as r:
+                        data = await r.json()
+                jdata = data.get("data") or data
+                status = jdata.get("status","")
+                if status == "finished":
+                    from services.cloudconvert_hook import _handle_cc_job  # BUG-WS-02
+                    await _handle_cc_job(job.job_id, jdata, api_key)
+                elif status == "error":
+                    await cc_job_store.update(job.job_id, status="error")  # BUG-WS-03
+            except Exception as exc:
+                log.warning("[WH-Sync] CC poll %s: %s", job.job_id, exc)
+    except Exception as exc:
+        log.error("[WH-Sync] _poll_cc: %s", exc)
+
+
+async def _poll_fc():
+    try:
+        from services.fc_job_store import fc_job_store
+        pending = await fc_job_store.list_processing()
+        if not pending: return
+        import aiohttp as _ah
+        for job in pending:
+            api_key = job.api_key or os.environ.get("FC_API_KEY","").strip()
+            if not api_key: continue
+            try:
+                async with _ah.ClientSession(timeout=_ah.ClientTimeout(total=15)) as s:
+                    async with s.get(f"https://api.freeconvert.com/v1/process/jobs/{job.job_id}",
+                                     headers={"Authorization": f"Bearer {api_key}"}) as r:
+                        data = await r.json()
+                status = (data.get("data") or data).get("status","").lower()
+                jdata  = (data.get("data") or data)
+                if status == "completed":
+                    from plugins.fc_webhook import _handle_completion
+                    await _handle_completion(job, jdata)
+                elif status in ("failed","error","cancelled"):
+                    await fc_job_store.update(job.job_id, status="failed",
+                                              error=jdata.get("message",status)[:200])
+            except Exception as exc:
+                log.warning("[WH-Sync] FC poll %s: %s", job.job_id, exc)
+    except Exception as exc:
+        log.error("[WH-Sync] _poll_fc: %s", exc)
+
+
+def _admin_uid():
+    try: return int(os.environ.get("ADMIN_ID","")) or None
+    except: return None
+
+
+async def _notify(uid, tunnel_url, cc, cc_path):
+    try:
+        from core.session import get_client
+        from pyrogram import enums
+        lines = []
+        for r in cc:
+            tail=r.get("key_tail","?"); d=r.get("deleted",0); reg=r.get("registered"); err=r.get("error","")
+            lines.append(f"  {tail}  {'❌ '+err[:50] if err else str(d)+' deleted · ✅ '+str(reg)[:12]}")
+        text = (f"✅ <b>Webhook sync</b>\\n🔗 <code>{tunnel_url}{cc_path}</code>\\n\\n"
+                f"☁️ CC:\\n" + (chr(10).join(lines) or "  (no CC keys)") +
+                "\\n\\n🆓 FC: per-job ✅")
+        await (await get_client().__class__).send_message  # just import test
+        client = get_client()
+        await client.send_message(uid, text, parse_mode=enums.ParseMode.HTML, disable_web_page_preview=True)
+    except Exception: pass
+""", "webhook_sync.py (all BUG-WS fixes)")
+
+
+# ── PATCH: services/downloader.py — PanelUpdater interval ─────────────────
+_patch_file("services/downloader.py",
+    "_updater = PanelUpdater(msg, _build_dl_panel, interval=1.0)",
+    "_updater = PanelUpdater(msg, _build_dl_panel, interval=5.0)",
+    "BUG-UH-04: downloader interval 1→5s")
+
+# ── PATCH: services/tg_download.py — PanelUpdater interval ────────────────
+_patch_file("services/tg_download.py",
+    "async with PanelUpdater(msg, _build, interval=1.0) as pu:",
+    "async with PanelUpdater(msg, _build, interval=3.0) as pu:",
+    "BUG-UH-04: tg_download interval 1→3s")
+
+# ── PATCH: cloudconvert_hook.py — BUG-12 signature prefix ─────────────────
+_patch_file("services/cloudconvert_hook.py",
+    "    return hmac.compare_digest(expected, signature)",
+    "    sig_hex = signature.removeprefix('sha256=')\n    return hmac.compare_digest(expected, sig_hex)",
+    "BUG-12: signature sha256= prefix strip")
+
+# ── PATCH: cloudconvert_hook.py — BUG-01 download_direct ──────────────────
+_patch_file("services/cloudconvert_hook.py",
+    "    from services.downloader import smart_download\n",
+    "    from services.downloader import download_direct  # BUG-01\n",
+    "BUG-01a: import download_direct")
+_patch_file("services/cloudconvert_hook.py",
+    "        path = await smart_download(url, tmp)\n",
+    "        path = await download_direct(url, tmp)\n",
+    "BUG-01b: call download_direct")
+
+# ── PATCH: services/webhook_sync.py cc_path (defensive, if inject missed) ─
+_patch_file("services/webhook_sync.py",
+    'cc_path:    str        = "/webhook"',
+    'cc_path:    str        = "/webhook/cloudconvert"',
+    "BUG-WS-04: cc_path defensive")
+_patch_file("services/webhook_sync.py",
+    'cc_path="/webhook"',
+    'cc_path="/webhook/cloudconvert"',
+    "BUG-WS-04: cc_path call-site defensive")
+
+# ── PATCH: plugins/video.py _IGNORED ─────────────────────────────────────
+_patch_file("plugins/video.py",
+    '"nyaa_add","nyaa_list","nyaa_remove","nyaa_check",\n    "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit",\n}',
+    '"nyaa_add","nyaa_list","nyaa_remove","nyaa_check",\n    "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit",\n    "resize","compress","hardsub","botname","ccstatus","convert",\n    "captiontemplate","usage","allow","deny","allowed","cancel",\n}',
+    "BUG-07: video.py _IGNORED")
+
+# ── PATCH: freeconvert_api.py FC-01/02 (fabricated options) ───────────────
+_fc_api_path = os.path.join(BASE_DIR, "services", "freeconvert_api.py")
+if os.path.exists(_fc_api_path):
+    with open(_fc_api_path) as _f: _fc_src = _f.read()
+    _bad = "'subtitle_task'" in _fc_src or '"subtitle_task"' in _fc_src
+    if _bad:
+        # Replace "input" → "depends_on" throughout
+        _fc_fixed = (_fc_src
+            .replace('"input":         "import-file"',    '"depends_on":    ["import-file"]')
+            .replace('"input":     "import-file"',        '"depends_on": ["import-file"]')
+            .replace('"input":     ["convert-file"]',     '"depends_on": ["convert-file"]')
+            .replace('"input":     ["compress-file"]',    '"depends_on": ["compress-file"]')
+            .replace('"input":     ["hardsub"]',          '"depends_on": ["hardsub"]')
+            .replace("'subtitle_task': 'import-subtitle',", "# FC-01 REMOVED subtitle_task")
+            .replace('"subtitle_task": "import-subtitle",', "# FC-01 REMOVED subtitle_task")
+            .replace("'subtitle_burn': True,", "# FC-01 REMOVED subtitle_burn")
+            .replace('"subtitle_burn": True,', "# FC-01 REMOVED subtitle_burn")
+        )
+        try:
+            _patch_ast.parse(_fc_fixed)
+            with open(_fc_api_path, "w") as _f: _f.write(_fc_fixed)
+            _log("OK", "✅ freeconvert_api.py FC-01/02 patched")
+        except SyntaxError as e:
+            _log("WARN", f"freeconvert_api.py patch failed: {e}")
     else:
-        _log("INFO", "PATCH B: stream_extractor.py — no aria2p pattern found (already patched or different version)")
+        _log("INFO", "freeconvert_api.py FC-01/02 already clean")
 
-except Exception as _pe:
-    _log("ERR", f"PATCH B failed: {_pe}")
-
-
-_log("OK", "Post-clone patches complete ✅")
-# ════════════════════════════════════════════════════════════════════════════
+_log("OK", "All injections and patches complete ✅")
 
 
 # ── Python packages ───────────────────────────────────────────────────────
 _log("STEP", "Installing Python packages…")
-subprocess.run(
-    [sys.executable, "-m", "pip", "uninstall", "-q", "-y", "pyrogram"],
-    capture_output=True,
-)
-subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q", "-r", f"{BASE_DIR}/requirements.txt"],
-    check=True,
-)
+subprocess.run([sys.executable, "-m", "pip", "uninstall", "-q", "-y", "pyrogram"], capture_output=True)
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{BASE_DIR}/requirements.txt"], check=True)
 _log("OK", "Python packages installed")
 
 # ── aria2c daemon ─────────────────────────────────────────────────────────
 _log("STEP", "Starting aria2c daemon…")
-subprocess.Popen(
-    "aria2c --enable-rpc --rpc-listen-all=true --rpc-allow-origin-all "
-    "--max-connection-per-server=16 --split=16 --seed-time=0 --daemon 2>/dev/null",
-    shell=True,
-)
+subprocess.Popen("aria2c --enable-rpc --rpc-listen-all=true --rpc-allow-origin-all "
+                 "--max-connection-per-server=16 --split=16 --seed-time=0 --daemon 2>/dev/null",
+                 shell=True)
 time.sleep(2)
 _log("OK", "aria2c started")
 
 # ── Write .env ────────────────────────────────────────────────────────────
 env_lines = [
-    f"API_ID={API_ID}",
-    f"API_HASH={API_HASH}",
-    f"BOT_TOKEN={BOT_TOKEN}",
-    f"OWNER_ID={OWNER_ID}",
-    f"FILE_LIMIT_MB={FILE_LIMIT_MB}",
-    f"LOG_CHANNEL={LOG_CHANNEL}",
-    "DOWNLOAD_DIR=/tmp/zilong_dl",
-    "ARIA2_HOST=http://localhost",
-    "ARIA2_PORT=6800",
-    "ARIA2_SECRET=",
-    f"NGROK_TOKEN={NGROK_TOKEN}",
-    f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
+    f"API_ID={API_ID}", f"API_HASH={API_HASH}", f"BOT_TOKEN={BOT_TOKEN}", f"OWNER_ID={OWNER_ID}",
+    f"FILE_LIMIT_MB={FILE_LIMIT_MB}", f"LOG_CHANNEL={LOG_CHANNEL}",
+    "DOWNLOAD_DIR=/tmp/zilong_dl", "ARIA2_HOST=http://localhost", "ARIA2_PORT=6800", "ARIA2_SECRET=",
+    f"NGROK_TOKEN={NGROK_TOKEN}", f"CC_WEBHOOK_SECRET={CC_WEBHOOK_SECRET}",
     f"CC_API_KEY={CC_API_KEY}",
-    f"SEEDR_USERNAME={SEEDR_USERNAME}",
-    f"SEEDR_PASSWORD={SEEDR_PASSWORD}",
+    f"FC_API_KEY={FC_API_KEY}",   # FIX: was missing — FC features silently disabled without this
+    f"SEEDR_USERNAME={SEEDR_USERNAME}", f"SEEDR_PASSWORD={SEEDR_PASSWORD}",
     f"WEBHOOK_BASE_URL={WEBHOOK_BASE_URL}",
 ]
-for optional in ("ADMINS", "GDRIVE_SA_JSON"):
-    val = _secret(optional)
-    if val:
-        env_lines.append(f"{optional}={val}")
+for opt in ("ADMINS", "GDRIVE_SA_JSON"):
+    val = _secret(opt)
+    if val: env_lines.append(f"{opt}={val}")
 
 with open(f"{BASE_DIR}/.env", "w") as f:
     f.write("\n".join(env_lines))
+_log("OK", f".env written (CC_API_KEY={'set' if CC_API_KEY else 'empty'}, FC_API_KEY={'set' if FC_API_KEY else 'empty'})")
 
 for sf in glob.glob(os.path.join(BASE_DIR, "*.session*")):
-    try:
-        os.remove(sf)
-    except OSError:
-        pass
-
-_log("OK", "Environment configured (.env written)")
+    try: os.remove(sf)
+    except OSError: pass
 
 os.chdir(BASE_DIR)
 
 # ── Colab keep-alive ──────────────────────────────────────────────────────
-_log("STEP", "Activating Colab keep-alive…")
 try:
     from IPython.display import display, Javascript
     display(Javascript("""
-    function ColabKeepAlive() {
+    setInterval(function(){
         document.querySelector("#top-toolbar .colab-connect-button")?.click();
-        document.querySelector("colab-connect-button")?.shadowRoot
-            ?.querySelector("#connect")?.click();
+        document.querySelector("colab-connect-button")?.shadowRoot?.querySelector("#connect")?.click();
         document.querySelector("#ok")?.click();
-    }
-    setInterval(ColabKeepAlive, 60000);
-    console.log("Colab keep-alive: clicking connect every 60s");
+    }, 60000);
     """))
-    _log("OK", "JS keep-alive injected (clicks connect every 60s)")
+    _log("OK", "JS keep-alive injected")
 except Exception:
-    _log("WARN", "Not in Colab notebook — JS keep-alive skipped")
+    _log("WARN", "Not in Colab — JS keep-alive skipped")
 
+threading.Thread(target=lambda: [time.sleep(300) or print(f"\r[{datetime.now().strftime('%H:%M')}] 💓", end="", flush=True) for _ in iter(int, 1)], daemon=True).start()
 
-def _heartbeat() -> None:
-    while True:
-        time.sleep(300)
-        print(f"\r[{datetime.now().strftime('%H:%M')}] 💓", end="", flush=True)
-
-
-threading.Thread(target=_heartbeat, daemon=True).start()
-_log("OK", "Heartbeat thread started (every 5 min)")
-
-# ── Kill any stale bot instances before starting ──────────────────────────
-_log("STEP", "Checking for stale bot instances…")
+# ── Kill stale PID ────────────────────────────────────────────────────────
 _PID_FILE = "/tmp/zilong_bot.pid"
 try:
     if os.path.exists(_PID_FILE):
         _old_pid = int(open(_PID_FILE).read().strip())
         try:
-            import signal
-            os.kill(_old_pid, signal.SIGTERM)
-            time.sleep(2)
-            try:
-                os.kill(_old_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            _log("WARN", f"Killed stale bot process (PID {_old_pid})")
-        except ProcessLookupError:
-            pass
+            import signal; os.kill(_old_pid, signal.SIGTERM); time.sleep(2)
+            try: os.kill(_old_pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+        except ProcessLookupError: pass
         os.remove(_PID_FILE)
-except Exception as _ke:
-    _log("WARN", f"Could not clean up stale PID: {_ke}")
+except Exception: pass
 
-# ── Open public tunnel for CloudConvert webhook (port 8765) ──────────────
+# ── Tunnel ────────────────────────────────────────────────────────────────
 import re as _re2
-
 _tunnel_proc = None
 _TUNNEL_TIMEOUT = 30
 
 
-def _install_cloudflared() -> bool:
-    if subprocess.run(["which", "cloudflared"], capture_output=True).returncode == 0:
-        return True
-    _log("INFO", "Installing cloudflared…")
-    r = subprocess.run(
-        "curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest"
-        "/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared"
-        " && chmod +x /usr/local/bin/cloudflared",
-        shell=True, capture_output=True,
-    )
+def _install_cloudflared():
+    if subprocess.run(["which","cloudflared"], capture_output=True).returncode == 0: return True
+    r = subprocess.run("curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared", shell=True, capture_output=True)
     return r.returncode == 0
 
 
-def _open_cloudflare_tunnel() -> str:
+def _open_cf():
     global _tunnel_proc
-    if not _install_cloudflared():
-        _log("WARN", "cloudflared install failed")
-        return ""
+    if not _install_cloudflared(): return ""
     try:
-        proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", "http://localhost:8765", "--no-autoupdate"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
+        proc = subprocess.Popen(["cloudflared","tunnel","--url","http://localhost:8765","--no-autoupdate"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         _tunnel_proc = proc
         deadline = time.time() + _TUNNEL_TIMEOUT
         for line in proc.stdout:
-            _log("INFO", f"[cloudflared] {line.rstrip()}")
             m = _re2.search(r"(https://[a-z0-9\-]+\.trycloudflare\.com)", line)
-            if m:
-                url = m.group(1).rstrip("/")
-                _log("OK", f"Cloudflare tunnel active: {url}")
-                return url
-            if time.time() > deadline:
-                break
-        _log("WARN", f"cloudflared timed out after {_TUNNEL_TIMEOUT}s")
+            if m: url = m.group(1).rstrip("/"); _log("OK", f"Cloudflare tunnel: {url}"); return url
+            if time.time() > deadline: break
         return ""
     except Exception as exc:
-        _log("WARN", f"cloudflared error: {exc}")
-        return ""
+        _log("WARN", f"cloudflared: {exc}"); return ""
 
 
-def _open_ngrok_tunnel() -> str:
+def _open_ngrok():
     global _tunnel_proc
-    if not NGROK_TOKEN:
-        return ""
+    if not NGROK_TOKEN: return ""
     try:
-        from pyngrok import ngrok as _ngrok, conf as _conf
+        from pyngrok import ngrok as _ng, conf as _conf
         _conf.get_default().auth_token = NGROK_TOKEN
-        tunnel = _ngrok.connect(8765, "http")
-        url = tunnel.public_url
-        if url.startswith("http://"):
-            url = "https://" + url[7:]
-        _log("OK", f"ngrok tunnel (pyngrok) active: {url}")
-        return url.rstrip("/")
-    except ImportError:
-        _log("INFO", "pyngrok not installed — trying ngrok CLI")
-    except Exception as exc:
-        _log("WARN", f"pyngrok failed: {exc} — trying ngrok CLI")
+        t = _ng.connect(8765, "http"); url = t.public_url
+        if url.startswith("http://"): url = "https://" + url[7:]
+        _log("OK", f"ngrok: {url}"); return url.rstrip("/")
+    except Exception: pass
     try:
-        proc = subprocess.Popen(
-            ["ngrok", "http", "8765", "--log=stdout", f"--authtoken={NGROK_TOKEN}"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        _tunnel_proc = proc
-        deadline = time.time() + _TUNNEL_TIMEOUT
+        proc = subprocess.Popen(["ngrok","http","8765","--log=stdout",f"--authtoken={NGROK_TOKEN}"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        _tunnel_proc = proc; deadline = time.time() + _TUNNEL_TIMEOUT
         for line in proc.stdout:
-            _log("INFO", f"[ngrok] {line.rstrip()}")
             m = _re2.search(r"(https://[a-z0-9\-]+\.ngrok[\-a-z\.io]+)", line)
-            if m:
-                url = m.group(1).rstrip("/")
-                _log("OK", f"ngrok tunnel (CLI) active: {url}")
-                return url
-            if time.time() > deadline:
-                break
-        _log("WARN", f"ngrok CLI timed out after {_TUNNEL_TIMEOUT}s")
+            if m: url = m.group(1).rstrip("/"); _log("OK", f"ngrok CLI: {url}"); return url
+            if time.time() > deadline: break
         return ""
-    except FileNotFoundError:
-        _log("WARN", "ngrok CLI not found")
-        return ""
-    except Exception as exc:
-        _log("WARN", f"ngrok CLI error: {exc}")
-        return ""
+    except Exception: return ""
 
 
-def _tunnel_watchdog() -> None:
+def _watchdog():
     global _tunnel_proc
     while True:
         time.sleep(20)
         proc = _tunnel_proc
         if proc is None or proc.poll() is not None:
             _log("WARN", "[Tunnel] Dropped — reconnecting…")
-            url = _open_cloudflare_tunnel() or (NGROK_TOKEN and _open_ngrok_tunnel()) or ""
-            if url:
-                _log("OK", f"[Tunnel] Restored: {url}")
-            else:
-                _log("WARN", "[Tunnel] Reconnect failed — will retry in 20s")
+            url = _open_cf() or (NGROK_TOKEN and _open_ngrok()) or ""
+            if url: _log("OK", f"[Tunnel] Restored: {url}")
 
 
-if CC_API_KEY and not WEBHOOK_BASE_URL:
-    _log("STEP", "Opening Cloudflare tunnel for CloudConvert webhook (port 8765)…")
-    WEBHOOK_BASE_URL = _open_cloudflare_tunnel()
-
+_has_any_key = bool(CC_API_KEY or FC_API_KEY)
+if _has_any_key and not WEBHOOK_BASE_URL:
+    _log("STEP", "Opening Cloudflare tunnel (port 8765)…")
+    WEBHOOK_BASE_URL = _open_cf()
     if not WEBHOOK_BASE_URL and NGROK_TOKEN:
         _log("STEP", "Cloudflare unavailable — trying ngrok…")
-        WEBHOOK_BASE_URL = _open_ngrok_tunnel()
-
+        WEBHOOK_BASE_URL = _open_ngrok()
     if WEBHOOK_BASE_URL:
-        _log("OK", f"Webhook tunnel active: {WEBHOOK_BASE_URL}/webhook/cloudconvert")
-        env_lines = [
-            ln if not ln.startswith("WEBHOOK_BASE_URL=") else f"WEBHOOK_BASE_URL={WEBHOOK_BASE_URL}"
-            for ln in env_lines
-        ]
-        with open(f"{BASE_DIR}/.env", "w") as _f:
-            _f.write("\n".join(env_lines))
-        threading.Thread(target=_tunnel_watchdog, daemon=True, name="tunnel-watchdog").start()
-        _log("OK", "Tunnel watchdog started (auto-reconnects on drop)")
+        _log("OK", f"Tunnel active: {WEBHOOK_BASE_URL}")
+        env_lines = [ln if not ln.startswith("WEBHOOK_BASE_URL=") else f"WEBHOOK_BASE_URL={WEBHOOK_BASE_URL}" for ln in env_lines]
+        with open(f"{BASE_DIR}/.env","w") as _f: _f.write("\n".join(env_lines))
+        threading.Thread(target=_watchdog, daemon=True, name="tunnel-watchdog").start()
     else:
-        _log("WARN", "No tunnel available — webhook localhost-only (ccstatus poller active).")
+        _log("WARN", "No tunnel — poller compensates")
 elif WEBHOOK_BASE_URL:
-    _log("OK", f"Using provided WEBHOOK_BASE_URL: {WEBHOOK_BASE_URL}")
+    _log("OK", f"Using WEBHOOK_BASE_URL: {WEBHOOK_BASE_URL}")
 
 # ── Bot restart loop ──────────────────────────────────────────────────────
-_log("OK", "Starting bot…\n" + "─" * 50)
+_log("OK", "Starting bot…\n" + "─"*50)
 
-MAX_RESTARTS  = 50
-restart_count = 0
-
+MAX_RESTARTS = 50; restart_count = 0
 _bot_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
 for line in env_lines:
     if "=" in line and not line.startswith("#"):
-        k, _, v = line.partition("=")
-        _bot_env[k] = v
+        k, _, v = line.partition("="); _bot_env[k] = v
 
 import re as _re
-_FLOOD_RE = _re.compile(
-    r"(?:FLOOD_WAIT_SECONDS=(\d+)"
-    r"|A wait of (\d+) seconds is required"
-    r")"
-)
+_FLOOD_RE = _re.compile(r"(?:FLOOD_WAIT_SECONDS=(\d+)|A wait of (\d+) seconds is required)")
 
-def _parse_flood_wait(output_lines: list) -> int:
-    for ln in reversed(output_lines):
+def _parse_flood(lines):
+    for ln in reversed(lines):
         m = _FLOOD_RE.search(ln)
-        if m:
-            return int(m.group(1) or m.group(2))
+        if m: return int(m.group(1) or m.group(2))
     return 0
-
 
 while restart_count < MAX_RESTARTS:
     t_start = datetime.now()
-    proc = subprocess.Popen(
-        [sys.executable, "-u", "main.py"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
-        env=_bot_env,
-    )
-
-    captured_lines: list = []
+    proc = subprocess.Popen([sys.executable,"-u","main.py"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=_bot_env)
+    captured = []
     for line in proc.stdout:
-        print(line, end="", flush=True)
-        captured_lines.append(line)
+        print(line, end="", flush=True); captured.append(line)
     proc.wait()
-
-    try:
-        proc.kill()
-    except Exception:
-        pass
-
-    elapsed = (datetime.now() - t_start).seconds
-    if proc.returncode == 0:
-        _log("OK", "Bot stopped cleanly.")
-        break
-
-    if elapsed > 300:
-        restart_count = 0
-
+    try: proc.kill()
+    except Exception: pass
+    elapsed = (datetime.now()-t_start).seconds
+    if proc.returncode == 0: _log("OK","Bot stopped cleanly."); break
+    if elapsed > 300: restart_count = 0
     restart_count += 1
-    _log("WARN", f"Crashed (exit={proc.returncode}) after {elapsed}s  [{restart_count}/{MAX_RESTARTS}]")
-    if restart_count >= MAX_RESTARTS:
-        _log("ERR", "Too many restarts — stopping.")
-        break
-
-    flood_wait = _parse_flood_wait(captured_lines)
-    if flood_wait > 0:
-        _log("WARN", f"FloodWait detected — waiting {flood_wait + 5}s before restart…")
-        time.sleep(flood_wait + 5)
+    _log("WARN", f"Crashed (exit={proc.returncode}) after {elapsed}s [{restart_count}/{MAX_RESTARTS}]")
+    if restart_count >= MAX_RESTARTS: _log("ERR","Too many restarts."); break
+    fw = _parse_flood(captured)
+    if fw > 0: _log("WARN",f"FloodWait {fw+5}s"); time.sleep(fw+5)
     else:
-        wait = min(5 * restart_count, 30)
-        _log("WARN", f"Restarting in {wait}s…")
-        time.sleep(wait)
+        wait = min(5*restart_count, 30); _log("WARN",f"Restarting in {wait}s…"); time.sleep(wait)
