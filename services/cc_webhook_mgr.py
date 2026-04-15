@@ -176,7 +176,7 @@ async def _sync_one_key(api_key: str, new_webhook_url: str) -> dict:
 async def sync_cc_webhooks(
     tunnel_base_url:  str,
     api_keys:         Optional[list[str]] = None,
-    webhook_path:     str = "/webhook",
+    webhook_path:     str = "/webhook/cloudconvert",
 ) -> list[dict]:
     """
     Clean up all stale CloudConvert webhook subscriptions and register

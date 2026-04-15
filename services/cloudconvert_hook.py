@@ -203,6 +203,13 @@ def _build_app() -> web.Application:
     app.router.add_post("/webhook/cloudconvert", handle_cloudconvert)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/", handle_health)
+    # FreeConvert per-job webhooks
+    try:
+        from plugins.fc_webhook import handle_fc_webhook
+        app.router.add_post("/fc-webhook", handle_fc_webhook)
+        log.info("[CC-Hook] /fc-webhook route registered")
+    except Exception as _e:
+        log.warning("[CC-Hook] Could not register /fc-webhook route: %s", _e)
     return app
 
 
@@ -415,6 +422,22 @@ async def _open_ngrok_tunnel(port: int, token: str) -> str:
         return ""
 
 
+async def _handle_cc_job(job_id: str, data: dict, api_key: str) -> None:
+    """
+    Recovery entry-point used by webhook_sync.poll_pending_jobs().
+    Called when a CC job completed while the bot was offline (no webhook delivery).
+    Mirrors the logic in handle_cloudconvert but operates on an already-fetched dict.
+    """
+    from core.config import cfg
+    files = _extract_urls(data)
+    if not files:
+        log.warning("[CC-Hook] _handle_cc_job: no export URLs in job %s", job_id)
+        return
+    log.info("[CC-Hook] Recovering offline CC job %s — %d file(s)", job_id, len(files))
+    for f in files:
+        asyncio.create_task(_process_file(f["url"], f["filename"], cfg.owner_id))
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 async def start_webhook_server(port: int = LISTEN_PORT) -> str:
@@ -440,6 +463,12 @@ async def start_webhook_server(port: int = LISTEN_PORT) -> str:
     if preset_url:
         webhook_url = f"{preset_url}/webhook/cloudconvert"
         log.info("[CC-Hook] Using preset WEBHOOK_BASE_URL: %s", webhook_url)
+        # Store tunnel base URL so FC jobs can build /fc-webhook URLs
+        try:
+            from core.config import set_tunnel_url
+            set_tunnel_url(preset_url)
+        except Exception:
+            pass
         if api_key:
             await _register_webhook_all_keys(webhook_url, api_key, WEBHOOK_SECRET)
         return webhook_url
@@ -461,6 +490,13 @@ async def start_webhook_server(port: int = LISTEN_PORT) -> str:
         return f"http://localhost:{port}/webhook/cloudconvert"
 
     webhook_url = f"{public_url}/webhook/cloudconvert"
+
+    # Store base URL so FC jobs can build /fc-webhook callback URLs
+    try:
+        from core.config import set_tunnel_url
+        set_tunnel_url(public_url)
+    except Exception:
+        pass
 
     # 5. Auto-register with ALL CloudConvert accounts
     reg_status = "⚠️ No CC_API_KEY — cannot auto-register webhook"
