@@ -1,12 +1,11 @@
 """
 services/tg_download.py
-Download a Telegram file with non-blocking 1s progress panel.
+Download a Telegram file with non-blocking progress panel.
 
-REWRITE:
-  - PanelUpdater decouples Telegram edits from Pyrogram's progress callback.
-  - Progress callback is now O(1) non-blocking: just ticks shared state.
-  - Background task edits the panel every 1 s.
-  - FloodWaits handled in PanelUpdater, never block the download.
+FIX BUG-UH-04: PanelUpdater interval raised from 1.0 s → 3.0 s.
+  A 1 s edit rate against a multi-hour download accumulates thousands of
+  Telegram API calls, saturating the per-method FloodWait budget.
+  3 s still gives a responsive UI while reducing API pressure by 3×.
 """
 from __future__ import annotations
 
@@ -54,7 +53,8 @@ async def tg_download(
             style      = panel_style,
         )
 
-    async with PanelUpdater(msg, _build, interval=1.0) as pu:
+    # FIX BUG-UH-04: interval raised from 1.0 → 3.0 to reduce FloodWait pressure.
+    async with PanelUpdater(msg, _build, interval=3.0) as pu:
 
         async def _prog(current: int, total: int) -> None:
             elapsed = time.time() - start

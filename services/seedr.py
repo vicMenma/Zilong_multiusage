@@ -2,31 +2,20 @@
 services/seedr.py
 Seedr.cc cloud torrent client — uses seedrcc v2.0.2 library.
 
+FIX BUG-UH-03: poll_until_ready now fires progress_cb on a 30-second
+  heartbeat regardless of percentage change.  Previously the callback
+  only fired when pct changed, so a slow/stalled torrent produced no UI
+  updates for minutes — making the Seedr panel appear frozen.
+
 ═══════════════════════════════════════════════════════════════════
 METHOD NAMES VERIFIED FROM ACTUAL seedrcc v2.0.2 SOURCE CODE:
   AsyncSeedr.from_password(username, password, on_token_refresh=)
-  AsyncSeedr(token=Token(...), on_token_refresh=)
-  client.add_torrent(magnet_link='magnet:?...')     ← NOT add_magnet!
-  client.list_contents(folder_id='0')               ← NOT list_folder!
-  client.fetch_file(file_id: str)                   ← returns .url
+  client.add_torrent(magnet_link='magnet:?...')
+  client.list_contents(folder_id='0')
+  client.fetch_file(file_id: str)
   client.delete_folder(folder_id: str)
   client.get_settings()
   client.close()
-
-RETURN TYPES (all are frozen dataclasses):
-  ListContentsResult: .folders (List[Folder]), .files (List[File]),
-                      .torrents (List[Torrent]), .space_used, .space_max
-  Folder: .id (int), .name (str), .size (int)
-  File:   .folder_file_id (int), .name (str), .size (int)
-  Torrent: .id (int), .name (str), .progress (str!), .progress_url
-  FetchFileResult: .url (str), .name (str), .result (bool)
-  AddTorrentResult: .user_torrent_id, .torrent_hash, .title
-
-IMPORTANT: All method args that take IDs expect STRINGS, not ints.
-
-SETUP (.env):
-    SEEDR_USERNAME=your@email.com
-    SEEDR_PASSWORD=yourpassword
 ═══════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -52,7 +41,6 @@ _TOKEN_FILE = os.path.normpath(
 # ─────────────────────────────────────────────────────────────
 
 def _save_token(token) -> None:
-    """Save seedrcc Token to disk so it survives restarts."""
     try:
         os.makedirs(os.path.dirname(_TOKEN_FILE), exist_ok=True)
         with open(_TOKEN_FILE, "w", encoding="utf-8") as f:
@@ -63,7 +51,6 @@ def _save_token(token) -> None:
 
 
 def _load_token():
-    """Load seedrcc Token from disk. Returns Token or None."""
     try:
         from seedrcc import Token
         with open(_TOKEN_FILE, encoding="utf-8") as f:
@@ -83,18 +70,12 @@ def _load_token():
 # ─────────────────────────────────────────────────────────────
 
 async def _get_client():
-    """
-    Create an authenticated AsyncSeedr client.
-    Priority: saved token → password login → error.
-    """
     from seedrcc import AsyncSeedr, Token
 
-    # Try saved token first (avoids re-login, faster startup)
     saved = _load_token()
     if saved:
         try:
             client = AsyncSeedr(token=saved, on_token_refresh=_save_token)
-            # Verify it works with a lightweight call
             await client.get_settings()
             log.info("[Seedr] Authenticated via saved token")
             return client
@@ -105,7 +86,6 @@ async def _get_client():
             except Exception:
                 pass
 
-    # Password login
     username = os.environ.get("SEEDR_USERNAME", "").strip()
     password = os.environ.get("SEEDR_PASSWORD", "").strip()
     if not username or not password:
@@ -119,11 +99,8 @@ async def _get_client():
     client = await AsyncSeedr.from_password(
         username, password, on_token_refresh=_save_token,
     )
-
-    # Save token for next restart
     if client.token:
         _save_token(client.token)
-
     log.info("[Seedr] Authenticated via password login")
     return client
 
@@ -133,7 +110,6 @@ async def _get_client():
 # ─────────────────────────────────────────────────────────────
 
 async def check_credentials() -> bool:
-    """Return True if credentials are valid."""
     try:
         client = await _get_client()
         await client.close()
@@ -144,7 +120,6 @@ async def check_credentials() -> bool:
 
 
 async def get_storage_info() -> dict:
-    """Return {used, total, free} in bytes."""
     client = await _get_client()
     try:
         root = await client.list_contents(folder_id="0")
@@ -156,10 +131,6 @@ async def get_storage_info() -> dict:
 
 
 async def add_magnet(magnet: str) -> dict:
-    """
-    Submit a magnet link to Seedr.
-    Uses client.add_torrent(magnet_link=...) — the correct v2 method.
-    """
     client = await _get_client()
     try:
         result = await client.add_torrent(magnet_link=magnet)
@@ -177,16 +148,9 @@ async def add_magnet(magnet: str) -> dict:
 
 
 async def list_folder(folder_id: int = 0) -> dict:
-    """
-    List folder contents. Returns a plain dict with:
-      folders: [{id, name, size}, ...]
-      files: [{folder_file_id, name, size}, ...]
-      torrents: [{id, name, progress, ...}, ...]
-    """
     client = await _get_client()
     try:
         root = await client.list_contents(folder_id=str(folder_id))
-
         folders = [
             {"id": f.id, "name": f.name, "size": f.size}
             for f in (root.folders or [])
@@ -201,7 +165,6 @@ async def list_folder(folder_id: int = 0) -> dict:
              "size": t.size, "progress_url": getattr(t, "progress_url", None)}
             for t in (root.torrents or [])
         ]
-
         return {
             "folders": folders,
             "files": files,
@@ -214,7 +177,6 @@ async def list_folder(folder_id: int = 0) -> dict:
 
 
 async def get_file_download_url(file_id: int) -> str:
-    """Get direct download URL for a file via client.fetch_file()."""
     client = await _get_client()
     try:
         result = await client.fetch_file(str(file_id))
@@ -227,7 +189,6 @@ async def get_file_download_url(file_id: int) -> str:
 
 
 async def delete_folder(folder_id: int) -> None:
-    """Delete a folder from Seedr to reclaim quota."""
     client = await _get_client()
     try:
         await client.delete_folder(str(folder_id))
@@ -237,8 +198,11 @@ async def delete_folder(folder_id: int) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# Poll until torrent finishes
+# Poll until torrent finishes — with 30-second heartbeat
 # ─────────────────────────────────────────────────────────────
+
+_HEARTBEAT_INTERVAL = 30   # seconds — fire progress_cb even if pct unchanged
+
 
 async def poll_until_ready(
     torrent_name_hint: str = "",
@@ -248,16 +212,19 @@ async def poll_until_ready(
 ) -> dict:
     """
     Poll Seedr root folder until the torrent finishes.
-    Returns folder dict {id, name, size}.
 
-    Seedr progress: "0"-"99" = downloading, "100" = done, "101" = in folder.
-    Note: progress is a STRING in seedrcc v2.
+    FIX BUG-UH-03: progress_cb now fires on a 30-second heartbeat regardless
+    of whether the percentage changed.  This prevents the Seedr panel from
+    appearing frozen on slow or stalled torrents.
+
+    Returns folder dict {id, name, size}.
     """
     if existing_folder_ids is None:
         existing_folder_ids = set()
 
-    deadline = time.time() + timeout_s
-    last_pct = -1.0
+    deadline       = time.time() + timeout_s
+    last_pct       = -1.0
+    last_heartbeat = time.time()   # FIX BUG-UH-03
 
     while time.time() < deadline:
         try:
@@ -265,7 +232,6 @@ async def poll_until_ready(
             folders  = root.get("folders", [])
             torrents = root.get("torrents", [])
 
-            # Active downloads (progress < 100)
             downloading = []
             for t in torrents:
                 try:
@@ -275,7 +241,6 @@ async def poll_until_ready(
                 if pct < 100:
                     downloading.append({**t, "_pct": pct})
 
-            # New completed folders (not in baseline snapshot)
             new_folders = [
                 f for f in folders
                 if f.get("id") not in existing_folder_ids
@@ -289,8 +254,11 @@ async def poll_until_ready(
             if downloading:
                 dl  = downloading[0]
                 pct = dl["_pct"]
-                if pct != last_pct:
-                    last_pct = pct
+                now = time.time()
+                # FIX BUG-UH-03: fire on pct change OR 30s heartbeat
+                if pct != last_pct or (now - last_heartbeat) >= _HEARTBEAT_INTERVAL:
+                    last_pct       = pct
+                    last_heartbeat = now
                     name = dl.get("name", "")
                     log.info("[Seedr] Progress: %.1f%%  %s", pct, name)
                     if progress_cb:
@@ -316,15 +284,10 @@ async def poll_until_ready(
 # ─────────────────────────────────────────────────────────────
 
 async def get_file_urls(folder_id: int) -> list[dict]:
-    """
-    Return [{name, url, size}, ...] for every file in folder_id,
-    recursing into sub-folders.
-    """
     result: list[dict] = []
 
     async def _collect(fid: int) -> None:
         contents = await list_folder(fid)
-
         for f in contents.get("files", []):
             file_id = f.get("folder_file_id") or f.get("id")
             name    = f.get("name", "file")
@@ -337,7 +300,6 @@ async def get_file_urls(folder_id: int) -> list[dict]:
                     result.append({"name": name, "url": dl_url, "size": size})
             except Exception as e:
                 log.warning("[Seedr] File URL fetch failed for %s: %s", name, e)
-
         for sub in contents.get("folders", []):
             sub_id = sub.get("id")
             if sub_id:
@@ -370,7 +332,6 @@ async def download_via_seedr(
     if progress_cb:
         await progress_cb("adding", 0.0, "Submitting to Seedr…")
 
-    # Snapshot existing folders BEFORE adding magnet
     existing_folder_ids: set = set()
     try:
         root = await list_folder(0)
