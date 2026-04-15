@@ -2,55 +2,39 @@
 services/webhook_sync.py
 Webhook synchronisation — called once when the Cloudflare tunnel comes up.
 
-PROBLEM
-───────
-Every Colab restart creates a new Cloudflare tunnel with a different public
-URL.  Any webhook subscription registered in the previous session still points
-to the now-dead old URL.  When CloudConvert or FreeConvert complete a job they
-POST to that URL, get a connection-refused, and the bot never knows the job
-finished.
-
-SOLUTION
-────────
-After the tunnel URL is established (or changes), call:
-
-    await on_tunnel_ready(new_tunnel_url)
-
-This will, for every configured API key on both platforms:
-  1. List all existing webhook subscriptions.
-  2. Delete them all.
-  3. Register a single fresh subscription pointing to the new URL.
+╔══════════════════════════════════════════════════════════════════════════╗
+║  HOW EACH PLATFORM DELIVERS WEBHOOKS                                    ║
+╠══════════════════════════════════════════════════════════════════════════╣
+║                                                                          ║
+║  ☁️  CLOUDCONVERT — global subscription model                            ║
+║  CC uses persistent webhook subscriptions at /v2/webhooks.               ║
+║  A single subscription fires for ALL jobs on that API key.               ║
+║  Subscriptions survive Colab restarts — stale entries point at the       ║
+║  dead old tunnel URL.                                                    ║
+║  → MUST delete old subscriptions and register a fresh one on start.     ║
+║                                                                          ║
+║  🆓  FREECONVERT — per-job webhook model                                 ║
+║  FC embeds the webhook URL inside each job payload at submission time.   ║
+║  There is NO global subscription to manage or clean up.                  ║
+║  Every new job automatically gets the fresh URL because submit_*()       ║
+║  reads cfg.tunnel_url at call time.                                      ║
+║  → Nothing to register. Nothing to delete.                              ║
+║                                                                          ║
+║  WHAT ABOUT FC JOBS SUBMITTED BEFORE A CRASH?                            ║
+║  Those jobs have the OLD URL baked in. FC will POST to it and get a      ║
+║  502/timeout. poll_pending_jobs() rescues them by polling FC directly.  ║
+║                                                                          ║
+╚══════════════════════════════════════════════════════════════════════════╝
 
 HOW TO INTEGRATE
 ────────────────
-In your tunnel watchdog (wherever you restart cloudflared and get the new URL):
+In your tunnel watchdog, after the new URL is confirmed:
 
-    from services.webhook_sync import on_tunnel_ready
+    from services.webhook_sync import on_tunnel_ready, poll_pending_jobs
 
     async def _after_tunnel_start(new_url: str):
         await on_tunnel_ready(new_url)
-
-Typically this lives in services/tunnel.py or core/server.py, after the line
-that confirms the tunnel URL.
-
-WHAT IS REGISTERED
-──────────────────
-CloudConvert:
-  → https://{tunnel}/webhook        (handled by plugins/webhook.py)
-  → subscribed events: job.finished, job.failed
-
-FreeConvert:
-  → https://{tunnel}/fc-webhook     (handled by plugins/fc_webhook.py)
-  → subscribed events: job.completed, job.failed
-
-TELEGRAM SUMMARY
-────────────────
-Set ADMIN_ID in env or cfg to receive a Telegram message after sync:
-
-    ✅ Webhook sync complete  (https://abc.trycloudflare.com)
-    ──────────────────────
-    ☁️ CloudConvert  2 deleted · 2 registered  [key1 ✓, key2 ✓]
-    🆓 FreeConvert   1 deleted · 1 registered  [key1 ✓]
+        await poll_pending_jobs()
 """
 from __future__ import annotations
 
@@ -61,189 +45,167 @@ import os
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────
-# Main entry-point
-# ─────────────────────────────────────────────────────────────
-
 async def on_tunnel_ready(
     tunnel_url: str,
     *,
-    notify_uid:   int | None  = None,
-    cc_path:      str         = "/webhook",
-    fc_path:      str         = "/fc-webhook",
+    notify_uid: int | None = None,
+    cc_path:    str        = "/webhook",
 ) -> dict:
     """
-    Run CC + FC webhook cleanup/registration concurrently.
+    Sync CloudConvert webhook subscriptions for the new tunnel URL.
+
+    FreeConvert is intentionally NOT synced here — FC webhooks are
+    per-job and the new URL is picked up automatically on the next
+    job submission via cfg.tunnel_url.
 
     Args:
-        tunnel_url:  The new public URL, e.g. "https://abc.trycloudflare.com".
-        notify_uid:  Telegram user ID to notify on completion.
-                     If None, falls back to ADMIN_ID env var.
-        cc_path:     Webhook path registered with CloudConvert. Default /webhook.
-        fc_path:     Webhook path registered with FreeConvert. Default /fc-webhook.
+        tunnel_url:  New public URL, e.g. "https://abc.trycloudflare.com"
+        notify_uid:  Telegram UID for summary message. Falls back to ADMIN_ID.
+        cc_path:     Webhook path for CC. Default "/webhook".
 
     Returns:
-        {
-            "tunnel":  str,
-            "cc":      list[dict],   # per-key results from sync_cc_webhooks
-            "fc":      list[dict],   # per-key results from sync_fc_webhooks
-        }
+        {"tunnel": str, "cc": list[dict]}
     """
     if not tunnel_url:
-        log.warning("[WH-Sync] tunnel_url is empty — skipping sync")
-        return {"tunnel": "", "cc": [], "fc": []}
+        log.warning("[WH-Sync] tunnel_url is empty — skipping")
+        return {"tunnel": "", "cc": []}
 
     tunnel_url = tunnel_url.rstrip("/")
-    log.info("[WH-Sync] Starting webhook sync for tunnel: %s", tunnel_url)
+    log.info("[WH-Sync] Syncing CC webhooks → %s", tunnel_url)
 
     from services.cc_webhook_mgr import sync_cc_webhooks
-    from services.freeconvert_api import sync_fc_webhooks
+    cc_results = await sync_cc_webhooks(tunnel_url, webhook_path=cc_path)
 
-    cc_results, fc_results = await asyncio.gather(
-        sync_cc_webhooks(tunnel_url, webhook_path=cc_path),
-        sync_fc_webhooks(tunnel_url, webhook_path=fc_path),
+    # Update cfg so every subsequent FC submit_*() call uses the new URL
+    try:
+        from core.config import cfg
+        cfg.tunnel_url = tunnel_url         # type: ignore[attr-defined]
+        log.info("[WH-Sync] cfg.tunnel_url → %s", tunnel_url)
+    except Exception as exc:
+        log.debug("[WH-Sync] cfg update: %s", exc)
+
+    uid = notify_uid or _admin_uid()
+    if uid:
+        asyncio.create_task(_notify(uid, tunnel_url, cc_results))
+
+    return {"tunnel": tunnel_url, "cc": cc_results}
+
+
+async def on_tunnel_reconnected(new_url: str) -> None:
+    """Convenience alias for tunnel watchdog reconnect events."""
+    await on_tunnel_ready(new_url)
+
+
+async def poll_pending_jobs() -> None:
+    """
+    After a restart, poll both CC and FC for jobs that completed while
+    the bot was offline.
+
+    CC: jobs finished during offline window never delivered the webhook
+        because the subscription pointed at the dead URL.
+    FC: jobs have the OLD tunnel URL baked in; FC tried to POST to it
+        and got no response. Direct poll recovers them.
+    """
+    await asyncio.gather(
+        _poll_cc_pending(),
+        _poll_fc_pending(),
         return_exceptions=True,
     )
 
-    if isinstance(cc_results, BaseException):
-        log.error("[WH-Sync] CC sync raised: %s", cc_results)
-        cc_results = []
-    if isinstance(fc_results, BaseException):
-        log.error("[WH-Sync] FC sync raised: %s", fc_results)
-        fc_results = []
 
-    result = {"tunnel": tunnel_url, "cc": cc_results, "fc": fc_results}
-
-    # Telegram notification (best-effort)
-    uid = notify_uid or _admin_uid()
-    if uid:
-        asyncio.create_task(_notify(uid, tunnel_url, cc_results, fc_results))
-
-    return result
-
-
-# ─────────────────────────────────────────────────────────────
-# Tunnel watchdog integration helper
-# ─────────────────────────────────────────────────────────────
-
-async def on_tunnel_reconnected(new_url: str) -> None:
-    """
-    Convenience wrapper — call this from your tunnel watchdog when a
-    reconnect produces a new URL.
-
-    Also re-registers the new URL with CloudConvert jobs in cc_job_store
-    that are still pending (they already have a notification_url set, but
-    those are per-job and can't be changed after submission — what this does
-    instead is ensure the global subscription covers all future completions).
-    """
-    await on_tunnel_ready(new_url)
-
-    # Persist the new tunnel URL for other services
-    try:
-        from core.config import cfg
-        cfg.tunnel_url = new_url          # type: ignore[attr-defined]
-        log.info("[WH-Sync] cfg.tunnel_url updated → %s", new_url)
-    except Exception as exc:
-        log.debug("[WH-Sync] Could not update cfg.tunnel_url: %s", exc)
-
-
-# ─────────────────────────────────────────────────────────────
-# Optional startup: poll pending jobs in both stores
-# ─────────────────────────────────────────────────────────────
-
-async def poll_pending_jobs(client=None) -> None:
-    """
-    After a restart, jobs submitted before the crash may have completed while
-    the bot was down.  This function polls both CC and FC job stores and
-    handles any that are now finished.
-
-    Call after on_tunnel_ready() so the new webhook is registered first.
-    """
-    await _poll_cc_pending(client)
-    await _poll_fc_pending(client)
-
-
-async def _poll_cc_pending(client=None) -> None:
-    """Poll CloudConvert for jobs that are still 'processing' in cc_job_store."""
+async def _poll_cc_pending() -> None:
     try:
         from services.cc_job_store import cc_job_store
         pending = await cc_job_store.list_processing()
         if not pending:
             return
-        log.info("[WH-Sync] %d pending CC job(s) — polling for completion", len(pending))
+        log.info("[WH-Sync] %d pending CC job(s) to poll", len(pending))
 
         import aiohttp as _ah
-        cc_base = "https://api.cloudconvert.com/v2"
+        api_key = os.environ.get("CC_API_KEY", "").strip()
+        if not api_key:
+            log.warning("[WH-Sync] CC_API_KEY not set — cannot poll")
+            return
 
         for job in pending:
-            api_key = os.environ.get("CC_API_KEY", "").strip()
-            if not api_key:
-                break
             try:
-                async with _ah.ClientSession(
-                    timeout=_ah.ClientTimeout(total=10)
-                ) as sess:
+                async with _ah.ClientSession(timeout=_ah.ClientTimeout(total=10)) as sess:
                     async with sess.get(
-                        f"{cc_base}/jobs/{job.job_id}",
+                        f"https://api.cloudconvert.com/v2/jobs/{job.job_id}",
                         headers={"Authorization": f"Bearer {api_key}"},
                     ) as resp:
                         data = await resp.json()
 
-                status = (data.get("data") or data).get("status", "")
+                jdata  = data.get("data") or data
+                status = jdata.get("status", "")
+
                 if status == "finished":
-                    log.info("[WH-Sync] CC job %s is finished — triggering webhook handler", job.job_id)
-                    # Re-trigger the CC webhook handler with the job data
+                    log.info("[WH-Sync] CC job %s finished — recovering", job.job_id)
                     try:
                         from plugins.webhook import _handle_cc_job
-                        await _handle_cc_job(job.job_id, data.get("data") or data, api_key)
+                        await _handle_cc_job(job.job_id, jdata, api_key)
                     except ImportError:
-                        log.warning("[WH-Sync] plugins.webhook._handle_cc_job not found")
+                        log.warning("[WH-Sync] plugins.webhook._handle_cc_job not importable")
                 elif status == "error":
                     await cc_job_store.update(job.job_id, status="failed")
-                    log.warning("[WH-Sync] CC job %s errored", job.job_id)
+
             except Exception as exc:
-                log.warning("[WH-Sync] CC poll failed for job %s: %s", job.job_id, exc)
+                log.warning("[WH-Sync] CC poll %s: %s", job.job_id, exc)
 
     except Exception as exc:
-        log.error("[WH-Sync] _poll_cc_pending failed: %s", exc)
+        log.error("[WH-Sync] _poll_cc_pending: %s", exc)
 
 
-async def _poll_fc_pending(client=None) -> None:
-    """Poll FreeConvert for jobs that are still 'processing' in fc_job_store."""
+async def _poll_fc_pending() -> None:
+    """
+    Poll FreeConvert for jobs whose embedded webhook_url pointed at the
+    old dead tunnel. FC already tried to deliver and got no response.
+    We recover by calling GET /v1/process/jobs/{id} directly.
+    """
     try:
         from services.fc_job_store import fc_job_store
         pending = await fc_job_store.list_processing()
         if not pending:
             return
-        log.info("[WH-Sync] %d pending FC job(s) — polling for completion", len(pending))
+        log.info("[WH-Sync] %d pending FC job(s) to poll", len(pending))
 
-        from services.freeconvert_api import _fc_get_job
+        import aiohttp as _ah
 
         for job in pending:
             api_key = job.api_key or os.environ.get("FC_API_KEY", "").strip()
             if not api_key:
-                break
+                log.warning("[WH-Sync] No FC key for job %s — skip", job.job_id)
+                continue
             try:
-                data   = await _fc_get_job(api_key, job.job_id)
-                status = (data.get("status") or "").lower()
+                async with _ah.ClientSession(timeout=_ah.ClientTimeout(total=15)) as sess:
+                    async with sess.get(
+                        f"https://api.freeconvert.com/v1/process/jobs/{job.job_id}",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                    ) as resp:
+                        data = await resp.json()
+
+                jdata  = data.get("data") or data
+                status = (jdata.get("status") or "").lower()
 
                 if status == "completed":
-                    log.info("[WH-Sync] FC job %s completed — triggering FC webhook handler", job.job_id)
+                    log.info("[WH-Sync] FC job %s completed — recovering", job.job_id)
                     from plugins.fc_webhook import _handle_completion
-                    await _handle_completion(job, data)
-                elif status in ("failed", "error"):
-                    await fc_job_store.update(job.job_id, status="failed")
-                    log.warning("[WH-Sync] FC job %s failed", job.job_id)
+                    await _handle_completion(job, jdata)
+                elif status in ("failed", "error", "cancelled"):
+                    err = jdata.get("message", status)
+                    await fc_job_store.update(job.job_id, status="failed", error=err[:200])
+                    log.warning("[WH-Sync] FC job %s: %s", job.job_id, err)
+                else:
+                    # Still processing on FC side — new webhook when it finishes
+                    # will go to the dead URL, but next poll_pending_jobs() will catch it
+                    log.info("[WH-Sync] FC job %s still %s — will retry on next start", job.job_id, status)
+
             except Exception as exc:
-                log.warning("[WH-Sync] FC poll failed for job %s: %s", job.job_id, exc)
+                log.warning("[WH-Sync] FC poll %s: %s", job.job_id, exc)
 
     except Exception as exc:
-        log.error("[WH-Sync] _poll_fc_pending failed: %s", exc)
+        log.error("[WH-Sync] _poll_fc_pending: %s", exc)
 
-
-# ─────────────────────────────────────────────────────────────
-# Telegram notification helper
-# ─────────────────────────────────────────────────────────────
 
 def _admin_uid() -> int | None:
     raw = os.environ.get("ADMIN_ID", "").strip()
@@ -253,37 +215,33 @@ def _admin_uid() -> int | None:
         return None
 
 
-def _fmt_results(results: list[dict], platform: str) -> str:
-    if not results:
-        return f"  {platform}  —  (no keys configured)\n"
-    lines = []
-    for r in results:
-        tail = r.get("key_tail", "?")
-        d    = r.get("deleted", 0)
-        reg  = r.get("registered")
-        err  = r.get("error", "")
-        if err:
-            lines.append(f"  {tail}  ❌ {err[:50]}")
-        else:
-            lines.append(f"  {tail}  {d} deleted · ✅ registered <code>{str(reg)[:12]}</code>")
-    return "\n".join(lines)
-
-
-async def _notify(uid: int, tunnel_url: str, cc: list, fc: list) -> None:
+async def _notify(uid: int, tunnel_url: str, cc: list) -> None:
     try:
         from core.session import get_client
         from pyrogram import enums
         client = get_client()
 
-        cc_section = _fmt_results(cc, "☁️ CloudConvert")
-        fc_section = _fmt_results(fc, "🆓 FreeConvert")
+        lines = []
+        for r in cc:
+            tail = r.get("key_tail", "?")
+            d    = r.get("deleted", 0)
+            reg  = r.get("registered")
+            err  = r.get("error", "")
+            if err:
+                lines.append(f"  {tail}  ❌ {err[:50]}")
+            else:
+                lines.append(f"  {tail}  {d} deleted · ✅ <code>{str(reg)[:12]}</code>")
+
+        cc_section = "\n".join(lines) if lines else "  (no CC keys configured)"
 
         text = (
             "✅ <b>Webhook sync complete</b>\n"
             "──────────────────────\n\n"
             f"🔗 <code>{tunnel_url}</code>\n\n"
-            f"<b>CloudConvert</b>\n{cc_section}\n\n"
-            f"<b>FreeConvert</b>\n{fc_section}"
+            f"☁️ <b>CloudConvert</b>\n{cc_section}\n\n"
+            "🆓 <b>FreeConvert</b>\n"
+            "  Per-job — no registration needed ✅\n"
+            "  <i>(URL is embedded at job submission time)</i>"
         )
         await client.send_message(
             uid, text,
