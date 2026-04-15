@@ -2,13 +2,10 @@
 plugins/video.py
 Full video processing plugin.
 
-Fixes vs original:
-  - user_id always bound at top of every callback (no NameError)
-  - _ensure() is a module-level async function, not a closure
-  - handle_secondary_file properly handles burn_sub
-  - merge_vids queue correctly seeds primary file
-  - all FFmpeg actions use _tracked_ffmpeg wrapper
-  - text_reply_handler ignores commands properly
+CHANGE: Added 📐 Compress and ↕️ Resize buttons to video_menu_kb().
+  • vid|compress_ask|{key}  → handled by plugins/resize.py (asks for target MB)
+  • vid|resize|{key}        → handled by plugins/resize.py (resolution picker)
+  These use local FFmpeg — no API key required.
 """
 from __future__ import annotations
 
@@ -32,20 +29,15 @@ from services.utils import (
 
 log = logging.getLogger(__name__)
 
-# Build the compact LANG dict used for stream labels from the shared table
 from services.utils import LANG_NAME as LANG
 
 _IGNORED = {
-    # Core / admin
     "start","help","settings","info","broadcast","stats","log","restart",
     "mergedone","admin","ban_user","unban_user","banned_list","status",
     "forward","createarchive","archiveddone","bulk_url","usettings",
     "show_thumb","del_thumb","json_formatter","stream",
-    # Nyaa tracker
     "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
     "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit",
-    # FIX BUG-07: added missing commands so text_reply_handler never tries to
-    # parse a slash command as a trim timestamp / split chunk / etc.
     "resize","compress","hardsub","botname","ccstatus","convert",
     "captiontemplate","usage","allow","deny","allowed","cancel",
 }
@@ -75,6 +67,9 @@ def video_menu_kb(key: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("🎞️ Sample Clip",       callback_data=f"vid|sample|{key}")],
         [InlineKeyboardButton("🟡 Convert",           callback_data=f"vid|convert|{key}"),
          InlineKeyboardButton("⚡ Optimize",          callback_data=f"vid|optimize|{key}")],
+        # NEW: local FFmpeg compress (→ ask MB) and resize (→ resolution picker)
+        [InlineKeyboardButton("📐 Compress",          callback_data=f"vid|compress_ask|{key}"),
+         InlineKeyboardButton("↕️ Resize",            callback_data=f"vid|resize|{key}")],
         [InlineKeyboardButton("🏷️ Metadata",          callback_data=f"vid|metadata|{key}"),
          InlineKeyboardButton("✏️ Rename",            callback_data=f"vid|rename|{key}")],
         [InlineKeyboardButton("❌ Cancel",            callback_data=f"vid|cancel|{key}")],
@@ -163,10 +158,8 @@ async def _tracked_ffmpeg(user_id: int, label: str, fname: str, coro) -> None:
 # ─────────────────────────────────────────────────────────────
 
 async def _ensure(client: Client, session: FileSession, st) -> str | None:
-    """Download if not already cached. Must be called inside session.lock."""
     if session.is_downloaded():
         return session.local_path
-
     dest = os.path.join(session.tmp_dir, session.fname)
     try:
         path = await tg_download(client, session.file_id, dest, st,
@@ -210,7 +203,6 @@ async def video_cb(client: Client, cb: CallbackQuery):
 
     await cb.answer()
 
-    # ── Actions that only prompt (no download needed yet) ─────
     prompts = {
         "trim", "split", "sample", "manual_shots", "rename",
         "metadata", "merge_av", "merge_vs", "merge_vids", "burn_sub",
@@ -220,7 +212,6 @@ async def video_cb(client: Client, cb: CallbackQuery):
         await _prompt(client, cb, action, key, session, user_id)
         return
 
-    # ── Actions that need the file ────────────────────────────
     async with session.lock:
         st   = await cb.message.edit("⬇️ Downloading…")
         path = await _ensure(client, session, st)
@@ -243,7 +234,6 @@ async def video_cb(client: Client, cb: CallbackQuery):
 async def _execute(client, cb, action, key, session, user_id,
                    st, path, tmp, ext, base):
 
-    # ── Thumbnail ─────────────────────────────────────────────
     if action == "thumb":
         out = os.path.join(tmp, f"{base}_thumb.jpg")
         await safe_edit(st, "🖼️ Extracting thumbnail…")
@@ -256,7 +246,6 @@ async def _execute(client, cb, action, key, session, user_id,
             await safe_edit(st, "❌ Could not extract thumbnail.",
                             reply_markup=video_menu_kb(key))
 
-    # ── Media info ────────────────────────────────────────────
     elif action == "mediainfo":
         await safe_edit(st, "📊 Reading streams…")
         fname_d = os.path.basename(path)
@@ -312,7 +301,6 @@ async def _execute(client, cb, action, key, session, user_id,
                         parse_mode=enums.ParseMode.HTML,
                         reply_markup=InlineKeyboardMarkup(kb_rows))
 
-    # ── Stream menus ──────────────────────────────────────────
     elif action in ("smap_menu", "srem_menu", "sext_menu"):
         label_map = {
             "sext_menu": "📤 Stream Extractor",
@@ -336,7 +324,6 @@ async def _execute(client, cb, action, key, session, user_id,
                         parse_mode=enums.ParseMode.HTML,
                         reply_markup=_stream_kb(streams, act_map[action], key))
 
-    # ── Remove audio ──────────────────────────────────────────
     elif action == "rm_audio":
         out = os.path.join(tmp, f"{base}_noaudio{ext}")
         await safe_edit(st, "🔇 Removing audio…")
@@ -345,7 +332,6 @@ async def _execute(client, cb, action, key, session, user_id,
         await upload_file(client, st, out, user_id=user_id)
         cleanup(tmp); await sessions.remove(key)
 
-    # ── Screenshots ───────────────────────────────────────────
     elif action == "shots":
         await safe_edit(st, "📸 Generating 5 screenshots…")
         shots = await FF.screenshots(path, tmp, count=5)
@@ -363,7 +349,7 @@ async def _execute(client, cb, action, key, session, user_id,
 
 
 # ─────────────────────────────────────────────────────────────
-# Prompt dispatcher (no download needed yet)
+# Prompt dispatcher
 # ─────────────────────────────────────────────────────────────
 
 async def _prompt(client, cb, action, key, session, user_id):
@@ -392,7 +378,6 @@ async def _prompt(client, cb, action, key, session, user_id):
             parse_mode=enums.ParseMode.HTML)
 
     elif action in ("trim", "split", "sample", "manual_shots"):
-        # Need duration — download first
         st = await msg.edit("⬇️ Downloading to read duration…")
         async with session.lock:
             path = await _ensure(client, session, st)
@@ -448,7 +433,7 @@ async def _prompt(client, cb, action, key, session, user_id):
 
 
 # ─────────────────────────────────────────────────────────────
-# Stream callbacks  (sext|smap|srem)|<idx>|<key>
+# Stream callbacks
 # ─────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^(sext|smap|srem)\|"))
@@ -651,7 +636,6 @@ async def text_reply_handler(client: Client, msg: Message):
     ext  = session.ext or os.path.splitext(path)[1] or ".mp4"
     base = os.path.splitext(os.path.basename(path))[0]
 
-    # ── Trim ─────────────────────────────────────────────────
     if action == "trim":
         try:
             parts = msg.text.strip().split()
@@ -671,7 +655,6 @@ async def text_reply_handler(client: Client, msg: Message):
         await upload_file(client, st, out, user_id=user_id)
         cleanup(tmp); await sessions.remove(session.key)
 
-    # ── Split ─────────────────────────────────────────────────
     elif action == "split":
         try:
             chunk = int(msg.text.strip())
@@ -697,7 +680,6 @@ async def text_reply_handler(client: Client, msg: Message):
         session.waiting = None
         cleanup(tmp); await sessions.remove(session.key)
 
-    # ── Sample ────────────────────────────────────────────────
     elif action == "sample":
         try:
             p2 = msg.text.strip().split()
@@ -717,7 +699,6 @@ async def text_reply_handler(client: Client, msg: Message):
         await upload_file(client, st, out, user_id=user_id)
         cleanup(tmp); await sessions.remove(session.key)
 
-    # ── Manual screenshots ────────────────────────────────────
     elif action == "manual_shots":
         timestamps = [t.strip() for t in msg.text.strip().splitlines() if t.strip()]
         if not timestamps:
@@ -741,7 +722,6 @@ async def text_reply_handler(client: Client, msg: Message):
         session.waiting = None
         cleanup(tmp); await sessions.remove(session.key)
 
-    # ── Rename ────────────────────────────────────────────────
     elif action == "rename":
         new_name = msg.text.strip()
         if not new_name:
@@ -761,7 +741,6 @@ async def text_reply_handler(client: Client, msg: Message):
             parse_mode=enums.ParseMode.HTML,
         )
 
-    # ── Metadata ──────────────────────────────────────────────
     elif action == "metadata":
         try:
             meta = json.loads(msg.text.strip())
@@ -783,7 +762,7 @@ async def text_reply_handler(client: Client, msg: Message):
 
 
 # ─────────────────────────────────────────────────────────────
-# Secondary file handler (merge_av / merge_vs / burn_sub / merge_vids)
+# Secondary file handler
 # ─────────────────────────────────────────────────────────────
 
 async def handle_secondary_file(client: Client, msg: Message, session: FileSession):
@@ -849,7 +828,6 @@ async def handle_secondary_file(client: Client, msg: Message, session: FileSessi
 
     elif action == "merge_vids":
         queue = session.payload.setdefault("merge_queue", [])
-        # Ensure primary is first
         if path not in queue:
             queue.insert(0, path)
         queue.append(sec)
