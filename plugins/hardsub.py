@@ -1,16 +1,19 @@
 """
 plugins/hardsub.py
-CloudConvert-powered hardsubbing — batch multi-video support.
+CloudConvert / FreeConvert hardsubbing — batch multi-video support.
+
+CHANGES:
+  • CRF quality picker (CRF 18/20/23/26) at "waiting_subtitle" step.
+  • Platform picker (☁️ CloudConvert  /  🆓 FreeConvert) at same step.
+    - CloudConvert: CC_API_KEY env var; webhooks via Cloudflare tunnel.
+    - FreeConvert:  FC_API_KEY env var; webhooks via /fc-webhook route.
+    - If only one key is configured, platform is chosen automatically.
+    - If both are set, user sees the platform buttons.
+  • Default: CloudConvert / CRF 20 / preset "medium".
+  • Preset changed from "ultrafast" → "medium" for better quality.
 
 FIX BUG-04: hardsub_url_handler now handles kind == "scrape".
-  services/downloader.classify() returns "scrape" for vidmoli.com, sbnet.*,
-  streamtape, mixdrop, and other hosters not in yt-dlp.
-  The previous elif only covered ("magnet","torrent","ytdlp","gdrive","mediafire").
-  Scrape URLs silently fell through, stalling the hardsub state machine.
-
-PATCH: _submit_one_job() uses build_cc_output_name() from cc_sanitize
-  instead of re.sub(r'[^\\w\\s\\-\\[\\]()]', ...) which kept [] and spaces —
-  both of which silently break CloudConvert's FFmpeg subtitles filter.
+PATCH: _submit_one_job() uses build_cc_output_name() from cc_sanitize.
 """
 from __future__ import annotations
 
@@ -57,9 +60,7 @@ async def start_hardsub_for_url(
     url: str,
     fname: str,
 ) -> None:
-    """
-    DOWNLOAD-FIRST: Download the video locally before asking for subtitle.
-    """
+    """DOWNLOAD-FIRST: Download the video locally before asking for subtitle."""
     _clear(uid)
     tmp = make_tmp(cfg.download_dir, uid)
 
@@ -103,19 +104,126 @@ async def start_hardsub_for_url(
         "videos":    [{"path": path, "url": None, "fname": fname}],
         "sub_path":  None,
         "sub_fname": None,
+        "crf":       20,
+        "platform":  _default_platform(),   # cc or fc
     }
+
+    await _show_subtitle_prompt(st, uid, fname, fsize)
+
+
+async def _show_subtitle_prompt(st, uid: int, fname: str, fsize: int = 0) -> None:
+    """Show the subtitle request with CRF quality picker."""
+    state    = _STATE.get(uid, {})
+    cur_crf  = state.get("crf", 20)
+    crf_lbl  = _crf_label(cur_crf)
+
+    size_s = f"  <code>{human_size(fsize)}</code>" if fsize else ""
 
     await safe_edit(
         st,
         f"🔥 <b>Hardsub — Ready</b>\n"
         "──────────────────────\n\n"
-        f"✅ <code>{fname[:45]}</code>  <code>{human_size(fsize)}</code>\n\n"
+        f"✅ <code>{fname[:45]}</code>{size_s}\n\n"
+        f"⚙️ <b>Quality:</b> {crf_lbl}  "
+        "<i>(tap to change)</i>\n\n"
         "Now send the <b>subtitle</b>:\n"
         "• A <b>file</b> (.ass / .srt / .vtt / .txt)\n"
         "• A <b>URL</b> to a subtitle file\n\n"
         "<i>Send /cancel to abort.</i>",
         parse_mode=enums.ParseMode.HTML,
+        reply_markup=_crf_kb(uid),
     )
+
+
+def _crf_label(crf: int) -> str:
+    labels = {18: "CRF 18 🔵 (HQ)", 20: "CRF 20 🟢 (Default)",
+              23: "CRF 23 🟡 (Medium)", 26: "CRF 26 🟠 (Low)"}
+    return labels.get(crf, f"CRF {crf}")
+
+
+def _platform_label(platform: str) -> str:
+    return "☁️ CloudConvert" if platform == "cc" else "🆓 FreeConvert"
+
+
+def _has_cc() -> bool:
+    return bool(os.environ.get("CC_API_KEY", "").strip())
+
+
+def _has_fc() -> bool:
+    return bool(os.environ.get("FC_API_KEY", "").strip())
+
+
+def _default_platform() -> str:
+    """Auto-select platform when only one key is configured."""
+    if _has_cc():
+        return "cc"
+    if _has_fc():
+        return "fc"
+    return "cc"   # will fail at submission; error surfaced there
+
+
+async def _show_subtitle_prompt(st, uid: int, fname: str, fsize: int = 0) -> None:
+    """Show the subtitle request with CRF quality picker + platform picker."""
+    state        = _STATE.get(uid, {})
+    cur_crf      = state.get("crf", 20)
+    cur_platform = state.get("platform", _default_platform())
+    crf_lbl      = _crf_label(cur_crf)
+    plat_lbl     = _platform_label(cur_platform)
+
+    size_s = f"  <code>{human_size(fsize)}</code>" if fsize else ""
+
+    await safe_edit(
+        st,
+        f"🔥 <b>Hardsub — Ready</b>\n"
+        "──────────────────────\n\n"
+        f"✅ <code>{fname[:45]}</code>{size_s}\n\n"
+        f"⚙️ <b>Quality:</b> {crf_lbl}  <i>(tap to change)</i>\n"
+        f"🌐 <b>Platform:</b> {plat_lbl}  <i>(tap to change)</i>\n\n"
+        "Now send the <b>subtitle</b>:\n"
+        "• A <b>file</b> (.ass / .srt / .vtt / .txt)\n"
+        "• A <b>URL</b> to a subtitle file\n\n"
+        "<i>Send /cancel to abort.</i>",
+        parse_mode=enums.ParseMode.HTML,
+        reply_markup=_subtitle_kb(uid),
+    )
+
+
+def _subtitle_kb(uid: int) -> InlineKeyboardMarkup:
+    """
+    Combined keyboard shown at the subtitle prompt:
+    top row = CRF picker, second row = platform picker (if both keys set).
+    """
+    state        = _STATE.get(uid, {})
+    cur_crf      = state.get("crf", 20)
+    cur_platform = state.get("platform", _default_platform())
+
+    def _crf_btn(label: str, crf: int) -> InlineKeyboardButton:
+        tick = " ✓" if crf == cur_crf else ""
+        return InlineKeyboardButton(f"{label}{tick}", callback_data=f"hs_crf|{uid}|{crf}")
+
+    def _plat_btn(label: str, plat: str) -> InlineKeyboardButton:
+        tick = " ✓" if plat == cur_platform else ""
+        return InlineKeyboardButton(f"{label}{tick}", callback_data=f"hs_plat|{uid}|{plat}")
+
+    rows = [
+        [_crf_btn("🔵 HQ (18)", 18), _crf_btn("🟢 Default (20)", 20)],
+        [_crf_btn("🟡 Medium (23)", 23), _crf_btn("🟠 Low (26)", 26)],
+    ]
+
+    # Show platform picker only if both keys are configured
+    if _has_cc() and _has_fc():
+        rows.append([
+            _plat_btn("☁️ CloudConvert", "cc"),
+            _plat_btn("🆓 FreeConvert",  "fc"),
+        ])
+
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"hs_cancel|{uid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _crf_kb(uid: int) -> InlineKeyboardMarkup:
+    """Alias kept for backward-compatibility — delegates to _subtitle_kb."""
+    return _subtitle_kb(uid)
 
 
 # ── Keyboards ─────────────────────────────────────────────────
@@ -129,24 +237,90 @@ def _more_or_done_kb(uid: int, count: int) -> InlineKeyboardMarkup:
 
 
 # ─────────────────────────────────────────────────────────────
-# Submit one hardsub job
+# CRF picker callback
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^hs_crf\|"))
+async def hardsub_crf_cb(client: Client, cb: CallbackQuery):
+    """Handle CRF quality selection during waiting_subtitle step."""
+    parts = cb.data.split("|")
+    if len(parts) < 3:
+        return await cb.answer("Invalid.", show_alert=True)
+    _, uid_s, crf_s = parts[:3]
+    uid = int(uid_s) if uid_s.isdigit() else cb.from_user.id
+    state = _user_state(uid)
+    if not state:
+        return await cb.answer("Session expired.", show_alert=True)
+    await cb.answer()
+
+    try:
+        new_crf = int(crf_s)
+    except ValueError:
+        return
+
+    state["crf"] = new_crf
+    log.info("[Hardsub] uid=%d CRF set to %d", uid, new_crf)
+
+    # Refresh the subtitle prompt with updated CRF display
+    videos   = state.get("videos", [])
+    fname    = videos[-1]["fname"] if videos else "video"
+    path     = videos[-1].get("path") if videos else None
+    fsize    = os.path.getsize(path) if path and os.path.isfile(path) else 0
+
+    await _show_subtitle_prompt(cb.message, uid, fname, fsize)
+
+
+# ─────────────────────────────────────────────────────────────
+# Platform picker callback  hs_plat|<uid>|<platform>
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^hs_plat\|"))
+async def hardsub_platform_cb(client: Client, cb: CallbackQuery):
+    """Handle platform selection (CloudConvert vs FreeConvert)."""
+    parts = cb.data.split("|")
+    if len(parts) < 3:
+        return await cb.answer("Invalid.", show_alert=True)
+    _, uid_s, plat = parts[:3]
+    uid   = int(uid_s) if uid_s.isdigit() else cb.from_user.id
+    state = _user_state(uid)
+    if not state:
+        return await cb.answer("Session expired.", show_alert=True)
+    await cb.answer()
+
+    if plat not in ("cc", "fc"):
+        return
+
+    state["platform"] = plat
+    log.info("[Hardsub] uid=%d platform → %s", uid, plat)
+
+    videos = state.get("videos", [])
+    fname  = videos[-1]["fname"] if videos else "video"
+    path   = videos[-1].get("path") if videos else None
+    fsize  = os.path.getsize(path) if path and os.path.isfile(path) else 0
+    await _show_subtitle_prompt(cb.message, uid, fname, fsize)
 # ─────────────────────────────────────────────────────────────
 
 async def _submit_one_job(
-    api_key: str,
-    video: dict,
-    sub_path: str,
+    api_key:   str,
+    video:     dict,
+    sub_path:  str,
     sub_fname: str,
-    uid: int,
+    uid:       int,
+    crf:       int  = 20,
+    platform:  str  = "cc",
 ) -> tuple[str, str, bool]:
-    from services.cloudconvert_api import submit_hardsub
-    from services.cc_job_store import cc_job_store, CCJob
-
     video_fname = video.get("fname", "video.mkv")
-
     output_name = build_cc_output_name(video_fname, suffix="VOSTFR")
 
-    log.info("[Hardsub] CC-safe output name: %s → %s", video_fname, output_name)
+    log.info("[Hardsub] output=%s  platform=%s  CRF=%d", output_name, platform, crf)
+
+    if platform == "fc":
+        return await _submit_one_fc(api_key, video, sub_path, sub_fname,
+                                    uid, crf, output_name, video_fname)
+
+    # ── CloudConvert (default) ────────────────────────────────
+    from services.cloudconvert_api import submit_hardsub
+    from services.cc_job_store import cc_job_store, CCJob
 
     try:
         job_id = await submit_hardsub(
@@ -156,28 +330,72 @@ async def _submit_one_job(
             subtitle_path=sub_path,
             output_name=output_name,
             scale_height=0,
+            crf=crf,
         )
-
         await cc_job_store.add(CCJob(
-            job_id=job_id,
-            uid=uid,
-            fname=video_fname,
-            sub_fname=sub_fname,
-            output_name=output_name,
+            job_id=job_id, uid=uid, fname=video_fname,
+            sub_fname=sub_fname, output_name=output_name,
             status="processing",
         ))
-        log.info("[Hardsub] Registered job %s in cc_job_store for uid=%d", job_id, uid)
-
+        log.info("[Hardsub-CC] Registered job %s uid=%d", job_id, uid)
         try:
             from plugins.ccstatus import _ensure_poller
             _ensure_poller()
-            log.info("[Hardsub] ccstatus poller ensured for job %s", job_id)
         except Exception as _pe:
-            log.warning("[Hardsub] Could not start ccstatus poller: %s", _pe)
-
+            log.warning("[Hardsub-CC] Could not start CC poller: %s", _pe)
         return video_fname, job_id, True
     except Exception as exc:
-        log.error("[Hardsub] Job failed for %s: %s", video_fname, exc)
+        log.error("[Hardsub-CC] Job failed for %s: %s", video_fname, exc)
+        return video_fname, str(exc)[:80], False
+
+
+async def _submit_one_fc(
+    api_key:     str,
+    video:       dict,
+    sub_path:    str,
+    sub_fname:   str,
+    uid:         int,
+    crf:         int,
+    output_name: str,
+    video_fname: str,
+) -> tuple[str, str, bool]:
+    """Submit one hardsub job to FreeConvert with webhook delivery."""
+    from services.freeconvert_api import submit_hardsub as fc_submit
+    from services.fc_job_store import fc_job_store, FCJob
+
+    try:
+        # Resolve webhook URL from running tunnel
+        webhook_url: str | None = None
+        try:
+            from core.config import cfg as _cfg
+            if hasattr(_cfg, "tunnel_url") and _cfg.tunnel_url:
+                from services.freeconvert_api import fc_webhook_url
+                webhook_url = fc_webhook_url(_cfg.tunnel_url)
+        except Exception:
+            pass
+
+        job_id = await fc_submit(
+            api_key,
+            video_path=video.get("path"),
+            video_url=video.get("url"),
+            subtitle_path=sub_path,
+            output_name=output_name,
+            crf=crf,
+            preset="medium",
+            webhook_url=webhook_url,
+        )
+
+        await fc_job_store.add(FCJob(
+            job_id=job_id, uid=uid, fname=video_fname,
+            sub_fname=sub_fname, output_name=output_name,
+            status="processing", job_type="hardsub",
+            api_key=api_key,
+        ))
+        log.info("[Hardsub-FC] Registered job %s uid=%d  webhook=%s",
+                 job_id, uid, webhook_url or "none")
+        return video_fname, job_id, True
+    except Exception as exc:
+        log.error("[Hardsub-FC] Job failed for %s: %s", video_fname, exc)
         return video_fname, str(exc)[:80], False
 
 
@@ -189,47 +407,90 @@ async def _submit_batch(st, state: dict, uid: int) -> None:
     videos    = state.get("videos", [])
     sub_path  = state["sub_path"]
     sub_fname = state.get("sub_fname", "subtitle.ass")
+    crf       = state.get("crf", 20)
+    platform  = state.get("platform", _default_platform())
     count     = len(videos)
 
     vid_list = "\n".join(
         f"  {i+1}. <code>{v['fname'][:40]}</code>"
         for i, v in enumerate(videos)
     )
+    crf_lbl  = _crf_label(crf)
+    plat_lbl = _platform_label(platform)
+
     await safe_edit(
         st,
         f"☁️ <b>Submitting {count} hardsub job{'s' if count > 1 else ''}…</b>\n"
         "──────────────────────\n\n"
         f"{vid_list}\n\n"
-        f"💬 <code>{sub_fname[:42]}</code>\n\n"
+        f"💬 <code>{sub_fname[:42]}</code>\n"
+        f"⚙️ Quality: {crf_lbl}\n"
+        f"🌐 Platform: {plat_lbl}\n\n"
         "<i>Checking API key and creating jobs…</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
-    api_key = os.environ.get("CC_API_KEY", "").strip()
+    if platform == "fc":
+        api_key = os.environ.get("FC_API_KEY", "").strip()
+        key_src = "FC_API_KEY"
+    else:
+        api_key = os.environ.get("CC_API_KEY", "").strip()
+        key_src = "CC_API_KEY"
 
-    try:
-        from services.cloudconvert_api import parse_api_keys, pick_best_key
-        keys = parse_api_keys(api_key)
-        if len(keys) > 1:
-            selected, credits = await pick_best_key(keys)
-            key_info = f"🔑 Key {keys.index(selected)+1}/{len(keys)} ({credits} credits left)"
-        else:
-            key_info = "🔑 1 API key"
-    except Exception as exc:
+    if not api_key:
         await safe_edit(
             st,
-            f"❌ <b>All API keys exhausted</b>\n\n<code>{str(exc)[:200]}</code>",
+            f"❌ <b>{key_src} not set</b>\n\n"
+            f"Add <code>{key_src}=your_key</code> to .env or Colab secrets.",
             parse_mode=enums.ParseMode.HTML,
         )
         _clear(uid)
         return
+
+    # Key credit check (CC only — FC credits checked per-job)
+    key_info = ""
+    if platform == "cc":
+        try:
+            from services.cloudconvert_api import parse_api_keys, pick_best_key
+            keys = parse_api_keys(api_key)
+            if len(keys) > 1:
+                selected, credits = await pick_best_key(keys)
+                key_info = f"🔑 Key {keys.index(selected)+1}/{len(keys)} ({credits} credits left)"
+            else:
+                key_info = "🔑 1 CC API key"
+        except Exception as exc:
+            await safe_edit(
+                st,
+                f"❌ <b>All CC API keys exhausted</b>\n\n<code>{str(exc)[:200]}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            _clear(uid)
+            return
+    else:
+        try:
+            from services.freeconvert_api import parse_fc_keys, pick_best_fc_key
+            fc_keys = parse_fc_keys(api_key)
+            if len(fc_keys) > 1:
+                best_key, minutes = await pick_best_fc_key(fc_keys)
+                key_info = f"🔑 Key {fc_keys.index(best_key)+1}/{len(fc_keys)} ({minutes:.0f} min left)"
+                api_key  = best_key
+            else:
+                key_info = "🔑 1 FC API key"
+        except Exception as exc:
+            await safe_edit(
+                st,
+                f"❌ <b>All FC API keys exhausted</b>\n\n<code>{str(exc)[:200]}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            _clear(uid)
+            return
 
     results: list[str] = []
     ok_count = 0
 
     for i, video in enumerate(videos):
         vname, result, success = await _submit_one_job(
-            api_key, video, sub_path, sub_fname, uid,
+            api_key, video, sub_path, sub_fname, uid, crf=crf, platform=platform,
         )
         if success:
             results.append(f"✅ {i+1}. <code>{vname[:35]}</code> → <code>{result}</code>")
@@ -238,19 +499,25 @@ async def _submit_batch(st, state: dict, uid: int) -> None:
             results.append(f"❌ {i+1}. <code>{vname[:35]}</code> — {result}")
 
     result_text = "\n".join(results)
+    wh_note = (
+        "⬆️ <i>Webhook active — result uploads automatically.</i>"
+        if platform == "fc"
+        else "⏳ <i>CloudConvert is processing…\nThe webhook will auto-upload results.</i>"
+    )
     await safe_edit(
         st,
         f"{'✅' if ok_count == count else '⚠️'} <b>Hardsub — {ok_count}/{count} submitted</b>\n"
         "──────────────────────\n\n"
         f"{result_text}\n\n"
         f"💬 <code>{sub_fname[:38]}</code>\n"
+        f"⚙️ {crf_lbl}  ·  🌐 {plat_lbl}\n"
         f"{key_info}\n\n"
-        "⏳ <i>CloudConvert is processing…\n"
-        "The webhook will auto-upload results to this chat.</i>",
+        f"{wh_note}",
         parse_mode=enums.ParseMode.HTML,
     )
 
-    log.info("[Hardsub] Batch: %d/%d jobs submitted for uid=%d", ok_count, count, uid)
+    log.info("[Hardsub] Batch: %d/%d jobs submitted for uid=%d (CRF=%d)",
+             ok_count, count, uid, crf)
     _clear(uid)
 
 
@@ -302,6 +569,8 @@ async def cmd_hardsub(client: Client, msg: Message):
         "videos":    [],
         "sub_path":  None,
         "sub_fname": None,
+        "crf":       20,
+        "platform":  _default_platform(),
     }
 
     await msg.reply(
@@ -309,10 +578,11 @@ async def cmd_hardsub(client: Client, msg: Message):
         "──────────────────────\n\n"
         "Send me the <b>video</b>:\n"
         "• A <b>video file</b> (upload from Telegram)\n"
-        "• A <b>direct URL</b> (HTTP link to .mkv/.mp4) — will download first\n"
+        "• A <b>direct URL</b> (HTTP link to .mkv/.mp4)\n"
         "• A <b>magnet link</b> (downloaded via aria2 first)\n\n"
         "📦 <i>You can send multiple videos — they'll all get\n"
         "the same subtitle burned in.</i>\n\n"
+        "⚙️ <i>Quality can be set when I ask for the subtitle.</i>\n\n"
         "<i>Send /cancel to abort.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
@@ -360,14 +630,11 @@ async def hardsub_flow_cb(client: Client, cb: CallbackQuery):
         if not state["videos"]:
             return await cb.answer("No videos added yet!", show_alert=True)
         state["step"] = "waiting_subtitle"
-        count = len(state["videos"])
-        await cb.message.edit(
-            f"✅ <b>{count} video{'s' if count > 1 else ''} queued</b>\n\n"
-            "Now send the <b>subtitle</b> (one for all):\n"
-            "• A <b>file</b> (.ass / .srt / .vtt / .txt)\n"
-            "• A <b>URL</b> to a subtitle file",
-            parse_mode=enums.ParseMode.HTML,
-        )
+        count  = len(state["videos"])
+        fname  = state["videos"][0]["fname"]
+        path   = state["videos"][0].get("path")
+        fsize  = os.path.getsize(path) if path and os.path.isfile(path) else 0
+        await _show_subtitle_prompt(cb.message, uid, fname, fsize)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -391,8 +658,10 @@ async def hardsub_video_file(client: Client, msg: Message):
     fname = getattr(media, "file_name", None) or "video.mkv"
     ext   = os.path.splitext(fname)[1].lower()
 
-    _VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv",
-                   ".ts", ".m2ts", ".wmv", ".m4v"}
+    _VIDEO_EXTS = {
+        ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv",
+        ".ts", ".m2ts", ".wmv", ".m4v",
+    }
     if ext not in _VIDEO_EXTS and not msg.video:
         return
 
@@ -428,12 +697,13 @@ async def hardsub_video_file(client: Client, msg: Message):
 
 @Client.on_message(
     filters.private & filters.text & ~filters.command(
-        ["start", "help", "settings", "info", "status", "log", "restart",
-         "broadcast", "admin", "ban_user", "unban_user", "banned_list",
-         "cancel", "show_thumb", "del_thumb", "json_formatter", "bulk_url",
-         "hardsub", "stream", "forward", "createarchive", "archiveddone", "mergedone",
-         "nyaa_add", "nyaa_list", "nyaa_remove", "nyaa_check",
-         "nyaa_search", "nyaa_dump", "nyaa_toggle", "nyaa_edit"]
+        ["start","help","settings","info","status","log","restart",
+         "broadcast","admin","ban_user","unban_user","banned_list",
+         "cancel","show_thumb","del_thumb","json_formatter","bulk_url",
+         "hardsub","stream","forward","createarchive","archiveddone","mergedone",
+         "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
+         "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit",
+         "resize","compress","usage","allow","deny","allowed"]
     ),
     group=1,
 )
@@ -462,8 +732,7 @@ async def hardsub_url_handler(client: Client, msg: Message):
         raw_name = text.split("/")[-1].split("?")[0]
         fname    = _urlparse.unquote_plus(raw_name)[:50] or "video.mkv"
         st = await msg.reply(
-            f"⬇️ <b>Downloading video…</b>\n"
-            f"<code>{fname[:40]}</code>",
+            f"⬇️ <b>Downloading video…</b>\n<code>{fname[:40]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
         tmp = state["tmp"]
@@ -481,9 +750,7 @@ async def hardsub_url_handler(client: Client, msg: Message):
         msg.stop_propagation()
 
     # FIX BUG-04: Added "scrape" to the elif tuple.
-    # classify() returns "scrape" for vidmoli.com, sbnet.*, streamtape, etc.
-    # Previously these fell through silently, stalling the hardsub flow.
-    elif kind in ("magnet", "torrent", "ytdlp", "gdrive", "mediafire", "scrape"):
+    elif kind in ("magnet","torrent","ytdlp","gdrive","mediafire","scrape"):
         st = await msg.reply(
             f"⬇️ Downloading video via {kind}…\n"
             "<i>This may take a while for magnets.</i>",
@@ -506,7 +773,6 @@ async def hardsub_url_handler(client: Client, msg: Message):
         except Exception as exc:
             await safe_edit(st, f"❌ Download failed: <code>{exc}</code>",
                             parse_mode=enums.ParseMode.HTML)
-
         msg.stop_propagation()
 
 
@@ -565,7 +831,9 @@ async def hardsub_subtitle_file(client: Client, msg: Message):
 # Step 2b: Receive subtitle URL
 # ─────────────────────────────────────────────────────────────
 
-async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) -> None:
+async def _handle_subtitle_url(
+    msg: Message, state: dict, url: str, uid: int,
+) -> None:
     tmp = state["tmp"]
 
     parsed_path = _urlparse.urlparse(url).path
