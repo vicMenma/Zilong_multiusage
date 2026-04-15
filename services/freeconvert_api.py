@@ -653,3 +653,180 @@ def fc_webhook_url(base_url: str) -> str:
         → "https://abc123.trycloudflare.com/fc-webhook"
     """
     return base_url.rstrip("/") + "/fc-webhook"
+
+
+# ─────────────────────────────────────────────────────────────
+# FreeConvert webhook subscription management
+# ─────────────────────────────────────────────────────────────
+# Called at tunnel startup to purge stale subscriptions and register
+# a fresh one pointing to the new /fc-webhook URL.
+#
+# API endpoints (FreeConvert v1):
+#   GET    /v1/process/webhooks        — list subscriptions
+#   POST   /v1/process/webhooks        — create subscription
+#   DELETE /v1/process/webhooks/{id}   — delete one
+# ─────────────────────────────────────────────────────────────
+
+_FC_WH_BASE  = "https://api.freeconvert.com/v1/process/webhooks"
+_FC_WH_EVENTS = ["job.completed", "job.failed"]   # events sent by FreeConvert
+
+
+async def list_fc_webhooks(api_key: str) -> list[dict]:
+    """
+    Return all webhook subscriptions registered for this FC API key.
+    Each dict contains at least: {"id": "...", "url": "...", "events": [...]}
+    """
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
+        async with sess.get(_FC_WH_BASE, headers=headers) as resp:
+            if resp.status == 401:
+                raise PermissionError("FreeConvert API key invalid (401)")
+            data = await resp.json()
+
+    # Handle both {"data": [...]} and direct list responses
+    if isinstance(data, list):
+        return data
+    return data.get("data") or []
+
+
+async def delete_fc_webhook(api_key: str, webhook_id: str) -> bool:
+    """
+    Delete a single FreeConvert webhook subscription by ID.
+    Returns True on success.
+    """
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
+        async with sess.delete(
+            f"{_FC_WH_BASE}/{webhook_id}",
+            headers=headers,
+        ) as resp:
+            if resp.status in (200, 204):
+                log.debug("[FC-WH] Deleted webhook %s", webhook_id)
+                return True
+            body = await resp.text()
+            log.warning("[FC-WH] Delete %s returned %d: %s",
+                        webhook_id, resp.status, body[:120])
+            return False
+
+
+async def create_fc_webhook(
+    api_key: str,
+    url: str,
+    events: list[str] = _FC_WH_EVENTS,
+) -> dict:
+    """
+    Register a new FreeConvert webhook subscription.
+    Returns the created webhook dict.
+    """
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"url": url, "events": events}
+    async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
+        async with sess.post(_FC_WH_BASE, json=payload, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status not in (200, 201):
+                msg = (data.get("message") or str(data))
+                raise RuntimeError(
+                    f"FreeConvert webhook creation failed ({resp.status}): {msg}"
+                )
+
+    wh = data.get("data") or data
+    log.info("[FC-WH] Registered webhook id=%s → %s", wh.get("id", "?"), url)
+    return wh
+
+
+async def _sync_one_fc_key(api_key: str, new_webhook_url: str) -> dict:
+    """
+    For a single FC API key:
+      1. List all existing webhook subscriptions.
+      2. Delete every one.
+      3. Register a fresh subscription pointing to new_webhook_url.
+    """
+    tail   = api_key[-6:]
+    result = {"key_tail": f"...{tail}", "deleted": 0, "registered": None, "error": ""}
+
+    try:
+        existing = await list_fc_webhooks(api_key)
+        log.info("[FC-WH] Key ...%s: found %d existing webhook(s)", tail, len(existing))
+
+        deleted = 0
+        for wh in existing:
+            wh_id  = wh.get("id") or wh.get("_id")
+            wh_url = wh.get("url", "?")
+            if not wh_id:
+                continue
+            log.info("[FC-WH] Deleting webhook id=%s  url=%s", wh_id, wh_url[:60])
+            ok = await delete_fc_webhook(api_key, str(wh_id))
+            if ok:
+                deleted += 1
+            await asyncio.sleep(0.3)
+
+        result["deleted"] = deleted
+
+        wh = await create_fc_webhook(api_key, new_webhook_url)
+        result["registered"] = wh.get("id") or wh.get("_id", "?")
+
+    except PermissionError as exc:
+        result["error"] = str(exc)
+        log.error("[FC-WH] Key ...%s invalid: %s", tail, exc)
+    except Exception as exc:
+        result["error"] = str(exc)[:120]
+        log.error("[FC-WH] Key ...%s error: %s", tail, exc, exc_info=True)
+
+    return result
+
+
+async def sync_fc_webhooks(
+    tunnel_base_url: str,
+    api_keys: Optional[list[str]] = None,
+    webhook_path: str = "/fc-webhook",
+) -> list[dict]:
+    """
+    Clean up all stale FreeConvert webhook subscriptions and register
+    a fresh one per API key pointing to the new tunnel URL.
+
+    Args:
+        tunnel_base_url:  e.g. "https://abc123.trycloudflare.com"
+        api_keys:         list of FC API keys to process.
+                          If None, reads FC_API_KEY + FC_API_KEY_2 … from env.
+        webhook_path:     path appended to base URL. Default "/fc-webhook".
+
+    Returns:
+        List of per-key result dicts.
+
+    Example:
+        results = await sync_fc_webhooks("https://abc.trycloudflare.com")
+        for r in results:
+            print(r["key_tail"], "deleted:", r["deleted"], "new id:", r["registered"])
+    """
+    import re as _re
+
+    new_url = tunnel_base_url.rstrip("/") + webhook_path
+
+    if api_keys is None:
+        all_keys: list[str] = []
+        raw = os.environ.get("FC_API_KEY", "").strip()
+        if raw:
+            all_keys.extend(k.strip() for k in _re.split(r"[,\s\n]+", raw) if k.strip())
+        for i in range(2, 10):
+            extra = os.environ.get(f"FC_API_KEY_{i}", "").strip()
+            if extra:
+                all_keys.extend(k.strip() for k in _re.split(r"[,\s\n]+", extra) if k.strip())
+        api_keys = all_keys
+
+    if not api_keys:
+        log.info("[FC-WH] No FC API keys configured — skipping FC webhook sync")
+        return []
+
+    log.info("[FC-WH] Syncing %d FC key(s) → %s", len(api_keys), new_url)
+
+    tasks   = [_sync_one_fc_key(k, new_url) for k in api_keys]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+
+    total_del = sum(r["deleted"] for r in results)
+    total_ok  = sum(1 for r in results if r.get("registered"))
+    total_err = sum(1 for r in results if r.get("error"))
+    log.info(
+        "[FC-WH] Sync complete: %d deleted, %d registered, %d errors",
+        total_del, total_ok, total_err,
+    )
+    return results
