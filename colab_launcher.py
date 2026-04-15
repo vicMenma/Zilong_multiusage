@@ -27,6 +27,7 @@ LOG_CHANNEL   = 0      # @param {type:"integer"}
 NGROK_TOKEN       = ""  # @param {type:"string"}
 CC_WEBHOOK_SECRET = ""  # @param {type:"string"}
 CC_API_KEY        = ""  # @param {type:"string"}
+FC_API_KEY        = ""  # @param {type:"string"}
 SEEDR_USERNAME    = ""  # @param {type:"string"}
 SEEDR_PASSWORD    = ""  # @param {type:"string"}
 GITHUB_TOKEN      = ""  # @param {type:"string"}

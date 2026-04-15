@@ -212,8 +212,35 @@ async def main() -> None:
             log.info("☁️  CloudConvert webhook active: %s", webhook_url)
         else:
             log.info("☁️  Webhook server running (local only).")
+
+        # Sync CC webhook subscriptions and recover any pending jobs
+        # that finished while the bot was offline.
+        try:
+            from services.webhook_sync import on_tunnel_ready, poll_pending_jobs
+            from core.config import get_tunnel_url
+            _turl = get_tunnel_url()
+            if _turl:
+                await on_tunnel_ready(_turl)
+                log.info("🔄 CC webhook subscriptions synced → %s", _turl)
+            await poll_pending_jobs()
+            log.info("🔄 Pending jobs recovery complete")
+        except Exception as exc:
+            log.warning("webhook_sync startup failed: %s", exc)
+
     else:
         log.info("ℹ️  No CC_API_KEY — CloudConvert features disabled")
+
+    # ── FreeConvert startup ──────────────────────────────────
+    fc_api_key = cfg.fc_api_key or os.environ.get("FC_API_KEY", "").strip()
+    if fc_api_key:
+        try:
+            import plugins.fc_webhook as fc_webhook
+            await fc_webhook.startup_load()
+            log.info("🆓 FreeConvert webhook store loaded")
+        except Exception as exc:
+            log.warning("FC webhook startup failed: %s", exc)
+    else:
+        log.info("ℹ️  No FC_API_KEY — FreeConvert features disabled")
 
     # ── ccstatus auto-poller ─────────────────────────────────
     if cfg.cc_api_key:
