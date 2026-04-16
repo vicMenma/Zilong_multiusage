@@ -119,9 +119,32 @@ async def _run(cmd: list, label: str = "FFmpeg") -> None:
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        err = stderr.decode(errors="replace")[-1200:].strip()
-        log.error("%s failed rc=%d — %s", label, proc.returncode, err[-300:])
-        raise RuntimeError(f"{label} failed (rc={proc.returncode}):\n{err}")
+        raw_err = stderr.decode(errors="replace").strip()
+        log.error("%s failed rc=%d — %s", label, proc.returncode, raw_err[-400:])
+        # FIX: Filter out informational FFmpeg output (chapters, format info)
+        # that clutters the error message shown to users
+        lines = raw_err.splitlines()
+        _NOISE_PREFIXES = (
+            "    Chapter", "      Metadata", "        title", "        artist",
+            "Input #", "Output #", "  Duration", "  Stream #", "  Metadata",
+            "    Stream", "    handler", "    encoder", "    creation",
+            "frame=", "fps=", "bitrate=", "speed=", "size=",
+        )
+        error_lines = [
+            l for l in lines
+            if l.strip()
+            and not any(l.startswith(p) or l.lstrip().startswith(p.lstrip()) for p in _NOISE_PREFIXES)
+        ]
+        # Keep only lines that look like actual errors or the last context
+        meaningful = [
+            l for l in error_lines
+            if any(kw in l.lower() for kw in (
+                "error", "invalid", "failed", "cannot", "unable", "no such",
+                "permission", "codec not", "unknown", "unsupported", "fatal",
+            ))
+        ] or error_lines[-15:]
+        err_display = "\n".join(meaningful[-15:]) if meaningful else raw_err[-600:]
+        raise RuntimeError(f"{label} failed (rc={proc.returncode}):\n{err_display}")
 
 
 async def _probe_json(args: list) -> Optional[dict]:
@@ -768,18 +791,28 @@ async def optimize(inp: str, out: str, crf: int = 23) -> None:
 
 
 async def convert_video(inp: str, out: str) -> None:
+    """
+    Convert video to the output format.
+    FIX: Added -map_chapters -1 to strip chapter metadata that caused
+    rc=1 failures on files with chapter tracks.  Added explicit stream
+    mapping to avoid issues with attached-pic / cover-art streams.
+    """
     try:
         await _run([
             "ffmpeg", "-y", "-i", inp,
+            "-map", "0:v:0", "-map", "0:a?",
             "-c:v", "copy", "-c:a", "copy",
+            "-map_chapters", "-1",
             out,
         ], "ConvertVideo(copy)")
     except RuntimeError:
         log.info("convert_video copy failed — retrying with re-encode")
         await _run([
             "ffmpeg", "-y", "-i", inp,
+            "-map", "0:v:0", "-map", "0:a?",
             "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-c:a", "aac", "-b:a", "192k",
+            "-map_chapters", "-1",
             out,
         ], "ConvertVideo(reencode)")
 
