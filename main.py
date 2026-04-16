@@ -227,6 +227,12 @@ async def main() -> None:
         try:
             import plugins.fc_webhook as fc_webhook
             await fc_webhook.startup_load()
+            # Also pre-load the fc_seedr plugin to ensure its handlers register
+            try:
+                import plugins.fc_seedr  # noqa: F401
+                log.info("🆓 FreeConvert Seedr pipeline loaded")
+            except Exception as exc:
+                log.warning("fc_seedr import: %s", exc)
             log.info("🆓 FreeConvert job store loaded")
         except ImportError as exc:
             # MAIN-04: log at warning so user can see what's missing
