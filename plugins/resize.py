@@ -578,14 +578,82 @@ async def rsz_cb(client: Client, cb: CallbackQuery):
 async def _do_resize(
     client, msg, path: str, fname: str, tmp: str, height: int, uid: int,
 ) -> None:
+    """
+    Resize video to `height` px.
+    Tries FreeConvert first (upload local file → cloud resize).
+    Falls back to local FFmpeg if FC not configured or job fails.
+    """
     from services.task_runner import tracker, TaskRecord
     from services import ffmpeg as FF
     from services.uploader import upload_file
+    from services.freeconvert_api import parse_fc_keys
 
     name_base = os.path.splitext(fname)[0]
     out_fname = f"{name_base}_{height}p.mp4"
     out       = os.path.join(tmp, out_fname)
 
+    # ── Try FreeConvert ───────────────────────────────────────
+    fc_raw  = os.environ.get("FC_API_KEY", "").strip()
+    fc_keys = parse_fc_keys(fc_raw)
+    for _ii in range(2, 10):
+        _xtra = os.environ.get(f"FC_API_KEY_{_ii}", "").strip()
+        if _xtra:
+            fc_keys.extend(parse_fc_keys(_xtra))
+
+    if fc_keys:
+        try:
+            from services.freeconvert_api import pick_best_fc_key, submit_convert, run_fc_job
+            tid    = tracker.new_tid()
+            record = TaskRecord(
+                tid=tid, user_id=uid,
+                label=f"FC Resize → {height}p",
+                mode="proc", engine="freeconvert",
+                fname=fname, state=f"☁️ Uploading to FC…",
+            )
+            await tracker.register(record)
+            try:
+                await safe_edit(msg,
+                    f"☁️ <b>FC Resize → {height}p</b>\n"
+                    f"<code>{fname[:40]}</code>\n⬆️ Uploading to FreeConvert…",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+                key, _mins = await pick_best_fc_key(fc_keys)
+                job_id = await submit_convert(
+                    key, video_path=path, scale_height=height, crf=23, output_name=out_fname,
+                )
+                await safe_edit(msg,
+                    f"⏳ <b>FC Resize → {height}p</b>\n"
+                    f"🆔 <code>{job_id}</code>\n<i>FreeConvert processing…</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+                result_path = await run_fc_job(key, job_id, tmp, output_name=out_fname)
+                record.update(state="✅ Done")
+                fsize = os.path.getsize(result_path)
+                try: await msg.delete()
+                except Exception: pass
+                st = await client.send_message(
+                    uid,
+                    f"📐 <b>FC Resize done!</b>  {height}p\n"
+                    f"<code>{out_fname}</code>  <code>{human_size(fsize)}</code>\n"
+                    f"⬆️ Uploading…",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+                try:
+                    await upload_file(client, st, result_path, user_id=uid)
+                finally:
+                    cleanup(tmp)
+                return
+            except Exception as exc:
+                record.update(state="⚠️ FC failed")
+                log.warning("[FC-resize] FC failed, fallback: %s", exc)
+                await safe_edit(msg,
+                    f"⚠️ FC failed — using local FFmpeg\n<code>{str(exc)[:100]}</code>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+        except Exception as exc:
+            log.warning("[FC-resize] FC setup failed: %s", exc)
+
+    # ── Local FFmpeg fallback ─────────────────────────────────
     tid    = tracker.new_tid()
     record = TaskRecord(
         tid=tid, user_id=uid,
@@ -651,6 +719,57 @@ async def _do_compress(
     )
     await tracker.register(record)
 
+    # ── Try FreeConvert first ─────────────────────────────────
+    from services.freeconvert_api import parse_fc_keys
+    fc_raw2  = os.environ.get("FC_API_KEY", "").strip()
+    fc_keys2 = parse_fc_keys(fc_raw2)
+    for _jj in range(2, 10):
+        _xtra2 = os.environ.get(f"FC_API_KEY_{_jj}", "").strip()
+        if _xtra2:
+            fc_keys2.extend(parse_fc_keys(_xtra2))
+
+    if fc_keys2:
+        try:
+            from services.freeconvert_api import pick_best_fc_key, submit_compress, run_fc_job
+            record.update(state="☁️ Uploading to FC…")
+            await safe_edit(msg,
+                f"🗜️ <b>FC Compress → {target_mb:.0f} MB</b>\n"
+                f"<code>{fname[:40]}</code>\n⬆️ Uploading to FreeConvert…",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            key2c, _mc = await pick_best_fc_key(fc_keys2)
+            job_idc = await submit_compress(key2c, video_path=path, target_mb=target_mb, output_name=out_fname)
+            await safe_edit(msg,
+                f"⏳ <b>FC Compress → {target_mb:.0f} MB</b>\n"
+                f"🆔 <code>{job_idc}</code>\n<i>FreeConvert processing…</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            result_c = await run_fc_job(key2c, job_idc, tmp, output_name=out_fname)
+            record.update(state="✅ Done")
+            fsize_c = os.path.getsize(result_c)
+            log.info("[Compress] FC done: %s → %.0f MB actual %s", fname, target_mb, human_size(fsize_c))
+            try: await msg.delete()
+            except Exception: pass
+            st_c = await client.send_message(
+                uid,
+                f"🗜️ <b>FC Compress done!</b>  {human_size(fsize_c)}\n"
+                f"<code>{out_fname}</code>\n⬆️ Uploading…",
+                parse_mode=enums.ParseMode.HTML,
+            )
+            try:
+                await upload_file(client, st_c, result_c, user_id=uid)
+            finally:
+                cleanup(tmp)
+            return
+        except Exception as exc:
+            record.update(state="⚠️ FC failed")
+            log.warning("[FC-compress] FC failed, fallback: %s", exc)
+            await safe_edit(msg,
+                f"⚠️ FC failed — using local FFmpeg 2-pass\n<code>{str(exc)[:100]}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+
+    # ── Local FFmpeg 2-pass fallback ──────────────────────────
     try:
         record.update(state="🗜️ Pass 1/2…")
         await FF.compress_to_size(path, out, target_mb)

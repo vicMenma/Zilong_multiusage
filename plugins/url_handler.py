@@ -207,7 +207,9 @@ def _url_kb(token: str, kind: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🔵 Stream Extractor",  callback_data=f"dl|magnet_stream|{token}"),
              InlineKeyboardButton("📊 Media Info",        callback_data=f"dl|info|{token}")],
             [InlineKeyboardButton("🔥 Hardsub (local)",   callback_data=f"dl|hardsub|{token}"),
-             InlineKeyboardButton("🔥 Seedr+Hardsub",     callback_data=f"shs|start|{token}")],
+             InlineKeyboardButton("🔥 Seedr+CC Hardsub",  callback_data=f"shs|start|{token}")],
+            [InlineKeyboardButton("🔄 Seedr+FC Convert",  callback_data=f"sfc|convert|{token}"),
+             InlineKeyboardButton("🔥 Seedr+FC Hardsub",  callback_data=f"sfc|hardsub|{token}")],
             [InlineKeyboardButton("❌ Cancel",            callback_data=f"dl|cancel|{token}")],
         ])
     elif kind == "gdrive":
@@ -789,54 +791,55 @@ async def dl_cb(client: Client, cb: CallbackQuery):
         asyncio.create_task(start_hardsub_for_url(client, st, uid, url, fname))
         return
 
-    # ── NEW: Compress (local FFmpeg, asks for MB) ───────────
+    # ── Compress via FreeConvert (URL-based, no local download needed) ──
     if mode == "compress":
         kind_c = classify(url)
         if kind_c in ("magnet", "torrent"):
             return await safe_edit(
                 cb.message,
                 "❌ Compress is not available for magnets/torrents from this menu.\n"
-                "Download first, then send the video file to the bot.",
+                "Use <b>Seedr+FC Convert</b> to download and convert via FreeConvert.",
                 parse_mode=enums.ParseMode.HTML,
             )
         fname_c = _up.unquote_plus(url.split("/")[-1].split("?")[0])[:50] or "video"
         _evict_url_compress()
         _url_compress_pending[uid] = {
-            "token": token,
-            "fname": fname_c,
-            "msg":   cb.message,
-            "ts":    time.time(),
+            "token":    token,
+            "fname":    fname_c,
+            "msg":      cb.message,
+            "ts":       time.time(),
+            "use_fc":   True,   # FreeConvert instead of local FFmpeg
         }
         await cb.message.edit(
-            f"🗜️ <b>Compress Video</b>\n"
+            f"🗜️ <b>FC Compress</b>\n"
             "──────────────────────\n\n"
             f"📁 <code>{fname_c[:50]}</code>\n\n"
             "Send target size in <b>MB</b>:\n"
             "<code>85</code>  ·  <code>200</code>  ·  <code>500</code>\n\n"
-            "<i>FFmpeg 2-pass encode — no API key required.\n"
+            "<i>FreeConvert cloud compression — fast, no local download.\n"
             "Send /cancel to abort.</i>",
             parse_mode=enums.ParseMode.HTML,
         )
         return
 
-    # ── NEW: Local Convert (local FFmpeg, resolution picker) ─
+    # ── Convert/Resize via FreeConvert ─────────────────────────
     if mode == "lconvert":
         kind_lc = classify(url)
         if kind_lc in ("magnet", "torrent"):
             return await safe_edit(
                 cb.message,
                 "❌ Convert is not available for magnets/torrents from this menu.\n"
-                "Download first, then send the video file to the bot.",
+                "Use <b>Seedr+FC Convert</b> for magnets.",
                 parse_mode=enums.ParseMode.HTML,
             )
         fname_lc = _up.unquote_plus(url.split("/")[-1].split("?")[0])[:50] or "video"
         await cb.message.edit(
-            f"🔄 <b>Local Convert / Resize</b>\n"
+            f"🔄 <b>FC Convert / Resize</b>\n"
             "──────────────────────\n\n"
             f"📁 <code>{fname_lc[:50]}</code>\n\n"
             "Choose target resolution:\n"
-            "<i>Uses local FFmpeg — no API key required.\n"
-            "Original = fast remux (copy streams, no re-encode)</i>",
+            "<i>FreeConvert cloud — fast, no local download needed.\n"
+            "Original = re-encode to MP4 at same resolution.</i>",
             parse_mode=enums.ParseMode.HTML,
             reply_markup=_lconvert_kb(token),
         )
@@ -920,8 +923,8 @@ async def dl_cb(client: Client, cb: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^lcv\|"))
 async def lcv_cb(client: Client, cb: CallbackQuery):
     """
-    Handle local FFmpeg convert from URL.
-    Downloads the video then runs ffmpeg.resize_video (or remux).
+    Convert/resize from URL — tries FreeConvert first (no local download),
+    falls back to local FFmpeg if FC_API_KEY not configured or job fails.
     """
     parts = cb.data.split("|", 2)
     if len(parts) < 3:
@@ -936,24 +939,115 @@ async def lcv_cb(client: Client, cb: CallbackQuery):
         return await safe_edit(cb.message, "❌ Session expired. Resend the link.",
                                parse_mode=enums.ParseMode.HTML)
 
-    height     = int(height_s) if height_s.isdigit() else 0
-    res_label  = f"{height}p" if height else "Original (remux)"
-    fname_raw  = _up.unquote_plus(url.split("/")[-1].split("?")[0])[:50] or "video.mkv"
-    name_base  = os.path.splitext(fname_raw)[0]
-    out_fname  = f"{name_base}_{res_label.replace(' ', '_')}.mp4"
+    height    = int(height_s) if height_s.isdigit() else 0
+    res_label = f"{height}p" if height else "Original"
+    fname_raw = _up.unquote_plus(url.split("/")[-1].split("?")[0])[:50] or "video.mkv"
+    name_base = os.path.splitext(fname_raw)[0]
+    out_fname = f"{name_base}_{res_label}.mp4"
 
-    st = await cb.message.edit(
-        f"⬇️ <b>Downloading for convert…</b>\n"
-        "──────────────────────\n\n"
-        f"🎬 <code>{fname_raw[:45]}</code>\n"
-        f"📐 → <b>{res_label}</b>\n\n"
-        "<i>Using local FFmpeg — no API key needed.</i>",
-        parse_mode=enums.ParseMode.HTML,
-    )
+    # ── Try FreeConvert first ─────────────────────────────────
+    from services.freeconvert_api import parse_fc_keys
+    fc_raw  = os.environ.get("FC_API_KEY", "").strip()
+    fc_keys = parse_fc_keys(fc_raw)
+    for _i in range(2, 10):
+        _extra = os.environ.get(f"FC_API_KEY_{_i}", "").strip()
+        if _extra:
+            fc_keys.extend(parse_fc_keys(_extra))
 
-    tmp = make_tmp(cfg.download_dir, uid)
+    if fc_keys:
+        st = await cb.message.edit(
+            f"🔄 <b>FC Convert → {res_label}</b>\n"
+            "──────────────────────\n\n"
+            f"🎬 <code>{fname_raw[:45]}</code>\n"
+            f"📐 → <b>{res_label}</b>\n\n"
+            "☁️ <i>Selecting FreeConvert key…</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        tmp = make_tmp(cfg.download_dir, uid)
+        try:
+            from services.freeconvert_api import pick_best_fc_key, submit_convert, run_fc_job
+            key, _mins = await pick_best_fc_key(fc_keys)
+
+            await safe_edit(
+                st,
+                f"🔄 <b>FC Convert → {res_label}</b>\n"
+                "──────────────────────\n\n"
+                f"🎬 <code>{fname_raw[:40]}</code>\n"
+                f"📐 → <b>{res_label}</b>\n\n"
+                "☁️ <i>Submitting to FreeConvert…\n"
+                "(FC fetches the URL directly — no local download)</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+
+            job_id = await submit_convert(
+                key,
+                video_url=url,
+                scale_height=height,
+                crf=23,
+                output_name=out_fname,
+            )
+
+            async def _prog(pct: float, detail: str) -> None:
+                bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+                await safe_edit(
+                    st,
+                    f"🔄 <b>FC Convert → {res_label}</b>\n"
+                    "──────────────────────\n\n"
+                    f"🎬 <code>{fname_raw[:38]}</code>\n"
+                    f"<code>[{bar}]</code>  <b>{pct:.0f}%</b>\n\n"
+                    f"<i>{detail}</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+
+            await safe_edit(
+                st,
+                f"🔄 <b>FC Convert → {res_label}</b>\n"
+                "──────────────────────\n\n"
+                f"🎬 <code>{fname_raw[:40]}</code>\n"
+                f"🆔 <code>{job_id}</code>\n\n"
+                "⏳ <i>FreeConvert is converting…</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+
+            result_path = await run_fc_job(
+                key, job_id, tmp,
+                output_name=out_fname,
+                progress_cb=_prog,
+            )
+
+            fsize = os.path.getsize(result_path)
+            upload_st = await _floodwait_send(
+                client, uid,
+                f"🔄 <b>Convert done!</b>  {res_label}\n"
+                f"<code>{out_fname}</code>  <code>{human_size(fsize)}</code>\n"
+                f"⬆️ Uploading…",
+            )
+            try:
+                await upload_file(client, upload_st, result_path, user_id=uid)
+            finally:
+                cleanup(tmp)
+            return
+
+        except Exception as exc:
+            cleanup(tmp)
+            log.error("[FC-Convert] URL convert failed: %s", exc, exc_info=True)
+            # Fall through to local FFmpeg
+            await safe_edit(
+                cb.message,
+                f"⚠️ <b>FC Convert failed — falling back to local FFmpeg</b>\n"
+                f"<code>{str(exc)[:200]}</code>\n\n"
+                f"⬇️ <i>Downloading…</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+
+    # ── Local FFmpeg fallback ─────────────────────────────────
+    res_ll = f"{height}p" if height else "Original (remux)"
+    out_ll = f"{name_base}_{res_ll.replace(' ', '_')}.mp4"
+    st_ff  = cb.message   # reuse the panel message
+
+    tmp2 = make_tmp(cfg.download_dir, uid)
     try:
-        path = await smart_download(url, tmp, user_id=uid, label=fname_raw, msg=st)
+        path = await smart_download(url, tmp2, user_id=uid, label=fname_raw, msg=st_ff)
         if os.path.isdir(path):
             resolved = largest_file(path)
             if resolved:
@@ -962,50 +1056,47 @@ async def lcv_cb(client: Client, cb: CallbackQuery):
             raise FileNotFoundError("No output file found after download")
         fname_dl = os.path.basename(path)
     except Exception as exc:
-        cleanup(tmp)
+        cleanup(tmp2)
         return await safe_edit(
-            st,
+            st_ff,
             f"❌ <b>Download failed</b>\n\n<code>{str(exc)[:200]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
 
-    # Now process with local FFmpeg
     from services import ffmpeg as FF
-
-    out_path = os.path.join(tmp, out_fname)
-
+    out_path = os.path.join(tmp2, out_ll)
     try:
         await safe_edit(
-            st,
+            st_ff,
             f"⚙️ <b>Converting…</b>\n"
             f"<code>{fname_dl[:45]}</code>\n"
-            f"📐 → <b>{res_label}</b>",
+            f"📐 → <b>{res_ll}</b>",
             parse_mode=enums.ParseMode.HTML,
         )
         if height > 0:
             await FF.resize_video(path, out_path, height)
         else:
-            # Remux — fast stream copy
             await FF.stream_op(path, out_path, ["-map", "0", "-c", "copy"])
     except Exception as exc:
-        cleanup(tmp)
+        cleanup(tmp2)
         return await safe_edit(
-            st,
+            st_ff,
             f"❌ <b>Convert failed</b>\n\n<code>{str(exc)[:300]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
 
-    fsize = os.path.getsize(out_path)
-    upload_st = await _floodwait_send(
+    fsize2 = os.path.getsize(out_path)
+    up_st2 = await _floodwait_send(
         client, uid,
-        f"📐 <b>Convert done!</b>  {res_label}\n"
-        f"<code>{out_fname}</code>  <code>{human_size(fsize)}</code>\n"
+        f"📐 <b>Convert done!</b>  {res_ll}\n"
+        f"<code>{out_ll}</code>  <code>{human_size(fsize2)}</code>\n"
         f"⬆️ Uploading…",
     )
     try:
-        await upload_file(client, upload_st, out_path, user_id=uid)
+        await upload_file(client, up_st2, out_path, user_id=uid)
     finally:
-        cleanup(tmp)
+        cleanup(tmp2)
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1051,17 +1142,80 @@ async def url_compress_mb_handler(client: Client, msg: Message) -> None:
         msg.stop_propagation()
         return
 
-    target_mb = float(text)
+    target_mb  = float(text)
+    use_fc     = state.get("use_fc", False)
+    fname_raw2 = state.get("fname", fname_raw)
 
     st = await msg.reply(
-        f"🗜️ <b>Compress</b> → <b>{target_mb:.0f} MB</b>\n"
+        f"🗜️ <b>{'FC ' if use_fc else ''}Compress</b> → <b>{target_mb:.0f} MB</b>\n"
         "──────────────────────\n\n"
-        f"📁 <code>{fname_raw[:45]}</code>\n\n"
-        "⬇️ <i>Downloading first…</i>",
+        f"📁 <code>{fname_raw2[:45]}</code>\n\n"
+        + ("☁️ <i>Submitting to FreeConvert…</i>" if use_fc
+           else "⬇️ <i>Downloading first…</i>"),
         parse_mode=enums.ParseMode.HTML,
     )
 
     tmp = make_tmp(cfg.download_dir, uid)
+
+    if use_fc:
+        # FC compress: pass URL directly, no local download
+        try:
+            from services.freeconvert_api import parse_fc_keys, pick_best_fc_key, submit_compress, run_fc_job
+            fc_raw  = os.environ.get("FC_API_KEY", "").strip()
+            fc_keys = parse_fc_keys(fc_raw)
+            for i in range(2, 10):
+                extra2 = os.environ.get(f"FC_API_KEY_{i}", "").strip()
+                if extra2:
+                    fc_keys.extend(parse_fc_keys(extra2))
+            if not fc_keys:
+                raise RuntimeError("FC_API_KEY not configured")
+
+            key, _mins = await pick_best_fc_key(fc_keys)
+            name_base2 = os.path.splitext(fname_raw2)[0]
+            out_name2  = f"{name_base2}_{int(target_mb)}MB.mp4"
+
+            job_id = await submit_compress(
+                key, video_url=url, target_mb=target_mb, output_name=out_name2,
+            )
+
+            async def _comp_prog(pct: float, detail: str) -> None:
+                bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+                await safe_edit(
+                    st,
+                    f"🗜️ <b>FC Compress</b> → <b>{target_mb:.0f} MB</b>\n"
+                    "──────────────────────\n\n"
+                    f"📁 <code>{fname_raw2[:40]}</code>\n"
+                    f"<code>[{bar}]</code>  <b>{pct:.0f}%</b>\n\n"
+                    f"<i>{detail}</i>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+
+            result_path = await run_fc_job(
+                key, job_id, tmp, output_name=out_name2, progress_cb=_comp_prog,
+            )
+            result_size = os.path.getsize(result_path)
+            upload_st = await _floodwait_send(
+                client, uid,
+                f"🗜️ <b>Compress done!</b>\n"
+                f"<code>{out_name2}</code>  <code>{human_size(result_size)}</code>\n"
+                "⬆️ Uploading…",
+            )
+            try:
+                await upload_file(client, upload_st, result_path, user_id=uid)
+            finally:
+                cleanup(tmp)
+        except Exception as exc:
+            cleanup(tmp)
+            log.error("[FC-Compress] URL compress failed: %s", exc, exc_info=True)
+            await safe_edit(
+                st,
+                f"❌ <b>FC Compress failed</b>\n\n<code>{str(exc)[:300]}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        msg.stop_propagation()
+        return
+
+    # Local FFmpeg fallback (when use_fc=False)
     try:
         path = await smart_download(url, tmp, user_id=uid, label=fname_raw, msg=st)
         if os.path.isdir(path):
@@ -1077,7 +1231,6 @@ async def url_compress_mb_handler(client: Client, msg: Message) -> None:
         msg.stop_propagation()
         return
 
-    # Delegate to resize.py's _do_compress
     from plugins.resize import _do_compress
     fname_dl = os.path.basename(path)
     try:

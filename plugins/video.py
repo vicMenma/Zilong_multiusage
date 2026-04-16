@@ -548,6 +548,11 @@ async def audio_fmt_cb(client: Client, cb: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^vconv\|"))
 async def video_conv_cb(client: Client, cb: CallbackQuery):
+    """
+    Convert uploaded video to another format.
+    Tries FreeConvert first (upload file → cloud convert).
+    Falls back to local FFmpeg if FC not configured or fails.
+    """
     _, fmt, key = cb.data.split("|", 2)
     user_id = cb.from_user.id
     session = sessions.get(key)
@@ -560,8 +565,58 @@ async def video_conv_cb(client: Client, cb: CallbackQuery):
         path = await _ensure(client, session, st)
         if not path:
             return
-        out = os.path.join(session.tmp_dir,
-                           os.path.splitext(os.path.basename(path))[0] + f".{fmt}")
+        base     = os.path.splitext(os.path.basename(path))[0]
+        out_name = f"{base}.{fmt}"
+        out      = os.path.join(session.tmp_dir, out_name)
+
+        # ── Try FreeConvert ───────────────────────────────────
+        import os as _os
+        from services.freeconvert_api import parse_fc_keys
+        fc_raw  = _os.environ.get("FC_API_KEY", "").strip()
+        fc_keys = parse_fc_keys(fc_raw)
+        for _ii in range(2, 10):
+            _xtra = _os.environ.get(f"FC_API_KEY_{_ii}", "").strip()
+            if _xtra:
+                fc_keys.extend(parse_fc_keys(_xtra))
+
+        if fc_keys:
+            try:
+                from services.freeconvert_api import pick_best_fc_key, submit_convert, run_fc_job
+                from core.config import cfg as _cfg
+                from services.utils import make_tmp as _mktmp, cleanup as _cl, human_size as _hs
+
+                await safe_edit(st, f"☁️ Uploading to FreeConvert for {fmt.upper()} convert…")
+                key2, _mins = await pick_best_fc_key(fc_keys)
+                tmp_fc = _mktmp(_cfg.download_dir, user_id)
+
+                job_id = await submit_convert(
+                    key2,
+                    video_path=path,
+                    scale_height=0,
+                    crf=23,
+                    output_name=out_name,
+                )
+                await safe_edit(
+                    st,
+                    f"⏳ FreeConvert converting to {fmt.upper()}…\n"
+                    f"🆔 <code>{job_id}</code>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+                result_path = await run_fc_job(key2, job_id, tmp_fc, output_name=out_name)
+                await upload_file(client, st, result_path, user_id=user_id)
+                _cl(tmp_fc)
+                cleanup(session.tmp_dir)
+                await sessions.remove(key)
+                return
+            except Exception as exc:
+                log.warning("[FC-vconv] FC failed, fallback to local: %s", exc)
+                await safe_edit(
+                    st,
+                    f"⚠️ FC failed — using local FFmpeg\n<code>{str(exc)[:100]}</code>",
+                    parse_mode=enums.ParseMode.HTML,
+                )
+
+        # ── Local FFmpeg fallback ─────────────────────────────
         await safe_edit(st, f"🔄 Converting to {fmt.upper()}…")
         try:
             await _tracked_ffmpeg(user_id, f"Convert → {fmt.upper()}", os.path.basename(out),
