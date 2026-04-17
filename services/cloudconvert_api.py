@@ -394,6 +394,7 @@ async def submit_hardsub(
     subtitle_path: str = "",
     output_name:   str = "hardsub.mp4",
     crf:           int = 20,
+    preset:        str = "medium",
     scale_height:  int = 0,
     user_id:       int = 0,
 ) -> str:
@@ -407,7 +408,7 @@ async def submit_hardsub(
         raise ValueError("No API keys provided in CC_API_KEY")
 
     selected_key, credits = await pick_best_key(keys)
-    log.info("[CC-API] Hardsub: using key with %d credits remaining", credits)
+    log.info("[CC-API] Hardsub: key with %d credits (preset=%s crf=%d)", credits, preset, crf)
 
     video_fname = (
         os.path.basename(video_path) if video_path
@@ -422,6 +423,7 @@ async def submit_hardsub(
         subtitle_filename=sub_fname,
         output_filename=output_name,
         crf=crf,
+        preset=preset,
         scale_height=scale_height,
     )
 
