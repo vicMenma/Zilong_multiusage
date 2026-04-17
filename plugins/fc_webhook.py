@@ -110,7 +110,13 @@ async def _process_webhook(job_id: str, status: str, data: dict) -> None:
         return
 
     if status == "completed":
-        await fc_job_store.update(job_id, status="completed")
+        # FIX: Atomically claim this job for delivery.
+        # Prevents a double-upload race with _poll_fc_pending running simultaneously
+        # (e.g. bot restarts, poller fires, then FC retries the webhook delivery).
+        claimed = await fc_job_store.try_claim_delivery(job_id)
+        if not claimed:
+            log.info("[FC-WH] job %s already claimed for delivery — skipping duplicate", job_id)
+            return
         await _handle_completion(job, data)
         return
 
@@ -133,7 +139,8 @@ async def _handle_completion(job, data: dict) -> None:
 
     log.info("[FC-WH] Downloading result for job %s  uid=%d", job.job_id, job.uid)
 
-    tmp = make_tmp(None, job.uid)
+    from core.config import cfg as _cfg
+    tmp = make_tmp(_cfg.download_dir, job.uid)
     try:
         local_path = await download_direct(download_url, tmp)
         fname = job.output_name or os.path.basename(local_path)
@@ -179,8 +186,10 @@ async def _handle_completion(job, data: dict) -> None:
         await _notify_failure(job, str(exc)[:200])
     finally:
         cleanup(tmp)
-
-    await fc_job_store.remove(job.job_id)
+        try:
+            await fc_job_store.remove(job.job_id)
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────

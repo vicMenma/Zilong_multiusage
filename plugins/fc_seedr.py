@@ -614,6 +614,7 @@ async def _submit_fc_hardsub(
             output_name=output_name,
             status="processing",
             job_type="hardsub",
+            api_key=key,
         ))
 
         await safe_edit(
