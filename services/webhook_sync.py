@@ -162,6 +162,12 @@ async def _poll_fc_pending() -> None:
 
                 if status == "completed":
                     log.info("[WH-Sync] FC job %s completed — recovering", job.job_id)
+                    # FIX: Atomically claim delivery to prevent a race with the
+                    # FC webhook handler firing simultaneously on the same job.
+                    claimed = await fc_job_store.try_claim_delivery(job.job_id)
+                    if not claimed:
+                        log.info("[WH-Sync] FC job %s already claimed — skip", job.job_id)
+                        continue
                     from plugins.fc_webhook import _handle_completion
                     await _handle_completion(job, jdata)
 

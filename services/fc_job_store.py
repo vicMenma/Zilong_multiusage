@@ -75,6 +75,12 @@ class FCJobStore:
                 log.warning("[FC-Store] Load error (%s) — starting empty", exc)
                 self._jobs = {}
             self._evict_expired()
+            # Reset any job that was atomically claimed (status="completed") but not
+            # fully delivered before the process exited.  The poller will re-poll them.
+            for job in self._jobs.values():
+                if job.status == "completed":
+                    job.status = "processing"
+                    log.info("[FC-Store] Reset undelivered job %s → 'processing'", job.job_id)
 
     async def _save(self) -> None:
         """Persist to disk (called internally, lock must be held)."""
@@ -142,6 +148,23 @@ class FCJobStore:
             if job_id in self._jobs:
                 del self._jobs[job_id]
                 await self._save()
+
+    async def try_claim_delivery(self, job_id: str) -> bool:
+        """
+        Atomically claim this job for delivery by moving it from
+        'processing' → 'completed'.  Only the first caller returns True;
+        all subsequent callers (webhook retry, startup poller) return False.
+
+        This prevents the double-upload race between the FC webhook handler
+        and _poll_fc_pending running simultaneously on the same job.
+        """
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != "processing":
+                return False
+            job.status = "completed"
+            await self._save()
+            return True
 
     async def list_by_uid(self, uid: int) -> list[FCJob]:
         """Return all jobs belonging to a user, newest first."""

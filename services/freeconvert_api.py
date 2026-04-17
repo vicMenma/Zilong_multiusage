@@ -390,10 +390,25 @@ async def wait_for_job(
     poll_interval: float = 5.0,
     progress_cb=None,
 ) -> dict:
-    deadline = time.time() + timeout_s
-    start    = time.time()
+    deadline    = time.time() + timeout_s
+    start       = time.time()
+    _poll_errs  = 0            # consecutive network-error counter
+
     while time.time() < deadline:
-        job    = await _fc_get_job(api_key, job_id)
+        try:
+            job = await _fc_get_job(api_key, job_id)
+            _poll_errs = 0     # reset on success
+        except Exception as exc:
+            _poll_errs += 1
+            log.warning("[FC-API] Poll error for job %s (attempt %d): %s — retrying",
+                        job_id, _poll_errs, exc)
+            if _poll_errs >= 5:
+                raise RuntimeError(
+                    f"[FC] Job {job_id}: 5 consecutive poll failures — last: {exc}"
+                ) from exc
+            await asyncio.sleep(min(poll_interval * _poll_errs, 30.0))
+            continue
+
         status = job.get("status", "")
         if status == "completed":
             log.info("[FC-API] Job %s completed", job_id)
@@ -402,12 +417,16 @@ async def wait_for_job(
                 except Exception: pass
             return job
         elif status in ("failed", "cancelled", "error"):
-            tasks = job.get("tasks") or []
+            tasks   = job.get("tasks") or []
             err_msg = job.get("message") or ""
             for t in tasks:
                 if (t.get("status") or "") in ("error", "failed"):
-                    t_err = ((t.get("result") or {}).get("message") or
-                             t.get("message") or "")
+                    # Check both result.message and top-level message
+                    t_err = (
+                        ((t.get("result") or {}).get("message") or
+                         (t.get("result") or {}).get("error") or
+                         t.get("message") or "")
+                    )
                     if t_err:
                         err_msg = t_err
                         break

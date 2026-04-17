@@ -183,10 +183,40 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
             log.warning("[CC-Hook] No export URLs in payload")
             return web.json_response({"status": "no_urls"})
 
+        # FIX: Double-upload prevention.
+        # Design: the ccstatus poller is the *single authoritative delivery path*.
+        # The webhook's job is to write the export_url into cc_job_store so the
+        # poller can pick it up on its next cycle — NOT to download+upload directly.
+        # Direct _process_file is reserved for jobs not tracked in cc_job_store
+        # (e.g. jobs submitted via the CloudConvert dashboard, not the bot).
+        job_id = (data.get("job") or {}).get("id", "")
+        if job_id:
+            try:
+                from services.cc_job_store import cc_job_store
+                job_rec = cc_job_store.get(job_id)
+                if job_rec is not None:
+                    if job_rec.notified:
+                        log.info("[CC-Hook] job %s already notified — ignoring duplicate webhook", job_id)
+                        return web.json_response({"status": "already_delivered"})
+                    # Store the export URL; ccstatus poller will deliver it.
+                    export_url = files[0]["url"] if files else ""
+                    await cc_job_store.finish(job_id, export_url=export_url)
+                    log.info("[CC-Hook] job %s → export_url stored; poller will deliver", job_id)
+                    # Wake the poller in case it went idle waiting for jobs.
+                    try:
+                        from plugins.ccstatus import _ensure_poller
+                        _ensure_poller()
+                    except Exception:
+                        pass
+                    return web.json_response({"status": "ok", "delivery": "deferred_to_poller"})
+            except Exception as exc:
+                log.warning("[CC-Hook] cc_job_store check for %s: %s — falling back to direct upload", job_id, exc)
+
+        # Job not in store (external CC submission) — process file directly.
         for f in files:
             asyncio.create_task(_process_file(f["url"], f["filename"], cfg.owner_id))
 
-        log.info("[CC-Hook] Enqueued %d file(s)", len(files))
+        log.info("[CC-Hook] Enqueued %d file(s) for direct delivery", len(files))
         return web.json_response({"status": "ok", "enqueued": [f["filename"] for f in files]})
 
     except Exception as e:
@@ -426,14 +456,39 @@ async def _handle_cc_job(job_id: str, data: dict, api_key: str) -> None:
     """
     Recovery entry-point used by webhook_sync.poll_pending_jobs().
     Called when a CC job completed while the bot was offline (no webhook delivery).
-    Mirrors the logic in handle_cloudconvert but operates on an already-fetched dict.
+
+    FIX: mirrors handle_cloudconvert's deferred-delivery design — writes the
+    export_url into cc_job_store so the ccstatus poller delivers it.  Previously
+    this called _process_file directly, causing a double-upload race with the
+    poller when both ran on the same job at startup.
     """
     from core.config import cfg
     files = _extract_urls(data)
     if not files:
         log.warning("[CC-Hook] _handle_cc_job: no export URLs in job %s", job_id)
         return
-    log.info("[CC-Hook] Recovering offline CC job %s — %d file(s)", job_id, len(files))
+
+    if job_id:
+        try:
+            from services.cc_job_store import cc_job_store
+            job_rec = cc_job_store.get(job_id)
+            if job_rec is not None:
+                if job_rec.notified:
+                    log.info("[CC-Hook] Recovery: job %s already notified — skip", job_id)
+                    return
+                export_url = files[0]["url"] if files else ""
+                await cc_job_store.finish(job_id, export_url=export_url)
+                log.info("[CC-Hook] Recovery: job %s → export_url stored; poller delivers", job_id)
+                try:
+                    from plugins.ccstatus import _ensure_poller
+                    _ensure_poller()
+                except Exception:
+                    pass
+                return
+        except Exception as exc:
+            log.warning("[CC-Hook] Recovery cc_job_store for %s: %s — direct delivery", job_id, exc)
+
+    log.info("[CC-Hook] Recovering offline CC job %s (not in store) — %d file(s)", job_id, len(files))
     for f in files:
         asyncio.create_task(_process_file(f["url"], f["filename"], cfg.owner_id))
 
