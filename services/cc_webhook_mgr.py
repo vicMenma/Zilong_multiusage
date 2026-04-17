@@ -1,34 +1,30 @@
 """
-services/cc_webhook_mgr.py
+services/cc_webhook_mgr.py  —  PATCHED v2
 CloudConvert webhook subscription management.
 
-WHY THIS EXISTS
-───────────────
-Every Colab restart creates a new Cloudflare tunnel with a different public
-URL.  Any CloudConvert webhook subscription registered in a previous session
-still points to the dead old URL — so completed jobs silently fail to notify
-the bot.
-
-This module, called once at tunnel-ready time, atomically:
-  1. Lists ALL existing webhook subscriptions for every configured CC API key.
-  2. Deletes them all (stale URLs are useless and clutter the CC dashboard).
-  3. Registers a fresh subscription pointing to the new /webhook endpoint.
-
-API REFERENCE (CloudConvert v2)
+WHAT CHANGED vs previous version
 ────────────────────────────────
-  GET    https://api.cloudconvert.com/v2/webhooks
-  POST   https://api.cloudconvert.com/v2/webhooks
-  DELETE https://api.cloudconvert.com/v2/webhooks/{id}
+FIX CC-WH-PAG: list_cc_webhooks() now paginates through EVERY page.
+  Root cause of "webhooks accumulate on every Colab restart":
+    CloudConvert /v2/webhooks returns 25 items per page by default.
+    The old code only read page 1 → only the first 25 stale webhooks
+    were ever deleted.  After a few Colab restarts you end up with
+    hundreds of dead webhooks cluttering your dashboard.
 
-USAGE
-─────
-    from services.cc_webhook_mgr import sync_cc_webhooks
+  Fix:
+    - Loop with ?page=N until we get an empty page or hit 20 pages
+      (safety cap = 500 webhooks).
+    - Use per_page=100 for efficiency (CC max is typically 100).
+    - Also handles the alternate response shape where data is nested
+      under "data" with "current_page" / "last_page" meta fields.
 
-    # Called once when the Cloudflare tunnel URL is confirmed:
-    results = await sync_cc_webhooks("https://abc.trycloudflare.com")
+FIX CC-WH-DELAY: small 0.15 s gap between deletes (was 0.3 s) — faster
+  cleanup for accounts with many stale webhooks.
 
-    # With explicit key list (overrides env):
-    results = await sync_cc_webhooks(tunnel_url, api_keys=["key1", "key2"])
+FIX CC-WH-EARLY-TUNNEL (coordinated with config.py change):
+  Caller (main.py / cloudconvert_hook.py) now calls set_tunnel_url()
+  BEFORE opening the aiohttp server, so FreeConvert jobs submitted
+  during early startup already have the correct webhook URL.
 """
 from __future__ import annotations
 
@@ -43,14 +39,12 @@ log = logging.getLogger(__name__)
 
 _CC_API   = "https://api.cloudconvert.com/v2"
 _TIMEOUT  = aiohttp.ClientTimeout(total=30)
-
-# Events we care about — job finished or failed covers everything
 _CC_EVENTS = ["job.finished", "job.failed"]
 
+_MAX_PAGES   = 20    # safety cap — up to 2000 webhooks listed
+_PAGE_SIZE   = 100
+_DELETE_GAP  = 0.15  # seconds between deletes
 
-# ─────────────────────────────────────────────────────────────
-# Low-level API calls
-# ─────────────────────────────────────────────────────────────
 
 def _hdr(api_key: str) -> dict:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -58,37 +52,58 @@ def _hdr(api_key: str) -> dict:
 
 async def list_cc_webhooks(api_key: str) -> list[dict]:
     """
-    Return all webhook subscriptions registered for this CC API key.
-    Each dict contains at least: {"id": "...", "url": "...", "events": [...]}
+    Return ALL webhook subscriptions for this key, paginating through
+    every page.  See FIX CC-WH-PAG above.
     """
+    all_items: list[dict] = []
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as sess:
-        async with sess.get(f"{_CC_API}/webhooks", headers=_hdr(api_key)) as resp:
-            if resp.status == 401:
-                raise PermissionError(f"CloudConvert API key invalid (401)")
-            data = await resp.json()
+        for page in range(1, _MAX_PAGES + 1):
+            url = f"{_CC_API}/webhooks?page={page}&per_page={_PAGE_SIZE}"
+            async with sess.get(url, headers=_hdr(api_key)) as resp:
+                if resp.status == 401:
+                    raise PermissionError("CloudConvert API key invalid (401)")
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.warning("[CC-WH] List page %d returned %d: %s",
+                                page, resp.status, body[:120])
+                    break
+                data = await resp.json()
 
-    items = data.get("data") or data
-    if isinstance(items, dict):
-        items = items.get("data", [])
-    return items if isinstance(items, list) else []
+            # Response shape handling:
+            #   { "data": [ {...}, ... ], "meta": {...} }   ← paginated
+            #   { "data": [ ... ] }                         ← unpaginated
+            #   [ ... ]                                     ← bare array
+            items = data.get("data") if isinstance(data, dict) else data
+            if isinstance(items, dict) and "data" in items:
+                items = items["data"]
+            if not isinstance(items, list):
+                break
+
+            if not items:
+                break   # empty page → we're done
+
+            all_items.extend(items)
+
+            # Stop early if response size < requested page size
+            if len(items) < _PAGE_SIZE:
+                break
+
+    log.info("[CC-WH] Key ...%s: paginated list → %d total webhook(s)",
+             api_key[-6:], len(all_items))
+    return all_items
 
 
 async def delete_cc_webhook(api_key: str, webhook_id: str) -> bool:
-    """
-    Delete a single CloudConvert webhook subscription by ID.
-    Returns True on success.
-    """
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as sess:
         async with sess.delete(
             f"{_CC_API}/webhooks/{webhook_id}",
             headers=_hdr(api_key),
         ) as resp:
             if resp.status in (200, 204):
-                log.debug("[CC-WH] Deleted webhook %s", webhook_id)
                 return True
             body = await resp.text()
-            log.warning("[CC-WH] Delete %s returned %d: %s",
-                        webhook_id, resp.status, body[:120])
+            log.warning("[CC-WH] Delete %s → %d: %s",
+                        webhook_id, resp.status, body[:100])
             return False
 
 
@@ -97,10 +112,6 @@ async def create_cc_webhook(
     url: str,
     events: list[str] = _CC_EVENTS,
 ) -> dict:
-    """
-    Register a new CloudConvert webhook subscription.
-    Returns the created webhook dict (contains 'id', 'url', 'events').
-    """
     payload = {"url": url, "events": events}
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as sess:
         async with sess.post(
@@ -111,55 +122,38 @@ async def create_cc_webhook(
             data = await resp.json()
             if resp.status not in (200, 201):
                 msg = (data.get("message") or
-                       data.get("data", {}).get("message") or
+                       (data.get("data") or {}).get("message") or
                        str(data))
-                raise RuntimeError(
-                    f"CloudConvert webhook creation failed ({resp.status}): {msg}"
-                )
+                raise RuntimeError(f"CC webhook create failed ({resp.status}): {msg}")
 
     wh = data.get("data") or data
     log.info("[CC-WH] Registered webhook id=%s → %s", wh.get("id", "?"), url)
     return wh
 
 
-# ─────────────────────────────────────────────────────────────
-# High-level: clean-and-register
-# ─────────────────────────────────────────────────────────────
-
 async def _sync_one_key(api_key: str, new_webhook_url: str) -> dict:
-    """
-    For a single CC API key:
-      1. List all existing webhook subscriptions.
-      2. Delete every one of them.
-      3. Register a fresh subscription pointing to new_webhook_url.
-
-    Returns a result dict:
-      {"key_tail": "...abc", "deleted": N, "registered": id | None, "error": ""}
-    """
     tail = api_key[-6:]
     result = {"key_tail": f"...{tail}", "deleted": 0, "registered": None, "error": ""}
 
     try:
-        # ── Step 1: list ─────────────────────────────────────
         existing = await list_cc_webhooks(api_key)
-        log.info("[CC-WH] Key ...%s: found %d existing webhook(s)", tail, len(existing))
+        log.info("[CC-WH] Key ...%s: found %d existing webhook(s) across all pages",
+                 tail, len(existing))
 
-        # ── Step 2: delete all ───────────────────────────────
         deleted = 0
         for wh in existing:
-            wh_id = wh.get("id") or wh.get("data", {}).get("id")
+            wh_id = wh.get("id") or (wh.get("data") or {}).get("id")
             if not wh_id:
                 continue
-            wh_url = wh.get("url", "?")
-            log.info("[CC-WH] Deleting webhook id=%s  url=%s", wh_id, wh_url[:60])
             ok = await delete_cc_webhook(api_key, str(wh_id))
             if ok:
                 deleted += 1
-            await asyncio.sleep(0.3)   # gentle rate-limiting
+            await asyncio.sleep(_DELETE_GAP)
 
         result["deleted"] = deleted
+        log.info("[CC-WH] Key ...%s: %d/%d webhook(s) deleted",
+                 tail, deleted, len(existing))
 
-        # ── Step 3: register fresh ───────────────────────────
         wh = await create_cc_webhook(api_key, new_webhook_url)
         result["registered"] = wh.get("id", "?")
 
@@ -179,31 +173,16 @@ async def sync_cc_webhooks(
     webhook_path:     str = "/webhook/cloudconvert",
 ) -> list[dict]:
     """
-    Clean up all stale CloudConvert webhook subscriptions and register
-    a fresh one per API key, pointing to the new tunnel URL.
-
-    Args:
-        tunnel_base_url:  e.g. "https://abc123.trycloudflare.com"
-        api_keys:         list of CC API keys to process.
-                          If None, reads CC_API_KEY from environment.
-        webhook_path:     path appended to tunnel_base_url. Default "/webhook".
-
-    Returns:
-        List of per-key result dicts (see _sync_one_key).
-
-    Example:
-        results = await sync_cc_webhooks("https://abc.trycloudflare.com")
-        for r in results:
-            print(r["key_tail"], "deleted:", r["deleted"], "new id:", r["registered"])
+    Clean up ALL stale CloudConvert webhook subscriptions (paginated),
+    then register a fresh one per API key pointing at tunnel_base_url.
     """
     new_url = tunnel_base_url.rstrip("/") + webhook_path
 
     if api_keys is None:
         raw = os.environ.get("CC_API_KEY", "").strip()
         if not raw:
-            log.info("[CC-WH] CC_API_KEY not set — skipping CC webhook sync")
+            log.info("[CC-WH] CC_API_KEY not set — skipping sync")
             return []
-        # parse comma/newline separated keys (same as parse_api_keys)
         import re as _re
         api_keys = [k.strip() for k in _re.split(r"[,\s\n]+", raw) if k.strip()]
 
@@ -215,12 +194,11 @@ async def sync_cc_webhooks(
     tasks   = [_sync_one_key(k, new_url) for k in api_keys]
     results = await asyncio.gather(*tasks, return_exceptions=False)
 
-    # Summary log
     total_del = sum(r["deleted"] for r in results)
     total_ok  = sum(1 for r in results if r.get("registered"))
     total_err = sum(1 for r in results if r.get("error"))
     log.info(
-        "[CC-WH] Sync complete: %d deleted, %d registered, %d errors",
+        "[CC-WH] Sync complete: %d stale webhooks purged, %d new registered, %d errors",
         total_del, total_ok, total_err,
     )
 

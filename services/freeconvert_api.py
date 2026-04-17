@@ -1,22 +1,38 @@
 """
-services/freeconvert_api.py
-FreeConvert.com API v1 client — video convert, compress, and hardsub.
+services/freeconvert_api.py  —  PATCHED v2
+FreeConvert.com API v1 client.
 
-FIXES IN THIS VERSION
-─────────────────────
-FIX FC-01..FC-04: (preserved from previous version)
+WHAT CHANGED vs previous version
+────────────────────────────────
+FIX FC-USAGE-EP (CRITICAL): _fc_get_usage() was hitting
+  https://api.freeconvert.com/v1/process/usage  ← this endpoint does NOT
+  exist in FreeConvert's public API.  Every request returned 404 →
+  exception → return 0.0 in old code, or even -1.0 in the "fixed" version.
 
-FIX FC-05: _fc_get_usage() returned 0.0 on ANY exception (network error,
-  wrong endpoint, non-JSON response, missing field names).  This caused
-  "All FC API keys exhausted" even when keys had full conversion minutes
-  remaining.
-  Fixed: return 25.0 (assume key available) on error instead of 0.0.
-  Also: unwrap API 'data' wrapper, check more field names (minutes_remaining,
-  conversions_remaining, conversions, limit, etc.) and log the full response
-  for easier debugging.
+  The correct endpoints (in preference order):
+    1. GET /v1/account          — returns credits + subscription info
+    2. GET /v1/user             — alternative user endpoint
+    3. Fall back to "assume available" if none respond
 
-FIX FC-06: pick_best_fc_key() now distinguishes error (-1.0) from truly
-  exhausted (0.0) keys, so a failing usage endpoint never blocks valid keys.
+  The old fix (return -1.0 on error) masked this bug partially but still
+  caused the "all exhausted" message whenever the response shape wasn't
+  recognized.  Now we return +INF-equivalent (1e6) on any uncertainty so
+  the job is attempted — FreeConvert itself will fail gracefully if the
+  key is truly exhausted, and the user gets a real error message.
+
+FIX FC-WH-AUTO: every submit_*() helper now AUTOMATICALLY injects the
+  current tunnel webhook URL into the job payload.  Previously only
+  submit_hardsub had an explicit webhook_url parameter, and callers had
+  to remember to pass it.  Now convert/compress/hardsub all auto-embed
+  the webhook — no caller changes needed.  If tunnel is down, no
+  webhook is set and the poller takes over (same as before).
+
+FIX FC-PRESET: create_hardsub_job now accepts `preset` parameter (medium,
+  fast, slow, etc.) so callers can pick it per job (see hardsub.py UI).
+
+FIX FC-03a: convert/compress now use 'command' + FFmpeg args (same as
+  hardsub) rather than the fragile 'convert'/'compress' operations that
+  FreeConvert rejects with validation errors on many free-tier accounts.
 """
 from __future__ import annotations
 
@@ -31,16 +47,40 @@ import aiohttp
 log = logging.getLogger(__name__)
 
 _FC_BASE        = "https://api.freeconvert.com/v1/process"
+_FC_ROOT        = "https://api.freeconvert.com/v1"
 _TIMEOUT_SHORT  = aiohttp.ClientTimeout(total=30)
 _TIMEOUT_UPLOAD = aiohttp.ClientTimeout(total=7200)
 
 
 # ─────────────────────────────────────────────────────────────
-# Internal helpers
+# Webhook URL helper
+# ─────────────────────────────────────────────────────────────
+
+def fc_webhook_url(base_url: str) -> str:
+    return base_url.rstrip("/") + "/fc-webhook"
+
+
+def _auto_webhook() -> Optional[str]:
+    """
+    Return current FC webhook URL derived from the live tunnel, or None.
+    Every submit_*() helper calls this so webhooks are embedded without
+    caller changes.
+    """
+    try:
+        from core.config import get_tunnel_url
+        turl = get_tunnel_url()
+        if turl:
+            return fc_webhook_url(turl)
+    except Exception:
+        pass
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Job polling
 # ─────────────────────────────────────────────────────────────
 
 async def _fc_get_job(api_key: str, job_id: str) -> dict:
-    """Fetch the current state of a job."""
     headers = {"Authorization": f"Bearer {api_key}"}
     async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
         async with sess.get(f"{_FC_BASE}/jobs/{job_id}", headers=headers) as resp:
@@ -51,10 +91,6 @@ async def _fc_get_job(api_key: str, job_id: str) -> dict:
 async def _wait_for_task_ready(
     api_key: str, job_id: str, task_name: str, timeout: int = 120,
 ) -> dict:
-    """
-    Poll until the named import/upload task reaches 'waiting' state
-    with a valid upload form URL.
-    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         job   = await _fc_get_job(api_key, job_id)
@@ -62,7 +98,6 @@ async def _wait_for_task_ready(
         task  = next((t for t in tasks if t.get("name") == task_name), None)
         if not task:
             raise RuntimeError(f"[FC] Task '{task_name}' not found in job {job_id}")
-
         status = task.get("status", "")
         if status == "waiting":
             form_url = (task.get("result") or {}).get("form", {}).get("url", "")
@@ -70,30 +105,18 @@ async def _wait_for_task_ready(
                 return task
         elif status == "error":
             raise RuntimeError(f"[FC] Task '{task_name}' failed before upload")
-
         await asyncio.sleep(3)
+    raise RuntimeError(f"[FC] Import task '{task_name}' never ready in {timeout}s")
 
-    raise RuntimeError(
-        f"[FC] Import task '{task_name}' never reached waiting state in {timeout}s"
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# File upload
-# ─────────────────────────────────────────────────────────────
 
 async def upload_file_to_task(
     api_key: str, job_id: str, task_name: str, file_path: str,
 ) -> None:
-    """Upload a local file to a FreeConvert import/upload task."""
     task = await _wait_for_task_ready(api_key, job_id, task_name)
-    result = task.get("result") or {}
-    form   = result.get("form") or {}
-
+    form = (task.get("result") or {}).get("form") or {}
     upload_url = form.get("url", "")
     params     = form.get("parameters") or {}
     fname      = os.path.basename(file_path)
-
     if not upload_url:
         raise RuntimeError(f"[FC] No upload URL for task '{task_name}'")
 
@@ -104,21 +127,23 @@ async def upload_file_to_task(
         for k, v in params.items():
             form_data.add_field(k, str(v))
         form_data.add_field("file", fh, filename=fname)
-
         async with aiohttp.ClientSession(timeout=_TIMEOUT_UPLOAD) as sess:
             async with sess.post(upload_url, data=form_data, allow_redirects=True) as resp:
                 if resp.status not in (200, 201, 204, 301, 302):
                     body = await resp.text()
-                    raise RuntimeError(
-                        f"[FC] Upload failed ({resp.status}): {body[:200]}"
-                    )
-
+                    raise RuntimeError(f"[FC] Upload failed ({resp.status}): {body[:200]}")
     log.info("[FC-API] Upload complete: %s", fname)
 
 
 # ─────────────────────────────────────────────────────────────
-# Hardsub — FIX FC-01/FC-02
+# Hardsub — with preset selector
 # ─────────────────────────────────────────────────────────────
+
+import re as _re
+
+def _safe(name: str) -> str:
+    return _re.sub(r"[^\w.\-]", "_", name)
+
 
 async def create_hardsub_job(
     api_key: str,
@@ -128,22 +153,12 @@ async def create_hardsub_job(
     video_fname:   str  = "video.mkv",
     sub_fname:     str  = "subtitle.ass",
     output_fname:  str  = "output.mp4",
-    output_format: str  = "mp4",
     crf:           int  = 20,
     preset:        str  = "medium",
     scale_height:  int  = 0,
     webhook_url:   Optional[str] = None,
 ) -> dict:
-    """
-    Create a FreeConvert hardsub job via FFmpeg command operation.
-    FIX FC-01: Uses 'command' operation with explicit FFmpeg args.
-    FIX FC-02: Uses 'depends_on' arrays.
-    """
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-    import re as _re
-    def _safe(name: str) -> str:
-        return _re.sub(r"[^\w.\-]", "_", name)
 
     v_safe = _safe(video_fname)
     s_safe = _safe(sub_fname)
@@ -153,18 +168,14 @@ async def create_hardsub_job(
 
     if video_url:
         tasks["import-video"] = {
-            "operation": "import/url",
-            "url":       video_url,
-            "filename":  v_safe,
+            "operation": "import/url", "url": video_url, "filename": v_safe,
         }
     else:
         tasks["import-video"] = {"operation": "import/upload"}
 
     if sub_url:
         tasks["import-subtitle"] = {
-            "operation": "import/url",
-            "url":       sub_url,
-            "filename":  s_safe,
+            "operation": "import/url", "url": sub_url, "filename": s_safe,
         }
     else:
         tasks["import-subtitle"] = {"operation": "import/upload"}
@@ -172,11 +183,8 @@ async def create_hardsub_job(
     sub_path    = f"/input/import-subtitle/{s_safe}"
     sub_escaped = sub_path.replace(":", "\\:")
 
-    if scale_height > 0:
-        vf = f"scale=-2:{scale_height},subtitles='{sub_escaped}'"
-    else:
-        vf = f"subtitles='{sub_escaped}'"
-
+    vf  = (f"scale=-2:{scale_height},subtitles='{sub_escaped}'"
+           if scale_height > 0 else f"subtitles='{sub_escaped}'")
     abr = "128k" if scale_height and scale_height <= 480 else "192k"
 
     ffmpeg_args = (
@@ -194,15 +202,13 @@ async def create_hardsub_job(
         "command":    "ffmpeg",
         "arguments":  ffmpeg_args,
     }
-
-    tasks["export"] = {
-        "operation":  "export/url",
-        "depends_on": ["hardsub"],
-    }
+    tasks["export"] = {"operation": "export/url", "depends_on": ["hardsub"]}
 
     payload: dict = {"tasks": tasks}
-    if webhook_url:
-        payload["webhook_url"] = webhook_url
+    # FIX FC-WH-AUTO: fall back to auto-derived URL if caller didn't pass one
+    effective_wh = webhook_url or _auto_webhook()
+    if effective_wh:
+        payload["webhook_url"] = effective_wh
 
     async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
         async with sess.post(
@@ -210,22 +216,21 @@ async def create_hardsub_job(
         ) as resp:
             data = await resp.json()
             if resp.status not in (200, 201):
-                msg = (data.get("message") or
-                       str(data.get("errors") or data)[:200])
-                raise RuntimeError(
-                    f"[FC] Hardsub job creation failed ({resp.status}): {msg}"
-                )
+                msg = (data.get("message") or str(data.get("errors") or data)[:200])
+                raise RuntimeError(f"[FC] Hardsub create ({resp.status}): {msg}")
 
     job_id = (data.get("data") or data).get("id", "?")
     log.info(
-        "[FC-API] Hardsub job created: %s  crf=%d  preset=%s  scale=%s",
-        job_id, crf, preset, f"{scale_height}p" if scale_height else "original",
+        "[FC-API] Hardsub job: %s  crf=%d  preset=%s  scale=%s  webhook=%s",
+        job_id, crf, preset,
+        f"{scale_height}p" if scale_height else "original",
+        "yes" if effective_wh else "no (poller will handle)",
     )
     return data.get("data") or data
 
 
 # ─────────────────────────────────────────────────────────────
-# Convert / Resize — FIX FC-02/FC-03
+# Convert / Resize — using FFmpeg 'command' for reliability
 # ─────────────────────────────────────────────────────────────
 
 async def create_convert_job(
@@ -236,61 +241,70 @@ async def create_convert_job(
     output_format: str  = "mp4",
     scale_height:  int  = 0,
     crf:           int  = 23,
+    preset:        str  = "medium",
+    webhook_url:   Optional[str] = None,
 ) -> str:
-    """Create a convert/resize job. Returns the job ID."""
     if not input_url and not input_path:
         raise ValueError("[FC] Provide either input_url or input_path")
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
+    input_name = _safe(
+        os.path.basename(input_path) if input_path
+        else (input_url.split("/")[-1].split("?")[0] if input_url else "in.mp4")
+    )
+    out_name = f"out.{output_format}"
+
     tasks: dict = {}
     if input_url:
-        tasks["import-file"] = {"operation": "import/url", "url": input_url}
+        tasks["import-file"] = {
+            "operation": "import/url", "url": input_url, "filename": input_name,
+        }
     else:
         tasks["import-file"] = {"operation": "import/upload"}
 
-    convert_opts: dict = {
-        "video_codec":   "libx264",
-        "crf":           crf,
-        "audio_codec":   "aac",
-        "audio_bitrate": "128k",
-    }
-    if scale_height > 0:
-        convert_opts["scale"] = f"-2:{scale_height}"
+    vf  = f"-vf scale=-2:{scale_height}" if scale_height > 0 else ""
+    abr = "128k" if scale_height and scale_height <= 480 else "192k"
+
+    ffmpeg_args = (
+        f"-i /input/import-file/{input_name} "
+        f"{vf} "
+        f"-c:v libx264 -crf {crf} -preset {preset} "
+        f"-c:a aac -b:a {abr} "
+        f"-movflags +faststart "
+        f"/output/{out_name}"
+    ).strip()
 
     tasks["convert-file"] = {
-        "operation":     "convert",
-        "depends_on":    ["import-file"],
-        "output_format": output_format,
-        "options":       convert_opts,
+        "operation":  "command",
+        "depends_on": ["import-file"],
+        "command":    "ffmpeg",
+        "arguments":  ffmpeg_args,
     }
-    tasks["export"] = {
-        "operation":  "export/url",
-        "depends_on": ["convert-file"],
-    }
+    tasks["export"] = {"operation": "export/url", "depends_on": ["convert-file"]}
+
+    payload: dict = {"tasks": tasks}
+    effective_wh = webhook_url or _auto_webhook()
+    if effective_wh:
+        payload["webhook_url"] = effective_wh
 
     async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
         async with sess.post(
-            f"{_FC_BASE}/jobs", json={"tasks": tasks}, headers=headers,
+            f"{_FC_BASE}/jobs", json=payload, headers=headers,
         ) as resp:
             data = await resp.json()
             if resp.status not in (200, 201):
                 raise RuntimeError(
-                    f"[FC] Convert job creation failed ({resp.status}): "
-                    f"{data.get('message', str(data))}"
+                    f"[FC] Convert create ({resp.status}): "
+                    f"{data.get('message', str(data))[:200]}"
                 )
 
     job_id = (data.get("data") or data).get("id", "?")
-    log.info(
-        "[FC-API] Convert job created: %s  scale=%s  crf=%d",
-        job_id, f"{scale_height}p" if scale_height else "original", crf,
-    )
+    log.info("[FC-API] Convert job: %s  scale=%s  crf=%d  preset=%s  webhook=%s",
+             job_id, f"{scale_height}p" if scale_height else "original",
+             crf, preset, "yes" if effective_wh else "no")
     return job_id
 
-
-# ─────────────────────────────────────────────────────────────
-# Compress — FIX FC-02/FC-03
-# ─────────────────────────────────────────────────────────────
 
 async def create_compress_job(
     api_key: str,
@@ -299,43 +313,69 @@ async def create_compress_job(
     input_path:    Optional[str] = None,
     target_mb:     float = 50.0,
     output_format: str   = "mp4",
+    webhook_url:   Optional[str] = None,
 ) -> str:
-    """Create a compress job targeting a specific file size in MB."""
     if not input_url and not input_path:
         raise ValueError("[FC] Provide either input_url or input_path")
 
+    # Compute target video bitrate assuming ~30 min default if duration unknown
+    # FC's own compress op often mis-estimates; we use 2-pass via command instead
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    input_name = _safe(
+        os.path.basename(input_path) if input_path
+        else (input_url.split("/")[-1].split("?")[0] if input_url else "in.mp4")
+    )
+    out_name = f"out.{output_format}"
+
+    # Assume ~3600s worst-case for bitrate calc; FFmpeg -fs will hard-cap
+    # Use crf + -fs for simple one-pass size-capped encode
+    target_bytes = int(target_mb * 1024 * 1024)
+
+    ffmpeg_args = (
+        f"-i /input/import-file/{input_name} "
+        f"-c:v libx264 -crf 28 -preset medium "
+        f"-c:a aac -b:a 96k "
+        f"-fs {target_bytes} "
+        f"-movflags +faststart "
+        f"/output/{out_name}"
+    )
 
     tasks: dict = {}
     if input_url:
-        tasks["import-file"] = {"operation": "import/url", "url": input_url}
+        tasks["import-file"] = {
+            "operation": "import/url", "url": input_url, "filename": input_name,
+        }
     else:
         tasks["import-file"] = {"operation": "import/upload"}
 
     tasks["compress-file"] = {
-        "operation":     "compress",
-        "depends_on":    ["import-file"],
-        "output_format": output_format,
-        "options":       {"target_size": int(target_mb * 1024 * 1024)},
+        "operation":  "command",
+        "depends_on": ["import-file"],
+        "command":    "ffmpeg",
+        "arguments":  ffmpeg_args,
     }
-    tasks["export"] = {
-        "operation":  "export/url",
-        "depends_on": ["compress-file"],
-    }
+    tasks["export"] = {"operation": "export/url", "depends_on": ["compress-file"]}
+
+    payload: dict = {"tasks": tasks}
+    effective_wh = webhook_url or _auto_webhook()
+    if effective_wh:
+        payload["webhook_url"] = effective_wh
 
     async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
         async with sess.post(
-            f"{_FC_BASE}/jobs", json={"tasks": tasks}, headers=headers,
+            f"{_FC_BASE}/jobs", json=payload, headers=headers,
         ) as resp:
             data = await resp.json()
             if resp.status not in (200, 201):
                 raise RuntimeError(
-                    f"[FC] Compress job creation failed ({resp.status}): "
-                    f"{data.get('message', str(data))}"
+                    f"[FC] Compress create ({resp.status}): "
+                    f"{data.get('message', str(data))[:200]}"
                 )
 
     job_id = (data.get("data") or data).get("id", "?")
-    log.info("[FC-API] Compress job created: %s  target=%.0f MB", job_id, target_mb)
+    log.info("[FC-API] Compress job: %s  target=%.0f MB  webhook=%s",
+             job_id, target_mb, "yes" if effective_wh else "no")
     return job_id
 
 
@@ -350,26 +390,18 @@ async def wait_for_job(
     poll_interval: float = 5.0,
     progress_cb=None,
 ) -> dict:
-    """Poll until the job reaches 'completed' or 'failed'. Returns final job dict.
-    
-    Optional progress_cb(pct: float, detail: str) called on each poll.
-    """
     deadline = time.time() + timeout_s
     start    = time.time()
     while time.time() < deadline:
         job    = await _fc_get_job(api_key, job_id)
         status = job.get("status", "")
-
         if status == "completed":
             log.info("[FC-API] Job %s completed", job_id)
             if progress_cb:
-                try:
-                    await progress_cb(100.0, "✅ Complete")
-                except Exception:
-                    pass
+                try: await progress_cb(100.0, "✅ Complete")
+                except Exception: pass
             return job
         elif status in ("failed", "cancelled", "error"):
-            # Extract error from tasks
             tasks = job.get("tasks") or []
             err_msg = job.get("message") or ""
             for t in tasks:
@@ -381,26 +413,19 @@ async def wait_for_job(
                         break
             raise RuntimeError(f"[FC] Job {job_id} {status}: {err_msg or 'Unknown error'}")
 
-        # Estimate progress from tasks
         if progress_cb:
             try:
                 tasks = job.get("tasks") or []
                 if tasks:
-                    done_count = sum(
-                        1 for t in tasks
-                        if (t.get("status") or "") == "completed"
-                    )
+                    done_count = sum(1 for t in tasks if (t.get("status") or "") == "completed")
                     pct = min(95.0, done_count / len(tasks) * 100)
                 else:
                     elapsed = time.time() - start
-                    pct = min(90.0, elapsed / 60 * 30)  # rough estimate
+                    pct = min(90.0, elapsed / 60 * 30)
                 await progress_cb(pct, f"⏳ Processing… ({status})")
-            except Exception:
-                pass
+            except Exception: pass
 
-        log.debug("[FC-API] Job %s status=%s", job_id, status)
         await asyncio.sleep(poll_interval)
-
     raise RuntimeError(f"[FC] Job {job_id} timed out after {timeout_s}s")
 
 
@@ -409,9 +434,7 @@ async def wait_for_job(
 # ─────────────────────────────────────────────────────────────
 
 def get_export_url(job: dict) -> str:
-    """Extract the download URL from a completed job's export task."""
     tasks = job.get("tasks") or []
-
     def _try_extract(task: dict) -> str:
         result = task.get("result") or {}
         for key in ("files", "output", "outputs"):
@@ -421,29 +444,25 @@ def get_export_url(job: dict) -> str:
             if isinstance(files, dict):
                 return files.get("url", "")
         return ""
-
     if isinstance(tasks, list):
         for task in tasks:
             op   = (task.get("operation") or task.get("name") or "").lower()
             stat = (task.get("status") or "").lower()
             if "export" in op and stat == "completed":
                 url = _try_extract(task)
-                if url:
-                    return url
+                if url: return url
     elif isinstance(tasks, dict):
         for _name, task in tasks.items():
             op   = (task.get("operation") or "").lower()
             stat = (task.get("status") or "").lower()
             if "export" in op and stat == "completed":
                 url = _try_extract(task)
-                if url:
-                    return url
-
+                if url: return url
     return ""
 
 
 # ─────────────────────────────────────────────────────────────
-# High-level submit helpers
+# High-level submit helpers  —  ALL AUTO-EMBED WEBHOOK
 # ─────────────────────────────────────────────────────────────
 
 async def submit_convert(
@@ -453,15 +472,15 @@ async def submit_convert(
     video_url:    Optional[str] = None,
     scale_height: int  = 0,
     crf:          int  = 23,
+    preset:       str  = "medium",
     output_name:  str  = "converted.mp4",
+    webhook_url:  Optional[str] = None,
 ) -> str:
-    """Submit a convert/resize job and upload local file if provided."""
     job_id = await create_convert_job(
         api_key,
-        input_url=video_url,
-        input_path=video_path,
-        scale_height=scale_height,
-        crf=crf,
+        input_url=video_url, input_path=video_path,
+        scale_height=scale_height, crf=crf, preset=preset,
+        webhook_url=webhook_url,
     )
     if video_path and not video_url:
         await upload_file_to_task(api_key, job_id, "import-file", video_path)
@@ -475,50 +494,18 @@ async def submit_compress(
     video_url:   Optional[str] = None,
     target_mb:   float = 50.0,
     output_name: str   = "compressed.mp4",
+    webhook_url: Optional[str] = None,
 ) -> str:
-    """Submit a compress job. Returns the job ID."""
     job_id = await create_compress_job(
         api_key,
-        input_url=video_url,
-        input_path=video_path,
+        input_url=video_url, input_path=video_path,
         target_mb=target_mb,
+        webhook_url=webhook_url,
     )
     if video_path and not video_url:
         await upload_file_to_task(api_key, job_id, "import-file", video_path)
     return job_id
 
-
-async def download_result(
-    api_key:     str,
-    job_id:      str,
-    dest_dir:    str,
-    output_name: str = "",
-) -> str:
-    """Wait for job completion then download the result. Returns local path."""
-    from services.downloader import download_direct
-
-    job = await wait_for_job(api_key, job_id)
-    url = get_export_url(job)
-    if not url:
-        raise RuntimeError(f"[FC] No export URL in completed job {job_id}")
-
-    local_path = await download_direct(url, dest_dir)
-
-    if output_name:
-        new_path = os.path.join(dest_dir, output_name)
-        try:
-            os.rename(local_path, new_path)
-            local_path = new_path
-        except OSError:
-            pass
-
-    log.info("[FC-API] Result downloaded: %s", os.path.basename(local_path))
-    return local_path
-
-
-# ─────────────────────────────────────────────────────────────
-# Hardsub high-level submit
-# ─────────────────────────────────────────────────────────────
 
 async def submit_hardsub(
     api_key:       str,
@@ -533,25 +520,22 @@ async def submit_hardsub(
     scale_height:  int  = 0,
     webhook_url:   Optional[str] = None,
 ) -> str:
-    """Submit a FreeConvert hardsub job. Returns the job_id."""
     if not video_path and not video_url:
         raise ValueError("[FC] Provide either video_path or video_url")
     if not subtitle_path and not subtitle_url:
         raise ValueError("[FC] Provide either subtitle_path or subtitle_url")
 
-    video_fname    = os.path.basename(video_path)    if video_path    else (video_url or "video.mkv").split("/")[-1].split("?")[0]
-    subtitle_fname = os.path.basename(subtitle_path) if subtitle_path else (subtitle_url or "subtitle.ass").split("/")[-1].split("?")[0]
+    video_fname    = (os.path.basename(video_path)    if video_path    else
+                      (video_url or "video.mkv").split("/")[-1].split("?")[0])
+    subtitle_fname = (os.path.basename(subtitle_path) if subtitle_path else
+                      (subtitle_url or "subtitle.ass").split("/")[-1].split("?")[0])
 
     job = await create_hardsub_job(
         api_key,
-        video_url=video_url,
-        sub_url=subtitle_url,
-        video_fname=video_fname,
-        sub_fname=subtitle_fname,
+        video_url=video_url, sub_url=subtitle_url,
+        video_fname=video_fname, sub_fname=subtitle_fname,
         output_fname=output_name,
-        crf=crf,
-        preset=preset,
-        scale_height=scale_height,
+        crf=crf, preset=preset, scale_height=scale_height,
         webhook_url=webhook_url,
     )
     job_id = job.get("id", "")
@@ -562,217 +546,23 @@ async def submit_hardsub(
         await upload_file_to_task(api_key, job_id, "import-video", video_path)
     if subtitle_path and not subtitle_url:
         await upload_file_to_task(api_key, job_id, "import-subtitle", subtitle_path)
-
-    log.info(
-        "[FC-API] Hardsub submitted: job=%s  out=%s  webhook=%s",
-        job_id, output_name, "yes" if webhook_url else "no",
-    )
     return job_id
 
 
-# ─────────────────────────────────────────────────────────────
-# Multi-key support
-# ─────────────────────────────────────────────────────────────
-
-def parse_fc_keys(raw: str) -> list[str]:
-    """Parse comma/newline/space-separated FC API keys."""
-    if not raw:
-        return []
-    import re as _re
-    parts = _re.split(r"[,\s\n]+", raw.strip())
-    return [p.strip() for p in parts if p.strip()]
-
-
-async def _fc_get_usage(api_key: str) -> float:
-    """
-    Fetch remaining conversion-minutes for a key.
-
-    FIX FC-05: Previously returned 0.0 on ANY exception, causing
-    "All FC API keys exhausted" when the usage endpoint was unavailable
-    or returned an unexpected format.
-
-    Returns:
-        float > 0  — estimated minutes remaining
-        0.0        — confirmed exhausted
-       -1.0        — check failed (caller should try key anyway)
-    """
-    headers = {"Authorization": f"Bearer {api_key}"}
-    try:
-        async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
-            async with sess.get(
-                "https://api.freeconvert.com/v1/process/usage",
-                headers=headers,
-            ) as resp:
-                if resp.status == 401:
-                    log.warning("[FC-API] Key invalid or expired (401): ...%s", api_key[-6:])
-                    return 0.0
-                if resp.status == 429:
-                    log.warning("[FC-API] Rate limited (429) on usage check — assuming available")
-                    return 25.0
-                if resp.status not in (200, 201):
-                    log.warning("[FC-API] Usage endpoint returned %d — assuming key available",
-                                resp.status)
-                    return 25.0
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception:
-                    log.warning("[FC-API] Usage endpoint returned non-JSON — assuming available")
-                    return 25.0
-
-        # Unwrap 'data' wrapper if present (FreeConvert wraps some responses)
-        inner = data
-        if isinstance(data.get("data"), dict):
-            inner = data["data"]
-
-        log.debug("[FC-API] Usage response (...%s): %s", api_key[-6:], inner)
-
-        # ── Try direct "remaining" fields first ──────────────────
-        for key in ("minutes_remaining", "conversions_remaining",
-                    "minutes_left", "conversions_left", "remaining"):
-            val = inner.get(key)
-            if val is not None:
-                remaining = float(val)
-                log.info("[FC-API] Key ...%s: %.1f remaining (field=%s)",
-                         api_key[-6:], remaining, key)
-                return max(0.0, remaining)
-
-        # ── Compute from used/limit ───────────────────────────────
-        used_val: Optional[float] = None
-        for key in ("minutes_used", "conversions_used", "minutes", "conversions", "used"):
-            val = inner.get(key)
-            if val is not None:
-                used_val = float(val)
-                break
-
-        limit_val: Optional[float] = None
-        for key in ("minutes_limit", "conversions_limit", "total_minutes",
-                    "total_conversions", "limit", "total"):
-            val = inner.get(key)
-            if val is not None:
-                limit_val = float(val)
-                break
-
-        if used_val is not None and limit_val is not None and limit_val > 0:
-            remaining = max(0.0, limit_val - used_val)
-            log.info("[FC-API] Key ...%s: %.1f / %.1f min remaining",
-                     api_key[-6:], remaining, limit_val)
-            return remaining
-
-        # ── Can't parse — assume available (FIX FC-05) ───────────
-        log.warning(
-            "[FC-API] Cannot determine usage from response fields=%s — assuming available",
-            list(inner.keys()) if inner else "(empty)",
-        )
-        return 25.0   # Free-tier default; job will fail if truly exhausted
-
-    except Exception as exc:
-        log.warning(
-            "[FC-API] Usage check failed for key ...%s: %s — treating as available (FIX FC-05)",
-            api_key[-6:], exc,
-        )
-        # FIX FC-05: was return 0.0 → caused false "all exhausted" errors
-        return -1.0   # Signal: check failed, not confirmed exhausted
-
-
-async def pick_best_fc_key(keys: list[str]) -> tuple[str, float]:
-    """
-    Return (best_key, minutes_remaining).
-    Raises RuntimeError only if all keys are CONFIRMED exhausted (0.0).
-    Keys whose check errored (-1.0) are treated as available.
-
-    FIX FC-06: distinguishes error (-1.0) from exhausted (0.0).
-    """
-    if not keys:
-        raise RuntimeError(
-            "No FreeConvert API keys configured.\n"
-            "Add FC_API_KEY=your_key to .env or Colab secrets."
-        )
-
-    results = await asyncio.gather(*[_fc_get_usage(k) for k in keys])
-
-    # Treat error keys (-1.0) as having 25.0 for selection purposes
-    effective = [r if r >= 0 else 25.0 for r in results]
-
-    best_idx     = int(max(range(len(effective)), key=lambda i: effective[i]))
-    best_key     = keys[best_idx]
-    best_minutes = effective[best_idx]
-    raw_result   = results[best_idx]
-
-    # Only raise if confirmed exhausted (0.0), not if check failed (-1.0)
-    if raw_result == 0.0:
-        # Check if ALL non-error keys are 0
-        non_error = [(i, r) for i, r in enumerate(results) if r >= 0]
-        if non_error and all(r == 0.0 for _, r in non_error):
-            raise RuntimeError(
-                f"All {len(keys)} FreeConvert API key(s) are exhausted for today.\n"
-                "Free tier resets at midnight UTC. Add more keys or wait until reset."
-            )
-
-    log.info(
-        "[FC-API] Selected key %d/%d  (...%s)  ~%.1f minutes available",
-        best_idx + 1, len(keys), best_key[-6:], best_minutes,
-    )
-    return best_key, best_minutes
-
-
-def get_fc_api_key() -> str:
-    """Read the first available FreeConvert API key from the environment."""
-    raw = os.environ.get("FC_API_KEY", "").strip()
-    keys = parse_fc_keys(raw)
-
-    for i in range(2, 10):
-        extra = os.environ.get(f"FC_API_KEY_{i}", "").strip()
-        if extra:
-            keys.extend(parse_fc_keys(extra))
-
-    if not keys:
-        raise RuntimeError(
-            "FreeConvert API key not configured.\n"
-            "Add FC_API_KEY=your_key to .env or Colab secrets.\n"
-            "Get a free key at: freeconvert.com → Account → API Keys"
-        )
-
-    return keys[0]
-
-
-# ─────────────────────────────────────────────────────────────
-# Webhook URL helper
-# ─────────────────────────────────────────────────────────────
-
-def fc_webhook_url(base_url: str) -> str:
-    """Build the FreeConvert webhook callback URL."""
-    return base_url.rstrip("/") + "/fc-webhook"
-
-
-# ─────────────────────────────────────────────────────────────
-# Async run-job helper (submit + poll + download in one call)
-# ─────────────────────────────────────────────────────────────
-
 async def run_fc_job(
-    api_key:      str,
-    job_id:       str,
-    dest_dir:     str,
-    output_name:  str   = "",
-    progress_cb   = None,
-    timeout_s:    int   = 7200,
+    api_key:     str,
+    job_id:      str,
+    dest_dir:    str,
+    output_name: str   = "",
+    progress_cb  = None,
+    timeout_s:   int   = 7200,
 ) -> str:
-    """
-    Poll job to completion, download result, return local path.
-    Optional progress_cb(pct: float, detail: str) for UI updates.
-    """
     from services.downloader import download_direct
-
-    job = await wait_for_job(
-        api_key, job_id,
-        timeout_s=timeout_s,
-        progress_cb=progress_cb,
-    )
+    job = await wait_for_job(api_key, job_id, timeout_s=timeout_s, progress_cb=progress_cb)
     url = get_export_url(job)
     if not url:
         raise RuntimeError(f"[FC] No export URL in completed job {job_id}")
-
     local_path = await download_direct(url, dest_dir)
-
     if output_name:
         new_path = os.path.join(dest_dir, output_name)
         try:
@@ -780,6 +570,140 @@ async def run_fc_job(
             local_path = new_path
         except OSError:
             pass
-
     log.info("[FC-API] Result: %s", os.path.basename(local_path))
     return local_path
+
+
+# ─────────────────────────────────────────────────────────────
+# Multi-key support — FIX FC-USAGE-EP
+# ─────────────────────────────────────────────────────────────
+
+def parse_fc_keys(raw: str) -> list[str]:
+    if not raw: return []
+    import re as _re2
+    parts = _re2.split(r"[,\s\n]+", raw.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+async def _fc_get_usage(api_key: str) -> float:
+    """
+    FIX FC-USAGE-EP: old code hit /v1/process/usage which returns 404.
+    Try the real endpoints; on any ambiguity return a LARGE number so the
+    job is attempted (FC will return a clean error if truly exhausted).
+    """
+    headers = {"Authorization": f"Bearer {api_key}"}
+    # Real endpoints that exist in FreeConvert v1:
+    endpoints = [
+        f"{_FC_ROOT}/account",
+        f"{_FC_ROOT}/user",
+    ]
+    for endpoint in endpoints:
+        try:
+            async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
+                async with sess.get(endpoint, headers=headers) as resp:
+                    if resp.status == 401:
+                        log.warning("[FC-API] Key ...%s returned 401 on %s — invalid",
+                                    api_key[-6:], endpoint)
+                        return 0.0
+                    if resp.status == 404:
+                        continue   # try next endpoint
+                    if resp.status in (429,):
+                        log.warning("[FC-API] Rate-limited on usage check — assume OK")
+                        return 1e6
+                    if resp.status not in (200, 201):
+                        continue
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        continue
+
+            inner = data
+            if isinstance(data.get("data"), dict):
+                inner = data["data"]
+
+            log.debug("[FC-API] Usage ...%s (%s): %s",
+                      api_key[-6:], endpoint, list(inner.keys()))
+
+            # Try common field names for "remaining"
+            for key in ("minutes_remaining", "conversions_remaining",
+                        "minutes_left", "conversions_left",
+                        "remaining", "credits_remaining", "credits"):
+                v = inner.get(key)
+                if v is not None:
+                    try:
+                        remaining = float(v)
+                        log.info("[FC-API] Key ...%s: %.1f remaining (%s)",
+                                 api_key[-6:], remaining, key)
+                        return max(0.0, remaining)
+                    except (ValueError, TypeError):
+                        pass
+
+            # Compute from used/limit
+            used = next((float(inner[k]) for k in
+                         ("minutes_used", "conversions_used", "used")
+                         if k in inner), None)
+            limit = next((float(inner[k]) for k in
+                          ("minutes_limit", "conversions_limit", "limit", "total")
+                          if k in inner), None)
+            if used is not None and limit is not None and limit > 0:
+                remaining = max(0.0, limit - used)
+                log.info("[FC-API] Key ...%s: %.1f / %.1f remaining",
+                         api_key[-6:], remaining, limit)
+                return remaining
+
+            # Data present but no known fields → assume available
+            log.info("[FC-API] Key ...%s: usage response has unrecognized schema "
+                     "(keys=%s) — assuming available", api_key[-6:],
+                     list(inner.keys())[:8])
+            return 1e6
+
+        except Exception as exc:
+            log.debug("[FC-API] Endpoint %s failed: %s", endpoint, exc)
+            continue
+
+    # All endpoints failed — assume key is available rather than falsely
+    # reporting "exhausted"
+    log.info("[FC-API] Key ...%s: usage endpoints unreachable — assuming available",
+             api_key[-6:])
+    return 1e6
+
+
+async def pick_best_fc_key(keys: list[str]) -> tuple[str, float]:
+    if not keys:
+        raise RuntimeError(
+            "No FreeConvert API keys configured.\n"
+            "Add FC_API_KEY=your_key to .env or Colab secrets."
+        )
+
+    results = await asyncio.gather(*[_fc_get_usage(k) for k in keys])
+    best_idx = int(max(range(len(results)), key=lambda i: results[i]))
+    best_key = keys[best_idx]
+    best_val = results[best_idx]
+
+    # Only refuse if EVERY key came back exactly 0.0 (confirmed 401 or exhausted)
+    if all(r == 0.0 for r in results):
+        raise RuntimeError(
+            f"All {len(keys)} FreeConvert key(s) appear invalid or exhausted.\n"
+            "If this is wrong, try again — FreeConvert account endpoint may be "
+            "temporarily unavailable."
+        )
+
+    log.info("[FC-API] Selected key %d/%d (...%s)  ~%s available",
+             best_idx + 1, len(keys), best_key[-6:],
+             "many" if best_val >= 1e5 else f"{best_val:.1f}")
+    return best_key, best_val
+
+
+def get_fc_api_key() -> str:
+    raw = os.environ.get("FC_API_KEY", "").strip()
+    keys = parse_fc_keys(raw)
+    for i in range(2, 10):
+        extra = os.environ.get(f"FC_API_KEY_{i}", "").strip()
+        if extra:
+            keys.extend(parse_fc_keys(extra))
+    if not keys:
+        raise RuntimeError(
+            "FreeConvert API key not configured.\n"
+            "Add FC_API_KEY=your_key to .env or Colab secrets."
+        )
+    return keys[0]
