@@ -781,6 +781,12 @@ async def text_reply_handler(client: Client, msg: Message):
         new_name = msg.text.strip()
         if not new_name:
             return await msg.reply("❌ Name cannot be empty.")
+        # Strip any extension the user typed — we append the original ext
+        new_name = os.path.splitext(new_name)[0]
+        import re as _re_rn
+        new_name = _re_rn.sub(r'[\\/:*?"<>|]', "_", new_name).strip()
+        if not new_name:
+            return await msg.reply("❌ Invalid name after sanitisation.")
         new_path = os.path.join(tmp, new_name + ext)
         try:
             os.rename(path, new_path)
@@ -790,11 +796,17 @@ async def text_reply_handler(client: Client, msg: Message):
         session.local_path = new_path
         session.fname      = new_name + ext
         session.waiting    = None
-        await msg.reply(
-            f"✅ Renamed to <code>{new_name + ext}</code>\n\nChoose an action:",
-            reply_markup=video_menu_kb(session.key),
+        # FIX: actually upload the renamed file (was just re-showing menu)
+        st = await msg.reply(
+            f"✅ Renamed to <code>{new_name + ext}</code>\n📤 Uploading…",
             parse_mode=enums.ParseMode.HTML,
         )
+        try:
+            await upload_file(client, st, new_path, user_id=user_id)
+        except Exception as _ul_exc:
+            await safe_edit(st, f"❌ Upload failed: <code>{_ul_exc}</code>",
+                            parse_mode=enums.ParseMode.HTML)
+        cleanup(tmp); await sessions.remove(session.key)
 
     elif action == "metadata":
         try:
