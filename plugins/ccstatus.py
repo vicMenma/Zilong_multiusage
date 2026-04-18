@@ -286,6 +286,12 @@ async def _deliver_job(job: CCJob) -> None:
         log.info("[CCStatus] Downloaded %s → %s (%s)",
                  fname, dest, human_size(dl_bytes))
 
+        # Delete the download progress panel — it has served its purpose.
+        try:
+            await _dl_msg.delete()
+        except Exception:
+            pass
+
         st = await client.send_message(
             job.uid,
             f"📤 <b>Uploading…</b>\n<code>{fname[:50]}</code>",
