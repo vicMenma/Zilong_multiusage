@@ -236,7 +236,24 @@ async def _deliver_job(job: CCJob) -> None:
     await tracker.register(dl_rec)
 
     try:
-        await client.send_message(
+        from services.utils import PanelUpdater, progress_panel
+
+        _dl_start = _time.time()
+
+        def _build_cc_dl_panel(state: dict) -> str:
+            return progress_panel(
+                mode       = "dl",
+                fname      = fname,
+                done       = state.get("done", 0),
+                total      = state.get("total", 0),
+                speed      = state.get("speed", 0.0),
+                eta        = state.get("eta", 0),
+                elapsed    = _time.time() - _dl_start,
+                engine     = "cc",
+                link_label = "CloudConvert CDN",
+            )
+
+        _dl_msg = await client.send_message(
             job.uid,
             f"☁️ <b>CloudConvert Finished</b>\n"
             f"──────────────────────\n\n"
@@ -245,28 +262,26 @@ async def _deliver_job(job: CCJob) -> None:
             parse_mode=enums.ParseMode.HTML,
         )
 
-        # Progress callback feeds the TaskRunner tracker
-        _dl_start = _time.time()
-        _dl_last  = [_dl_start]
+        # PanelUpdater keeps the message live with speed/ETA without blocking
+        # the aiohttp download loop (decoupled background task).
+        async with PanelUpdater(_dl_msg, _build_cc_dl_panel, interval=2.0) as pu:
 
-        async def _dl_progress(done: int, total: int) -> None:
-            now = _time.time()
-            if now - _dl_last[0] < 3.0:
-                return
-            _dl_last[0] = now
-            elapsed = now - _dl_start
-            speed   = done / elapsed if elapsed else 0.0
-            eta     = int((total - done) / speed) if (speed and total > done) else 0
-            await tracker.update(
-                dl_tid,
-                state="⬇️ Downloading from CC…",
-                done=done, total=total,
-                speed=speed, eta=eta,
-                elapsed=elapsed,
-            )
+            async def _dl_progress(done: int, total: int) -> None:
+                elapsed = _time.time() - _dl_start
+                speed   = done / elapsed if elapsed else 0.0
+                eta     = int((total - done) / speed) if (speed and total > done) else 0
+                pu.tick(done=done, total=total, speed=speed, eta=eta)
+                await tracker.update(
+                    dl_tid,
+                    state="⬇️ Downloading from CC…",
+                    done=done, total=total,
+                    speed=speed, eta=eta,
+                    elapsed=elapsed,
+                )
 
-        await tracker.update(dl_tid, state="⬇️ Downloading from CC…")
-        dl_bytes = await _download_export(job.export_url, dest, progress_cb=_dl_progress)
+            await tracker.update(dl_tid, state="⬇️ Downloading from CC…")
+            dl_bytes = await _download_export(job.export_url, dest, progress_cb=_dl_progress)
+
         await tracker.finish(dl_tid, success=True)
         log.info("[CCStatus] Downloaded %s → %s (%s)",
                  fname, dest, human_size(dl_bytes))
