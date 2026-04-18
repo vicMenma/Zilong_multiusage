@@ -653,6 +653,35 @@ async def burn_subtitle(video: str, sub: str, out: str) -> None:
     ], "BurnSub")
 
 
+async def hardsub_video(
+    video: str,
+    sub:   str,
+    out:   str,
+    crf:   int = 23,
+    preset: str = "medium",
+) -> None:
+    """
+    Hardsub with explicit x264 + AAC re-encode.
+
+    Matches the CC/FC hardsub preset exactly:
+      libx264 CRF 23 preset medium, AAC 128k, +faststart.
+
+    Unlike burn_subtitle() this re-encodes the AUDIO too. Necessary because
+    MKV sources often carry AC3/DTS/FLAC tracks that Telegram won't play —
+    a stream-copy would leave the user with a silent or broken file.
+    """
+    abs_sub  = os.path.abspath(sub)
+    safe_sub = abs_sub.replace("\\", "/").replace("'", "\\'").replace(":", "\\:")
+    await _run([
+        "ffmpeg", "-y", "-i", video,
+        "-vf", f"subtitles='{safe_sub}'",
+        "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        out,
+    ], f"Hardsub(crf={crf},preset={preset})")
+
+
 async def trim_video(inp: str, out: str, start: str, end: str) -> None:
     await _run([
         "ffmpeg","-y",

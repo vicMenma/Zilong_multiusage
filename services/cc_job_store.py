@@ -142,6 +142,24 @@ class CCJobStore:
                 job.notified = True
                 self._save()
 
+    async def try_claim_delivery(self, job_id: str) -> bool:
+        """
+        Atomically claim delivery for a CC job to prevent double-upload
+        when the webhook and the poller both race to deliver the same job.
+
+        Returns True if caller has exclusive right to deliver, False if
+        another path has already claimed (notified==True) it.
+        """
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return False
+            if job.notified:
+                return False
+            job.notified = True
+            self._save()
+            return True
+
     # ── Read API ──────────────────────────────────────────────
 
     def get(self, job_id: str) -> Optional[CCJob]:

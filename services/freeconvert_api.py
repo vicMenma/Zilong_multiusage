@@ -52,6 +52,60 @@ _TIMEOUT_SHORT  = aiohttp.ClientTimeout(total=30)
 _TIMEOUT_UPLOAD = aiohttp.ClientTimeout(total=7200)
 
 
+def _extract_fc_error(data: dict | str, status: int = 0) -> str:
+    """
+    Extract the most-readable error message from a FreeConvert API response.
+    FC responses vary wildly in shape:
+      - {"message": "..."}
+      - {"errors": {"field": ["err1", "err2"]}}
+      - {"errors": [{"message": "..."}]}
+      - {"error": "..."}
+      - HTML error pages (string)
+      - deeply-nested validation payloads
+    Returns a user-friendly single-line message, never empty.
+    """
+    if isinstance(data, str):
+        s = data.strip()
+        return (s[:300] + "…") if len(s) > 300 else (s or f"HTTP {status}")
+
+    if not isinstance(data, dict):
+        return f"HTTP {status}: {str(data)[:200]}"
+
+    # Top-level "message"
+    msg = data.get("message") or data.get("error") or ""
+    if isinstance(msg, str) and msg.strip():
+        return msg.strip()[:300]
+
+    # "errors" can be dict (field→[msgs]) or list
+    errs = data.get("errors")
+    if isinstance(errs, dict):
+        fragments = []
+        for field, v in errs.items():
+            if isinstance(v, list):
+                fragments.append(f"{field}: {'; '.join(str(x) for x in v)}")
+            else:
+                fragments.append(f"{field}: {v}")
+        if fragments:
+            return " · ".join(fragments)[:300]
+    if isinstance(errs, list) and errs:
+        first = errs[0]
+        if isinstance(first, dict):
+            m = first.get("message") or first.get("detail") or str(first)
+        else:
+            m = str(first)
+        return m[:300]
+
+    # Task-level error lookup
+    for t in (data.get("tasks") or []):
+        if (t.get("status") or "") in ("error", "failed"):
+            r = t.get("result") or {}
+            m = r.get("message") or r.get("error") or t.get("message") or t.get("code")
+            if m: return str(m)[:300]
+
+    # Give them the raw shape so they can at least see what happened
+    return f"HTTP {status}: {str(data)[:200]}"
+
+
 # ─────────────────────────────────────────────────────────────
 # Webhook URL helper
 # ─────────────────────────────────────────────────────────────
@@ -185,7 +239,8 @@ async def create_hardsub_job(
 
     vf  = (f"scale=-2:{scale_height},subtitles='{sub_escaped}'"
            if scale_height > 0 else f"subtitles='{sub_escaped}'")
-    abr = "128k" if scale_height and scale_height <= 480 else "192k"
+    # FIX: user-required preset always uses 128k audio regardless of resolution
+    abr = "128k"
 
     ffmpeg_args = (
         f"-i /input/import-video/{v_safe} "
@@ -214,19 +269,24 @@ async def create_hardsub_job(
         async with sess.post(
             f"{_FC_BASE}/jobs", json=payload, headers=headers,
         ) as resp:
-            data = await resp.json()
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                data = await resp.text()
             if resp.status not in (200, 201):
-                msg = (data.get("message") or str(data.get("errors") or data)[:200])
-                raise RuntimeError(f"[FC] Hardsub create ({resp.status}): {msg}")
+                err = _extract_fc_error(data, resp.status)
+                log.error("[FC-API] Hardsub create failed %d: %s", resp.status, err)
+                raise RuntimeError(f"[FC] Hardsub create ({resp.status}): {err}")
 
-    job_id = (data.get("data") or data).get("id", "?")
+    job_id = ((data.get("data") if isinstance(data, dict) else {}) or data).get("id", "?") \
+             if isinstance(data, dict) else "?"
     log.info(
         "[FC-API] Hardsub job: %s  crf=%d  preset=%s  scale=%s  webhook=%s",
         job_id, crf, preset,
         f"{scale_height}p" if scale_height else "original",
         "yes" if effective_wh else "no (poller will handle)",
     )
-    return data.get("data") or data
+    return data.get("data") or data if isinstance(data, dict) else {"id": "?"}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -264,7 +324,8 @@ async def create_convert_job(
         tasks["import-file"] = {"operation": "import/upload"}
 
     vf  = f"-vf scale=-2:{scale_height}" if scale_height > 0 else ""
-    abr = "128k" if scale_height and scale_height <= 480 else "192k"
+    # Always 128k — matches user's hardsub preset spec, applied here for consistency
+    abr = "128k"
 
     ffmpeg_args = (
         f"-i /input/import-file/{input_name} "
@@ -292,13 +353,17 @@ async def create_convert_job(
         async with sess.post(
             f"{_FC_BASE}/jobs", json=payload, headers=headers,
         ) as resp:
-            data = await resp.json()
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                data = await resp.text()
             if resp.status not in (200, 201):
-                raise RuntimeError(
-                    f"[FC] Convert create ({resp.status}): "
-                    f"{data.get('message', str(data))[:200]}"
-                )
+                err = _extract_fc_error(data, resp.status)
+                log.error("[FC-API] Convert create failed %d: %s", resp.status, err)
+                raise RuntimeError(f"[FC] Convert create ({resp.status}): {err}")
 
+    if not isinstance(data, dict):
+        raise RuntimeError("[FC] Convert create: non-JSON response")
     job_id = (data.get("data") or data).get("id", "?")
     log.info("[FC-API] Convert job: %s  scale=%s  crf=%d  preset=%s  webhook=%s",
              job_id, f"{scale_height}p" if scale_height else "original",
@@ -366,13 +431,17 @@ async def create_compress_job(
         async with sess.post(
             f"{_FC_BASE}/jobs", json=payload, headers=headers,
         ) as resp:
-            data = await resp.json()
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                data = await resp.text()
             if resp.status not in (200, 201):
-                raise RuntimeError(
-                    f"[FC] Compress create ({resp.status}): "
-                    f"{data.get('message', str(data))[:200]}"
-                )
+                err = _extract_fc_error(data, resp.status)
+                log.error("[FC-API] Compress create failed %d: %s", resp.status, err)
+                raise RuntimeError(f"[FC] Compress create ({resp.status}): {err}")
 
+    if not isinstance(data, dict):
+        raise RuntimeError("[FC] Compress create: non-JSON response")
     job_id = (data.get("data") or data).get("id", "?")
     log.info("[FC-API] Compress job: %s  target=%.0f MB  webhook=%s",
              job_id, target_mb, "yes" if effective_wh else "no")
