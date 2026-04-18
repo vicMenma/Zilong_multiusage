@@ -41,6 +41,10 @@ class FCJob:
     api_key:     str   = ""             # key used for this job (for re-fetching)
     created_at:  float = field(default_factory=time.time)
     error:       str   = ""
+    # NEW — set True once the file is in Telegram.  Prevents duplicate delivery
+    # if the bot crashes after upload but before remove(), or if the webhook
+    # fires again after the user already received the file.
+    uploaded:    bool  = False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -77,10 +81,15 @@ class FCJobStore:
             self._evict_expired()
             # Reset any job that was atomically claimed (status="completed") but not
             # fully delivered before the process exited.  The poller will re-poll them.
+            # DUPLICATE-DELIVERY FIX: do NOT reset if uploaded=True — the file is
+            # already in Telegram, resetting would cause a second delivery.
             for job in self._jobs.values():
-                if job.status == "completed":
+                if job.status == "completed" and not job.uploaded:
                     job.status = "processing"
                     log.info("[FC-Store] Reset undelivered job %s → 'processing'", job.job_id)
+                elif job.status == "completed" and job.uploaded:
+                    log.info("[FC-Store] Job %s already uploaded — leaving as 'completed'",
+                             job.job_id)
 
     async def _save(self) -> None:
         """Persist to disk (called internally, lock must be held)."""
@@ -155,16 +164,32 @@ class FCJobStore:
         'processing' → 'completed'.  Only the first caller returns True;
         all subsequent callers (webhook retry, startup poller) return False.
 
-        This prevents the double-upload race between the FC webhook handler
-        and _poll_fc_pending running simultaneously on the same job.
+        Also refuses the claim if uploaded=True — once the file is in
+        Telegram, no path should ever be allowed to re-deliver.
         """
         async with self._lock:
             job = self._jobs.get(job_id)
-            if job is None or job.status != "processing":
+            if job is None:
+                return False
+            if job.uploaded:
+                return False
+            if job.status != "processing":
                 return False
             job.status = "completed"
             await self._save()
             return True
+
+    async def mark_uploaded(self, job_id: str) -> None:
+        """
+        Call this IMMEDIATELY after upload_file() returns successfully.
+        Flags the file as delivered so any post-upload exception cannot
+        trigger a duplicate on next poll / restart.
+        """
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job:
+                job.uploaded = True
+                await self._save()
 
     async def list_by_uid(self, uid: int) -> list[FCJob]:
         """Return all jobs belonging to a user, newest first."""
