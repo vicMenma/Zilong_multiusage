@@ -686,6 +686,15 @@ async def _fc_get_usage(api_key: str) -> float:
     FIX FC-USAGE-EP: old code hit /v1/process/usage which returns 404.
     Try the real endpoints; on any ambiguity return a LARGE number so the
     job is attempted (FC will return a clean error if truly exhausted).
+
+    FIX FC-401-BAIL: previous version returned 0.0 immediately on the
+    first 401 response, skipping the second endpoint and marking the key
+    as dead.  FreeConvert's /v1/account endpoint may return 401 for valid
+    free-tier keys (auth scope changed without breaking job creation).
+    Now we `continue` on 401 to try the next endpoint.  Only after ALL
+    endpoints are exhausted without a positive response do we assume the
+    key might still work (return 1e6) — the actual job submission will
+    surface a real 401 error if the key is truly invalid.
     """
     headers = {"Authorization": f"Bearer {api_key}"}
     # Real endpoints that exist in FreeConvert v1:
@@ -693,14 +702,19 @@ async def _fc_get_usage(api_key: str) -> float:
         f"{_FC_ROOT}/account",
         f"{_FC_ROOT}/user",
     ]
+    _got_401 = 0   # track 401s across all endpoints
     for endpoint in endpoints:
         try:
             async with aiohttp.ClientSession(timeout=_TIMEOUT_SHORT) as sess:
                 async with sess.get(endpoint, headers=headers) as resp:
                     if resp.status == 401:
-                        log.warning("[FC-API] Key ...%s returned 401 on %s — invalid",
-                                    api_key[-6:], endpoint)
-                        return 0.0
+                        _got_401 += 1
+                        log.warning(
+                            "[FC-API] Key ...%s returned 401 on %s — "
+                            "trying next endpoint before marking invalid",
+                            api_key[-6:], endpoint,
+                        )
+                        continue   # FIX: was `return 0.0`, now try next endpoint
                     if resp.status == 404:
                         continue   # try next endpoint
                     if resp.status in (429,):
@@ -758,9 +772,22 @@ async def _fc_get_usage(api_key: str) -> float:
             continue
 
     # All endpoints failed — assume key is available rather than falsely
-    # reporting "exhausted"
-    log.info("[FC-API] Key ...%s: usage endpoints unreachable — assuming available",
-             api_key[-6:])
+    # reporting "exhausted".
+    # If every endpoint returned 401 the key MIGHT be invalid, but we cannot
+    # confirm that without attempting a real job.  Let the job creation itself
+    # surface the error if the key is truly bad — the error message will be
+    # much clearer than "all keys exhausted".
+    if _got_401 and _got_401 == len(endpoints):
+        log.warning(
+            "[FC-API] Key ...%s: all %d endpoint(s) returned 401 — "
+            "account API may have changed auth requirements.  "
+            "Assuming key is still valid for job creation; "
+            "a real 401 will appear if the key is truly invalid.",
+            api_key[-6:], len(endpoints),
+        )
+    else:
+        log.info("[FC-API] Key ...%s: usage endpoints unreachable — assuming available",
+                 api_key[-6:])
     return 1e6
 
 

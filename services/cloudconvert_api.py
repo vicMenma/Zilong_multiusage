@@ -460,11 +460,16 @@ async def upload_file_to_task(
     api_key: str = "",
     job_id: str = "",
     task_name: str = "",
+    progress_cb=None,
 ) -> None:
     """
     Upload a local file to a CloudConvert import/upload task.
     Polls _wait_for_task_ready() first so we never hit the instant-ERROR
     caused by uploading while the task is still 'pending'.
+
+    progress_cb: optional async callable(done: int, total: int) — called
+    once before upload starts (done=0, total=fsize) and once on completion
+    (done=total) so callers can update a TaskRunner progress panel.
     """
     if api_key and job_id and task_name:
         task = await _wait_for_task_ready(api_key, job_id, task_name)
@@ -484,6 +489,12 @@ async def upload_file_to_task(
     log.info("[CC-API] Uploading %s → %s (%d bytes) to %s…",
              raw_fname, safe_fname, fsize, url[:60])
 
+    if progress_cb:
+        try:
+            await progress_cb(0, fsize)
+        except Exception:
+            pass
+
     with open(file_path, "rb") as fh:
         data = aiohttp.FormData()
         for key, value in params.items():
@@ -496,6 +507,12 @@ async def upload_file_to_task(
                     raise RuntimeError(
                         f"Upload failed ({resp.status}): {body[:300]}"
                     )
+
+    if progress_cb:
+        try:
+            await progress_cb(fsize, fsize)
+        except Exception:
+            pass
 
     log.info("[CC-API] Upload complete: %s", safe_fname)
 
@@ -531,7 +548,15 @@ async def submit_hardsub(
     preset:        str = "medium",
     scale_height:  int = 0,
     user_id:       int = 0,
+    upload_progress_cb=None,
 ) -> str:
+    """
+    Submit a hardsub job to CloudConvert.
+
+    upload_progress_cb: optional async callable(phase, done, total) where
+      phase is "sub" or "video".  Called at start (done=0) and end
+      (done=total) of each upload so callers can update a progress panel.
+    """
     if not video_path and not video_url:
         raise ValueError("Provide either video_path or video_url")
     if not subtitle_path or not os.path.isfile(subtitle_path):
@@ -563,12 +588,28 @@ async def submit_hardsub(
 
     job_id = job.get("id", "?")
 
+    # Build per-phase progress callbacks
+    async def _sub_progress(done: int, total: int) -> None:
+        if upload_progress_cb:
+            try:
+                await upload_progress_cb("sub", done, total)
+            except Exception:
+                pass
+
+    async def _vid_progress(done: int, total: int) -> None:
+        if upload_progress_cb:
+            try:
+                await upload_progress_cb("video", done, total)
+            except Exception:
+                pass
+
     sub_task = _find_task(job, "import-sub")
     if not sub_task:
         raise RuntimeError("No import-sub task found in job")
     await upload_file_to_task(
         sub_task, subtitle_path, sub_fname,
         api_key=selected_key, job_id=job_id, task_name="import-sub",
+        progress_cb=_sub_progress,
     )
 
     if video_path:
@@ -578,6 +619,7 @@ async def submit_hardsub(
         await upload_file_to_task(
             vid_task, video_path, video_fname,
             api_key=selected_key, job_id=job_id, task_name="import-video",
+            progress_cb=_vid_progress,
         )
 
     log.info("[CC-API] Hardsub job submitted: %s → %s", job_id, output_name)
