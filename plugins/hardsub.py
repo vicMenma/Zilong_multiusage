@@ -40,6 +40,10 @@ from core.session import users
 from services.cc_sanitize import build_cc_output_name
 from services.utils import human_size, make_tmp, cleanup, safe_edit
 
+# Local FFmpeg availability — checked once at import
+import shutil as _shutil
+_FFMPEG_OK = bool(_shutil.which("ffmpeg"))
+
 log = logging.getLogger(__name__)
 
 _SUB_EXTS = {".ass", ".srt", ".vtt", ".ssa", ".sub", ".txt"}
@@ -103,7 +107,7 @@ async def start_hardsub_for_url(
         "videos":    [{"path": path, "url": None, "fname": fname}],
         "sub_path":  None,
         "sub_fname": None,
-        "crf":       20,
+        "crf":       23,
         "preset":    "medium",
         "platform":  _default_platform(),
     }
@@ -114,8 +118,8 @@ async def start_hardsub_for_url(
 # ── Labels ────────────────────────────────────────────────────
 
 def _crf_label(crf: int) -> str:
-    labels = {18: "CRF 18 🔵 HQ", 20: "CRF 20 🟢 Default",
-              23: "CRF 23 🟡 Medium", 26: "CRF 26 🟠 Low"}
+    labels = {18: "CRF 18 🔵 HQ", 20: "CRF 20 🟢 HQ",
+              23: "CRF 23 🟢 Default", 26: "CRF 26 🟠 Low"}
     return labels.get(crf, f"CRF {crf}")
 
 
@@ -125,22 +129,28 @@ def _preset_label(p: str) -> str:
 
 
 def _platform_label(platform: str) -> str:
-    return "☁️ CloudConvert" if platform == "cc" else "🆓 FreeConvert"
+    return {
+        "cc":    "☁️ CloudConvert",
+        "fc":    "🆓 FreeConvert",
+        "local": "🖥 Local FFmpeg",
+    }.get(platform, platform)
 
 
-def _has_cc() -> bool: return bool(os.environ.get("CC_API_KEY", "").strip())
-def _has_fc() -> bool: return bool(os.environ.get("FC_API_KEY", "").strip())
+def _has_cc()    -> bool: return bool(os.environ.get("CC_API_KEY", "").strip())
+def _has_fc()    -> bool: return bool(os.environ.get("FC_API_KEY", "").strip())
+def _has_local() -> bool: return _FFMPEG_OK
 
 
 def _default_platform() -> str:
-    if _has_cc(): return "cc"
-    if _has_fc(): return "fc"
+    if _has_cc():    return "cc"
+    if _has_fc():    return "fc"
+    if _has_local(): return "local"
     return "cc"
 
 
 async def _show_subtitle_prompt(st, uid: int, fname: str, fsize: int = 0) -> None:
     state        = _STATE.get(uid, {})
-    cur_crf      = state.get("crf", 20)
+    cur_crf      = state.get("crf", 23)
     cur_preset   = state.get("preset", "medium")
     cur_platform = state.get("platform", _default_platform())
     size_s = f"  <code>{human_size(fsize)}</code>" if fsize else ""
@@ -164,7 +174,7 @@ async def _show_subtitle_prompt(st, uid: int, fname: str, fsize: int = 0) -> Non
 
 def _subtitle_kb(uid: int) -> InlineKeyboardMarkup:
     state        = _STATE.get(uid, {})
-    cur_crf      = state.get("crf", 20)
+    cur_crf      = state.get("crf", 23)
     cur_preset   = state.get("preset", "medium")
     cur_platform = state.get("platform", _default_platform())
 
@@ -188,11 +198,15 @@ def _subtitle_kb(uid: int) -> InlineKeyboardMarkup:
         [_pre_btn("fast"), _pre_btn("medium"),
          _pre_btn("slow"), _pre_btn("veryslow")],
     ]
-    if _has_cc() and _has_fc():
-        rows.append([
-            _plat_btn("☁️ CloudConvert", "cc"),
-            _plat_btn("🆓 FreeConvert",  "fc"),
-        ])
+
+    # Platform row — show if 2+ backends available
+    plat_row = []
+    if _has_cc():    plat_row.append(_plat_btn("☁️ CC",    "cc"))
+    if _has_fc():    plat_row.append(_plat_btn("🆓 FC",    "fc"))
+    if _has_local(): plat_row.append(_plat_btn("🖥 Local", "local"))
+    if len(plat_row) >= 2:
+        rows.append(plat_row)
+
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"hs_cancel|{uid}")])
     return InlineKeyboardMarkup(rows)
 
@@ -248,7 +262,7 @@ async def hardsub_platform_cb(client: Client, cb: CallbackQuery):
     state = _user_state(uid)
     if not state: return await cb.answer("Session expired.", show_alert=True)
     await cb.answer()
-    if plat not in ("cc", "fc"): return
+    if plat not in ("cc", "fc", "local"): return
     state["platform"] = plat
     videos = state.get("videos", [])
     fname  = videos[-1]["fname"] if videos else "video"
@@ -267,7 +281,7 @@ async def _submit_one_job(
     sub_path:  str,
     sub_fname: str,
     uid:       int,
-    crf:       int  = 20,
+    crf:       int  = 23,
     preset:    str  = "medium",
     platform:  str  = "cc",
 ) -> tuple[str, str, bool]:
@@ -346,14 +360,110 @@ async def _submit_one_fc(
         return video_fname, str(exc)[:80], False
 
 
+async def _submit_batch_local(
+    st, state: dict, uid: int,
+    videos: list, sub_path: str, sub_fname: str,
+    crf: int, preset: str,
+) -> None:
+    """Inline local-FFmpeg hardsub. Re-encodes audio to AAC 128k (matches CC preset)."""
+    import time as _time
+    from services.ffmpeg import hardsub_video
+    from services.uploader import upload_file
+    from core.session import get_client
+
+    client = get_client()
+
+    count = len(videos)
+    out_files: list[str] = []
+    errs: list[str] = []
+
+    await safe_edit(
+        st,
+        f"🖥 <b>Local hardsub — {count} video{'s' if count > 1 else ''}</b>\n"
+        "──────────────────────\n\n"
+        f"💬 <code>{sub_fname[:42]}</code>\n"
+        f"⚙️ {_crf_label(crf)}  ·  🎛 {_preset_label(preset)}\n"
+        f"🌐 {_platform_label('local')}\n\n"
+        "⏳ Processing…",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    for i, video in enumerate(videos):
+        in_path = video.get("path")
+        if not in_path or not os.path.isfile(in_path):
+            errs.append(f"{i+1}. missing input")
+            continue
+
+        fname = video.get("fname", os.path.basename(in_path))
+        stem, _ = os.path.splitext(fname)
+        out_name = build_cc_output_name(fname, suffix="VOSTFR")
+        out_path = os.path.join(state["tmp"], out_name)
+
+        t0 = _time.monotonic()
+        await safe_edit(
+            st,
+            f"🖥 <b>Encoding {i+1}/{count}</b>\n"
+            "──────────────────────\n\n"
+            f"📁 <code>{fname[:45]}</code>\n"
+            f"⚙️ {_crf_label(crf)}  ·  🎛 {_preset_label(preset)}\n"
+            "⏳ This can take a while for long videos…",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+        try:
+            await hardsub_video(in_path, sub_path, out_path, crf=crf, preset=preset)
+        except Exception as exc:
+            log.error("[Hardsub-Local] %s failed: %s", fname, exc)
+            errs.append(f"{i+1}. <code>{str(exc)[:80]}</code>")
+            continue
+
+        if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+            errs.append(f"{i+1}. empty output")
+            continue
+
+        dt = _time.monotonic() - t0
+        log.info("[Hardsub-Local] %s done in %.1fs", fname, dt)
+
+        # Upload (upload_file handles PanelUpdater + FloodWait internally)
+        try:
+            await upload_file(client, st, out_path, user_id=uid, is_last=(i == count - 1))
+            out_files.append(out_path)
+        except Exception as exc:
+            log.error("[Hardsub-Local] upload %s failed: %s", out_name, exc)
+            errs.append(f"{i+1}. upload: <code>{str(exc)[:60]}</code>")
+
+    ok_count = len(out_files)
+    ok_line = f"✅ {ok_count}/{count} uploaded"
+    err_block = ("\n\n❌ Errors:\n" + "\n".join(f"  {e}" for e in errs)) if errs else ""
+
+    await safe_edit(
+        st,
+        f"{'✅' if ok_count == count else '⚠️'} <b>Local hardsub complete</b>\n"
+        "──────────────────────\n\n"
+        f"{ok_line}{err_block}",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    # Cleanup outputs after upload
+    for p in out_files:
+        try: os.remove(p)
+        except Exception: pass
+
+    _clear(uid)
+
+
 async def _submit_batch(st, state: dict, uid: int) -> None:
     videos    = state.get("videos", [])
     sub_path  = state["sub_path"]
     sub_fname = state.get("sub_fname", "subtitle.ass")
-    crf       = state.get("crf", 20)
+    crf       = state.get("crf", 23)
     preset    = state.get("preset", "medium")
     platform  = state.get("platform", _default_platform())
     count     = len(videos)
+
+    # Local FFmpeg branches off — different flow (inline processing, not submit-and-wait)
+    if platform == "local":
+        return await _submit_batch_local(st, state, uid, videos, sub_path, sub_fname, crf, preset)
 
     vid_list = "\n".join(
         f"  {i+1}. <code>{v['fname'][:40]}</code>" for i, v in enumerate(videos)
@@ -476,10 +586,11 @@ async def cmd_hardsub(client: Client, msg: Message):
     uid = msg.from_user.id
     await users.register(uid, msg.from_user.first_name or "")
     api_key = os.environ.get("CC_API_KEY", "").strip() or os.environ.get("FC_API_KEY", "").strip()
-    if not api_key:
+    if not api_key and not _has_local():
         return await msg.reply(
-            "❌ <b>No hardsub API key configured</b>\n\n"
-            "Add <code>CC_API_KEY</code> or <code>FC_API_KEY</code> to .env.",
+            "❌ <b>No hardsub backend available</b>\n\n"
+            "Add <code>CC_API_KEY</code> or <code>FC_API_KEY</code> to .env, "
+            "or install <code>ffmpeg</code> for local hardsub.",
             parse_mode=enums.ParseMode.HTML,
         )
     _clear(uid)
@@ -487,7 +598,7 @@ async def cmd_hardsub(client: Client, msg: Message):
     _STATE[uid] = {
         "step": "waiting_video", "tmp": tmp, "videos": [],
         "sub_path": None, "sub_fname": None,
-        "crf": 20, "preset": "medium", "platform": _default_platform(),
+        "crf": 23, "preset": "medium", "platform": _default_platform(),
     }
     await msg.reply(
         "🔥 <b>Hardsub</b>\n"

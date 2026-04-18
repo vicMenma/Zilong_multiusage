@@ -36,21 +36,83 @@ from core.config import cfg
 from core.session import users
 from services.utils import human_size, make_tmp, cleanup, safe_edit
 
+import shutil as _shutil
+_FFMPEG_OK = bool(_shutil.which("ffmpeg"))
+
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────
+# Platform helpers
+# ─────────────────────────────────────────────────────────────
+
+def _has_cc()    -> bool: return bool(os.environ.get("CC_API_KEY", "").strip())
+def _has_fc()    -> bool: return bool(os.environ.get("FC_API_KEY", "").strip())
+def _has_local() -> bool: return _FFMPEG_OK
+
+
+def _default_platform() -> str:
+    if _has_fc():    return "fc"
+    if _has_cc():    return "cc"
+    if _has_local(): return "local"
+    return "local"
+
+
+def _platform_label(p: str) -> str:
+    return {"cc": "☁️ CloudConvert",
+            "fc": "🆓 FreeConvert",
+            "local": "🖥 Local FFmpeg"}.get(p, p)
+
+
+def _platform_row(tok: str, current: str, kind: str) -> list:
+    """Build platform toggle row. kind='rzp' or 'czp' for resize/compress."""
+    row = []
+    if _has_cc():
+        tick = " ✓" if current == "cc" else ""
+        row.append(InlineKeyboardButton(f"☁️ CC{tick}", callback_data=f"{kind}|cc|{tok}"))
+    if _has_fc():
+        tick = " ✓" if current == "fc" else ""
+        row.append(InlineKeyboardButton(f"🆓 FC{tick}", callback_data=f"{kind}|fc|{tok}"))
+    if _has_local():
+        tick = " ✓" if current == "local" else ""
+        row.append(InlineKeyboardButton(f"🖥 Local{tick}", callback_data=f"{kind}|local|{tok}"))
+    return row
 
 
 # ─────────────────────────────────────────────────────────────
 # Keyboard
 # ─────────────────────────────────────────────────────────────
 
-def resize_resolution_kb(source_token: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def resize_resolution_kb(source_token: str, platform: str | None = None) -> InlineKeyboardMarkup:
+    platform = platform or _default_platform()
+    # Update stored platform on keyboard build (keeps token in sync with current selection)
+    entry = _token_store.get(source_token)
+    if entry:
+        entry["platform"] = platform
+
+    rows = []
+    plat_row = _platform_row(source_token, platform, "rzp")
+    if len(plat_row) >= 2:
+        rows.append(plat_row)
+    rows += [
         [InlineKeyboardButton("🔵 1080p", callback_data=f"rsz|1080|{source_token}"),
          InlineKeyboardButton("🟢 720p",  callback_data=f"rsz|720|{source_token}")],
         [InlineKeyboardButton("🟡 480p",  callback_data=f"rsz|480|{source_token}"),
          InlineKeyboardButton("🟠 360p",  callback_data=f"rsz|360|{source_token}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"rsz|cancel|{source_token}")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def compress_platform_kb(tok: str, platform: str | None = None) -> InlineKeyboardMarkup:
+    platform = platform or _default_platform()
+    rows = []
+    plat_row = _platform_row(tok, platform, "czp")
+    if plat_row:
+        rows.append(plat_row)
+    rows.append([InlineKeyboardButton("🚀 Go", callback_data=f"czp|go|{tok}"),
+                 InlineKeyboardButton("❌ Cancel", callback_data=f"czp|cancel|{tok}")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -63,13 +125,19 @@ _TOKEN_TTL = 1800   # 30 min
 
 def _store_session(session_key: str) -> str:
     tok = session_key
-    _token_store[tok] = {"kind": "session", "key": session_key, "ts": time.time()}
+    _token_store[tok] = {
+        "kind": "session", "key": session_key, "ts": time.time(),
+        "platform": _default_platform(),
+    }
     return tok
 
 
 def _store_url(url: str, fname: str) -> str:
     tok = hashlib.md5(url.encode()).hexdigest()[:12]
-    _token_store[tok] = {"kind": "url", "url": url, "fname": fname, "ts": time.time()}
+    _token_store[tok] = {
+        "kind": "url", "url": url, "fname": fname, "ts": time.time(),
+        "platform": _default_platform(),
+    }
     return tok
 
 
@@ -78,6 +146,7 @@ def _store_tg_file(file_id: str, fname: str, fsize: int) -> str:
     _token_store[tok] = {
         "kind": "tg_file", "file_id": file_id,
         "fname": fname, "fsize": fsize, "ts": time.time(),
+        "platform": _default_platform(),
     }
     return tok
 
@@ -157,6 +226,23 @@ async def cmd_compress(client: Client, msg: Message):
     url       = next((a for a in args if a.startswith("http")), None)
     target_mb = next((float(a) for a in args if re.match(r"^\d+(\.\d+)?$", a)), None)
 
+    async def _stage_cmd(st, path, fname, tmp):
+        tok = hashlib.md5(f"{uid}_{time.time()}".encode()).hexdigest()[:12]
+        _cz_pending[tok] = {
+            "target_mb": target_mb, "uid": uid, "tmp": tmp,
+            "path": path, "fname": fname,
+            "platform": _default_platform(),
+        }
+        await safe_edit(
+            st,
+            f"🗜️ <b>Compress</b> → <b>{target_mb:.0f} MB</b>\n"
+            f"<code>{fname[:45]}</code>\n"
+            f"<code>{human_size(os.path.getsize(path))}</code>\n\n"
+            "Pick backend and tap 🚀 Go:",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=compress_platform_kb(tok, _default_platform()),
+        )
+
     if url and target_mb:
         fname = url.split("/")[-1].split("?")[0][:50] or "video.mkv"
         tmp   = make_tmp(cfg.download_dir, uid)
@@ -173,7 +259,7 @@ async def cmd_compress(client: Client, msg: Message):
                             parse_mode=enums.ParseMode.HTML)
             cleanup(tmp)
             return
-        await _do_compress(client, st, path, os.path.basename(path), tmp, target_mb, uid)
+        await _stage_cmd(st, path, os.path.basename(path), tmp)
         return
 
     reply     = msg.reply_to_message
@@ -197,7 +283,7 @@ async def cmd_compress(client: Client, msg: Message):
                                 parse_mode=enums.ParseMode.HTML)
                 cleanup(tmp)
                 return
-            await _do_compress(client, st, path, fname, tmp, target_mb, uid)
+            await _stage_cmd(st, path, fname, tmp)
             return
 
     _evict_resize_states()  # FIX H-05
@@ -401,6 +487,24 @@ async def compress_mb_receiver(client: Client, msg: Message):
     target_mb = float(text)
     info      = _compress_waiting.pop(uid)
 
+    async def _stage_platform_pick(st, path, fname, tmp):
+        """Download is done; stage platform picker."""
+        tok = hashlib.md5(f"{uid}_{time.time()}".encode()).hexdigest()[:12]
+        _cz_pending[tok] = {
+            "target_mb": target_mb, "uid": uid, "tmp": tmp,
+            "path": path, "fname": fname,
+            "platform": _default_platform(),
+        }
+        await safe_edit(
+            st,
+            f"🗜️ <b>Compress</b> → <b>{target_mb:.0f} MB</b>\n"
+            f"<code>{fname[:45]}</code>\n"
+            f"<code>{human_size(os.path.getsize(path))}</code>\n\n"
+            "Pick backend and tap 🚀 Go:",
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=compress_platform_kb(tok, _default_platform()),
+        )
+
     # ── Source: video menu session ────────────────────────────
     if "session_key" in info:
         from core.session import sessions
@@ -424,7 +528,7 @@ async def compress_mb_receiver(client: Client, msg: Message):
                 cleanup(tmp)
                 msg.stop_propagation()
                 return
-            await _do_compress(client, st, path, session.fname, tmp, target_mb, uid)
+            await _stage_platform_pick(st, path, session.fname, tmp)
         except Exception as exc:
             cleanup(tmp)
             await safe_edit(st, f"❌ Failed: <code>{exc}</code>",
@@ -449,7 +553,7 @@ async def compress_mb_receiver(client: Client, msg: Message):
                 except Exception: pass
             from services.downloader import download_direct
             path = await download_direct(url, tmp)
-            await _do_compress(client, st, path, os.path.basename(path), tmp, target_mb, uid)
+            await _stage_platform_pick(st, path, os.path.basename(path), tmp)
         except Exception as exc:
             cleanup(tmp)
             await safe_edit(st, f"❌ Failed: <code>{exc}</code>",
@@ -480,7 +584,7 @@ async def compress_mb_receiver(client: Client, msg: Message):
                 os.path.join(tmp, fname), st,
                 fname=fname, fsize=entry.get("fsize", 0), user_id=uid,
             )
-            await _do_compress(client, st, path, fname, tmp, target_mb, uid)
+            await _stage_platform_pick(st, path, fname, tmp)
         except Exception as exc:
             cleanup(tmp)
             await safe_edit(st, f"❌ Failed: <code>{exc}</code>",
@@ -489,6 +593,78 @@ async def compress_mb_receiver(client: Client, msg: Message):
         return
 
     msg.stop_propagation()
+
+
+# ─────────────────────────────────────────────────────────────
+# Resize platform toggle  rzp|<platform>|<token>
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^rzp\|"))
+async def rzp_cb(client: Client, cb: CallbackQuery):
+    parts = cb.data.split("|", 2)
+    if len(parts) < 3: return await cb.answer("Invalid.", show_alert=True)
+    _, plat, tok = parts
+    await cb.answer()
+    if plat not in ("cc", "fc", "local"): return
+    entry = _get_token(tok)
+    if not entry:
+        return await safe_edit(cb.message, "❌ Session expired.")
+    entry["platform"] = plat
+    try:
+        await cb.message.edit_reply_markup(reply_markup=resize_resolution_kb(tok, plat))
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Compress platform picker + go  czp|<platform>|<tok>
+# ─────────────────────────────────────────────────────────────
+
+# Stores: tok → {target_mb, client, msg, path/entry info, tmp, uid, fname, platform}
+_cz_pending: dict[str, dict] = {}
+
+
+@Client.on_callback_query(filters.regex(r"^czp\|"))
+async def czp_cb(client: Client, cb: CallbackQuery):
+    parts = cb.data.split("|", 2)
+    if len(parts) < 3: return await cb.answer("Invalid.", show_alert=True)
+    _, action, tok = parts
+    await cb.answer()
+    pending = _cz_pending.get(tok)
+    if not pending:
+        return await safe_edit(cb.message, "❌ Session expired.", parse_mode=enums.ParseMode.HTML)
+
+    if action == "cancel":
+        _cz_pending.pop(tok, None)
+        try: await cb.message.delete()
+        except Exception: pass
+        return
+
+    if action in ("cc", "fc", "local"):
+        pending["platform"] = action
+        try:
+            await cb.message.edit_reply_markup(
+                reply_markup=compress_platform_kb(tok, action)
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "go":
+        platform  = pending.get("platform", _default_platform())
+        target_mb = pending["target_mb"]
+        uid       = pending["uid"]
+        tmp       = pending["tmp"]
+        path      = pending["path"]
+        fname     = pending["fname"]
+        st        = cb.message
+        _cz_pending.pop(tok, None)
+        try:
+            await _do_compress(client, st, path, fname, tmp, target_mb, uid, platform=platform)
+        except Exception as exc:
+            cleanup(tmp)
+            await safe_edit(st, f"❌ <b>Compress failed</b>\n<code>{exc}</code>",
+                            parse_mode=enums.ParseMode.HTML)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -561,7 +737,8 @@ async def rsz_cb(client: Client, cb: CallbackQuery):
                 cleanup(tmp)
                 return
 
-        await _do_resize(client, cb.message, path, fname, tmp, height, uid)
+        platform = entry.get("platform", _default_platform())
+        await _do_resize(client, cb.message, path, fname, tmp, height, uid, platform=platform)
 
     except Exception as exc:
         log.error("[Resize] %s", exc, exc_info=True)
@@ -577,46 +754,103 @@ async def rsz_cb(client: Client, cb: CallbackQuery):
 
 async def _do_resize(
     client, msg, path: str, fname: str, tmp: str, height: int, uid: int,
+    platform: str | None = None,
 ) -> None:
     """
-    Resize video to `height` px.
-    Tries FreeConvert first (upload local file → cloud resize).
-    Falls back to local FFmpeg if FC not configured or job fails.
+    Resize video to `height` px on the chosen backend (cc | fc | local).
+    If the chosen backend is unavailable, falls back to next-best.
     """
     from services.task_runner import tracker, TaskRecord
     from services import ffmpeg as FF
     from services.uploader import upload_file
     from services.freeconvert_api import parse_fc_keys
 
+    platform = platform or _default_platform()
     name_base = os.path.splitext(fname)[0]
     out_fname = f"{name_base}_{height}p.mp4"
     out       = os.path.join(tmp, out_fname)
 
-    # ── Try FreeConvert ───────────────────────────────────────
-    fc_raw  = os.environ.get("FC_API_KEY", "").strip()
-    fc_keys = parse_fc_keys(fc_raw)
-    for _ii in range(2, 10):
-        _xtra = os.environ.get(f"FC_API_KEY_{_ii}", "").strip()
-        if _xtra:
-            fc_keys.extend(parse_fc_keys(_xtra))
-
-    if fc_keys:
+    # ── CloudConvert branch ───────────────────────────────────
+    if platform == "cc" and _has_cc():
         try:
-            from services.freeconvert_api import pick_best_fc_key, submit_convert, run_fc_job
+            from services.cloudconvert_api import (
+                parse_api_keys, pick_best_key, submit_convert, run_cc_job,
+            )
+            cc_keys = parse_api_keys(os.environ.get("CC_API_KEY", "").strip())
+            cc_key, _credits = await pick_best_key(cc_keys) if len(cc_keys) > 1 else (cc_keys[0], 0)
+
             tid    = tracker.new_tid()
             record = TaskRecord(
                 tid=tid, user_id=uid,
-                label=f"FC Resize → {height}p",
-                mode="proc", engine="freeconvert",
-                fname=fname, state=f"☁️ Uploading to FC…",
+                label=f"CC Resize → {height}p",
+                mode="proc", engine="cloudconvert",
+                fname=fname, state="☁️ Uploading to CC…",
             )
             await tracker.register(record)
+
+            await safe_edit(msg,
+                f"☁️ <b>CC Resize → {height}p</b>\n"
+                f"<code>{fname[:40]}</code>\n⬆️ Uploading to CloudConvert…",
+                parse_mode=enums.ParseMode.HTML)
+
+            job_id = await submit_convert(
+                cc_key, video_path=path,
+                scale_height=height, crf=23, output_name=out_fname,
+            )
+            await safe_edit(msg,
+                f"⏳ <b>CC Resize → {height}p</b>\n"
+                f"🆔 <code>{job_id}</code>\n<i>CloudConvert processing…</i>",
+                parse_mode=enums.ParseMode.HTML)
+
+            result_path = await run_cc_job(cc_key, job_id, tmp, output_name=out_fname)
+            record.update(state="✅ Done")
+            fsize = os.path.getsize(result_path)
+
+            try: await msg.delete()
+            except Exception: pass
+            st = await client.send_message(
+                uid,
+                f"📐 <b>CC Resize done!</b>  {height}p\n"
+                f"<code>{out_fname}</code>  <code>{human_size(fsize)}</code>\n"
+                f"⬆️ Uploading…",
+                parse_mode=enums.ParseMode.HTML,
+            )
             try:
+                await upload_file(client, st, result_path, user_id=uid)
+            finally:
+                cleanup(tmp)
+            return
+        except Exception as exc:
+            log.warning("[CC-resize] failed: %s", exc)
+            await safe_edit(msg,
+                f"⚠️ CC failed — falling back to local FFmpeg\n<code>{str(exc)[:150]}</code>",
+                parse_mode=enums.ParseMode.HTML)
+            platform = "local"
+
+    # ── FreeConvert branch ────────────────────────────────────
+    if platform == "fc" and _has_fc():
+        fc_raw  = os.environ.get("FC_API_KEY", "").strip()
+        fc_keys = parse_fc_keys(fc_raw)
+        for _ii in range(2, 10):
+            _xtra = os.environ.get(f"FC_API_KEY_{_ii}", "").strip()
+            if _xtra:
+                fc_keys.extend(parse_fc_keys(_xtra))
+
+        if fc_keys:
+            try:
+                from services.freeconvert_api import pick_best_fc_key, submit_convert, run_fc_job
+                tid    = tracker.new_tid()
+                record = TaskRecord(
+                    tid=tid, user_id=uid,
+                    label=f"FC Resize → {height}p",
+                    mode="proc", engine="freeconvert",
+                    fname=fname, state="☁️ Uploading to FC…",
+                )
+                await tracker.register(record)
                 await safe_edit(msg,
                     f"☁️ <b>FC Resize → {height}p</b>\n"
                     f"<code>{fname[:40]}</code>\n⬆️ Uploading to FreeConvert…",
-                    parse_mode=enums.ParseMode.HTML,
-                )
+                    parse_mode=enums.ParseMode.HTML)
                 key, _mins = await pick_best_fc_key(fc_keys)
                 job_id = await submit_convert(
                     key, video_path=path, scale_height=height, crf=23, output_name=out_fname,
@@ -624,8 +858,7 @@ async def _do_resize(
                 await safe_edit(msg,
                     f"⏳ <b>FC Resize → {height}p</b>\n"
                     f"🆔 <code>{job_id}</code>\n<i>FreeConvert processing…</i>",
-                    parse_mode=enums.ParseMode.HTML,
-                )
+                    parse_mode=enums.ParseMode.HTML)
                 result_path = await run_fc_job(key, job_id, tmp, output_name=out_fname)
                 record.update(state="✅ Done")
                 fsize = os.path.getsize(result_path)
@@ -644,16 +877,12 @@ async def _do_resize(
                     cleanup(tmp)
                 return
             except Exception as exc:
-                record.update(state="⚠️ FC failed")
                 log.warning("[FC-resize] FC failed, fallback: %s", exc)
                 await safe_edit(msg,
                     f"⚠️ FC failed — using local FFmpeg\n<code>{str(exc)[:100]}</code>",
-                    parse_mode=enums.ParseMode.HTML,
-                )
-        except Exception as exc:
-            log.warning("[FC-resize] FC setup failed: %s", exc)
+                    parse_mode=enums.ParseMode.HTML)
 
-    # ── Local FFmpeg fallback ─────────────────────────────────
+    # ── Local FFmpeg ──────────────────────────────────────────
     tid    = tracker.new_tid()
     record = TaskRecord(
         tid=tid, user_id=uid,
@@ -688,7 +917,6 @@ async def _do_resize(
         f"⬆️ Uploading…",
         parse_mode=enums.ParseMode.HTML,
     )
-    # FIX BUG-08: cleanup in finally so it runs even if upload_file raises
     try:
         await upload_file(client, st, out, user_id=uid)
     finally:
@@ -701,11 +929,13 @@ async def _do_resize(
 
 async def _do_compress(
     client, msg, path: str, fname: str, tmp: str, target_mb: float, uid: int,
+    platform: str | None = None,
 ) -> None:
     from services.task_runner import tracker, TaskRecord
     from services import ffmpeg as FF
     from services.uploader import upload_file
 
+    platform  = platform or _default_platform()
     name_base = os.path.splitext(fname)[0]
     out_fname = f"{name_base}_{int(target_mb)}MB.mp4"
     out       = os.path.join(tmp, out_fname)
@@ -714,62 +944,105 @@ async def _do_compress(
     record = TaskRecord(
         tid=tid, user_id=uid,
         label=f"Compress → {target_mb:.0f} MB",
-        mode="proc", engine="ffmpeg",
+        mode="proc", engine=platform,
         fname=fname, state=f"🗜️ Compressing to {target_mb:.0f} MB…",
     )
     await tracker.register(record)
 
-    # ── Try FreeConvert first ─────────────────────────────────
-    from services.freeconvert_api import parse_fc_keys
-    fc_raw2  = os.environ.get("FC_API_KEY", "").strip()
-    fc_keys2 = parse_fc_keys(fc_raw2)
-    for _jj in range(2, 10):
-        _xtra2 = os.environ.get(f"FC_API_KEY_{_jj}", "").strip()
-        if _xtra2:
-            fc_keys2.extend(parse_fc_keys(_xtra2))
-
-    if fc_keys2:
+    # ── CloudConvert branch ───────────────────────────────────
+    if platform == "cc" and _has_cc():
         try:
-            from services.freeconvert_api import pick_best_fc_key, submit_compress, run_fc_job
-            record.update(state="☁️ Uploading to FC…")
-            await safe_edit(msg,
-                f"🗜️ <b>FC Compress → {target_mb:.0f} MB</b>\n"
-                f"<code>{fname[:40]}</code>\n⬆️ Uploading to FreeConvert…",
-                parse_mode=enums.ParseMode.HTML,
+            from services.cloudconvert_api import (
+                parse_api_keys, pick_best_key, submit_compress, run_cc_job,
             )
-            key2c, _mc = await pick_best_fc_key(fc_keys2)
-            job_idc = await submit_compress(key2c, video_path=path, target_mb=target_mb, output_name=out_fname)
+            cc_keys = parse_api_keys(os.environ.get("CC_API_KEY", "").strip())
+            cc_key, _credits = await pick_best_key(cc_keys) if len(cc_keys) > 1 else (cc_keys[0], 0)
+
+            record.update(state="☁️ Uploading to CC…")
             await safe_edit(msg,
-                f"⏳ <b>FC Compress → {target_mb:.0f} MB</b>\n"
-                f"🆔 <code>{job_idc}</code>\n<i>FreeConvert processing…</i>",
-                parse_mode=enums.ParseMode.HTML,
+                f"☁️ <b>CC Compress → {target_mb:.0f} MB</b>\n"
+                f"<code>{fname[:40]}</code>\n⬆️ Uploading to CloudConvert…",
+                parse_mode=enums.ParseMode.HTML)
+            job_id = await submit_compress(
+                cc_key, video_path=path, target_mb=target_mb, output_name=out_fname,
             )
-            result_c = await run_fc_job(key2c, job_idc, tmp, output_name=out_fname)
+            await safe_edit(msg,
+                f"⏳ <b>CC Compress → {target_mb:.0f} MB</b>\n"
+                f"🆔 <code>{job_id}</code>\n<i>CloudConvert processing…</i>",
+                parse_mode=enums.ParseMode.HTML)
+            result_c = await run_cc_job(cc_key, job_id, tmp, output_name=out_fname)
             record.update(state="✅ Done")
             fsize_c = os.path.getsize(result_c)
-            log.info("[Compress] FC done: %s → %.0f MB actual %s", fname, target_mb, human_size(fsize_c))
+            log.info("[Compress] CC done: %s → %.0f MB actual %s",
+                     fname, target_mb, human_size(fsize_c))
             try: await msg.delete()
             except Exception: pass
             st_c = await client.send_message(
                 uid,
-                f"🗜️ <b>FC Compress done!</b>  {human_size(fsize_c)}\n"
+                f"🗜️ <b>CC Compress done!</b>  {human_size(fsize_c)}\n"
                 f"<code>{out_fname}</code>\n⬆️ Uploading…",
-                parse_mode=enums.ParseMode.HTML,
-            )
+                parse_mode=enums.ParseMode.HTML)
             try:
                 await upload_file(client, st_c, result_c, user_id=uid)
             finally:
                 cleanup(tmp)
             return
         except Exception as exc:
-            record.update(state="⚠️ FC failed")
-            log.warning("[FC-compress] FC failed, fallback: %s", exc)
+            record.update(state="⚠️ CC failed")
+            log.warning("[CC-compress] failed, fallback: %s", exc)
             await safe_edit(msg,
-                f"⚠️ FC failed — using local FFmpeg 2-pass\n<code>{str(exc)[:100]}</code>",
-                parse_mode=enums.ParseMode.HTML,
-            )
+                f"⚠️ CC failed — using local FFmpeg\n<code>{str(exc)[:150]}</code>",
+                parse_mode=enums.ParseMode.HTML)
+            platform = "local"
 
-    # ── Local FFmpeg 2-pass fallback ──────────────────────────
+    # ── FreeConvert branch ────────────────────────────────────
+    if platform == "fc" and _has_fc():
+        from services.freeconvert_api import parse_fc_keys
+        fc_raw2  = os.environ.get("FC_API_KEY", "").strip()
+        fc_keys2 = parse_fc_keys(fc_raw2)
+        for _jj in range(2, 10):
+            _xtra2 = os.environ.get(f"FC_API_KEY_{_jj}", "").strip()
+            if _xtra2:
+                fc_keys2.extend(parse_fc_keys(_xtra2))
+
+        if fc_keys2:
+            try:
+                from services.freeconvert_api import pick_best_fc_key, submit_compress, run_fc_job
+                record.update(state="☁️ Uploading to FC…")
+                await safe_edit(msg,
+                    f"🗜️ <b>FC Compress → {target_mb:.0f} MB</b>\n"
+                    f"<code>{fname[:40]}</code>\n⬆️ Uploading to FreeConvert…",
+                    parse_mode=enums.ParseMode.HTML)
+                key2c, _mc = await pick_best_fc_key(fc_keys2)
+                job_idc = await submit_compress(key2c, video_path=path, target_mb=target_mb, output_name=out_fname)
+                await safe_edit(msg,
+                    f"⏳ <b>FC Compress → {target_mb:.0f} MB</b>\n"
+                    f"🆔 <code>{job_idc}</code>\n<i>FreeConvert processing…</i>",
+                    parse_mode=enums.ParseMode.HTML)
+                result_c = await run_fc_job(key2c, job_idc, tmp, output_name=out_fname)
+                record.update(state="✅ Done")
+                fsize_c = os.path.getsize(result_c)
+                log.info("[Compress] FC done: %s → %.0f MB actual %s", fname, target_mb, human_size(fsize_c))
+                try: await msg.delete()
+                except Exception: pass
+                st_c = await client.send_message(
+                    uid,
+                    f"🗜️ <b>FC Compress done!</b>  {human_size(fsize_c)}\n"
+                    f"<code>{out_fname}</code>\n⬆️ Uploading…",
+                    parse_mode=enums.ParseMode.HTML)
+                try:
+                    await upload_file(client, st_c, result_c, user_id=uid)
+                finally:
+                    cleanup(tmp)
+                return
+            except Exception as exc:
+                record.update(state="⚠️ FC failed")
+                log.warning("[FC-compress] FC failed, fallback: %s", exc)
+                await safe_edit(msg,
+                    f"⚠️ FC failed — using local FFmpeg 2-pass\n<code>{str(exc)[:100]}</code>",
+                    parse_mode=enums.ParseMode.HTML)
+
+    # ── Local FFmpeg 2-pass ───────────────────────────────────
     try:
         record.update(state="🗜️ Pass 1/2…")
         await FF.compress_to_size(path, out, target_mb)
@@ -797,7 +1070,6 @@ async def _do_compress(
         f"⬆️ Uploading…",
         parse_mode=enums.ParseMode.HTML,
     )
-    # FIX BUG-08: cleanup in finally (mirrors _do_resize fix above)
     try:
         await upload_file(client, st, out, user_id=uid)
     finally:
