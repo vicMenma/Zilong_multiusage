@@ -6,6 +6,11 @@ Stores hardsub / convert / compress jobs submitted to FreeConvert so the
 webhook handler can look them up when FC calls back.
 
 Data file: data/fc_jobs.json  (created automatically)
+
+FIX NEW-JOB-POLLER: add() now fires an optional on_job_added callback.
+  This lets plugins/fc_webhook.py register _ensure_fc_poller() as the
+  callback so the recurring FC poller is (re)started automatically
+  whenever a new job is submitted — without creating a circular import.
 """
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ import logging
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -38,12 +43,10 @@ class FCJob:
     status:      str   = "processing"   # processing | completed | failed
     job_type:    str   = "hardsub"      # hardsub | convert | compress
     sub_fname:   str   = ""
-    api_key:     str   = ""             # key used for this job (for re-fetching)
+    api_key:     str   = ""
     created_at:  float = field(default_factory=time.time)
     error:       str   = ""
-    # NEW — set True once the file is in Telegram.  Prevents duplicate delivery
-    # if the bot crashes after upload but before remove(), or if the webhook
-    # fires again after the user already received the file.
+    # Set True once the file is in Telegram — prevents duplicate delivery.
     uploaded:    bool  = False
 
 
@@ -52,21 +55,22 @@ class FCJob:
 # ─────────────────────────────────────────────────────────────
 
 class FCJobStore:
-    """
-    Thread-safe, asyncio-aware persistent store for FCJob objects.
-    All public methods are coroutines and must be awaited.
-    """
-
     def __init__(self, path: str = _STORE_PATH) -> None:
-        self._path  = path
+        self._path   = path
         self._jobs: dict[str, FCJob] = {}
-        self._lock  = asyncio.Lock()
-        self._dirty = False
+        self._lock   = asyncio.Lock()
+        self._dirty  = False
+        # FIX NEW-JOB-POLLER: callback fired after every add() so the FC
+        # poller can be (re)started from fc_webhook.py without a circular import.
+        self._on_job_added: Optional[Callable[[], None]] = None
+
+    def set_on_job_added(self, cb: Callable[[], None]) -> None:
+        """Register a zero-argument callback invoked each time a job is added."""
+        self._on_job_added = cb
 
     # ── Load / save ───────────────────────────────────────────
 
     async def load(self) -> None:
-        """Load jobs from disk.  Call once at startup."""
         async with self._lock:
             try:
                 with open(self._path, encoding="utf-8") as fh:
@@ -80,19 +84,15 @@ class FCJobStore:
                 self._jobs = {}
             self._evict_expired()
             # Reset any job that was atomically claimed (status="completed") but not
-            # fully delivered before the process exited.  The poller will re-poll them.
-            # DUPLICATE-DELIVERY FIX: do NOT reset if uploaded=True — the file is
-            # already in Telegram, resetting would cause a second delivery.
+            # fully delivered before the process exited.
             for job in self._jobs.values():
                 if job.status == "completed" and not job.uploaded:
                     job.status = "processing"
                     log.info("[FC-Store] Reset undelivered job %s → 'processing'", job.job_id)
                 elif job.status == "completed" and job.uploaded:
-                    log.info("[FC-Store] Job %s already uploaded — leaving as 'completed'",
-                             job.job_id)
+                    log.info("[FC-Store] Job %s already uploaded — leaving", job.job_id)
 
     async def _save(self) -> None:
-        """Persist to disk (called internally, lock must be held)."""
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
         try:
             tmp = self._path + ".tmp"
@@ -102,15 +102,13 @@ class FCJobStore:
                     fh, indent=2,
                 )
             os.replace(tmp, self._path)
-            self._dirty = False
         except Exception as exc:
             log.error("[FC-Store] Save error: %s", exc)
 
     # ── Eviction ──────────────────────────────────────────────
 
     def _evict_expired(self) -> None:
-        """Remove jobs older than _JOB_TTL (called with lock held)."""
-        cutoff = time.time() - _JOB_TTL
+        cutoff  = time.time() - _JOB_TTL
         expired = [k for k, v in self._jobs.items() if v.created_at < cutoff]
         for k in expired:
             del self._jobs[k]
@@ -120,25 +118,23 @@ class FCJobStore:
     # ── Public API ────────────────────────────────────────────
 
     async def add(self, job: FCJob) -> None:
-        """Register a new job."""
         async with self._lock:
             self._jobs[job.job_id] = job
             await self._save()
         log.debug("[FC-Store] Added job %s  type=%s  uid=%d",
                   job.job_id, job.job_type, job.uid)
+        # FIX NEW-JOB-POLLER: notify the registered callback (if any)
+        if self._on_job_added is not None:
+            try:
+                self._on_job_added()
+            except Exception as _cb_exc:
+                log.debug("[FC-Store] on_job_added callback error: %s", _cb_exc)
 
     async def get(self, job_id: str) -> Optional[FCJob]:
-        """Return the FCJob for job_id, or None if not found."""
         async with self._lock:
             return self._jobs.get(job_id)
 
     async def update(self, job_id: str, **kwargs) -> Optional[FCJob]:
-        """
-        Update fields on an existing job.  Returns the updated FCJob or None.
-
-        Example:
-            await fc_job_store.update(job_id, status="completed")
-        """
         async with self._lock:
             job = self._jobs.get(job_id)
             if not job:
@@ -147,12 +143,11 @@ class FCJobStore:
                 if hasattr(job, k):
                     setattr(job, k, v)
                 else:
-                    log.warning("[FC-Store] Unknown field '%s' in update for %s", k, job_id)
+                    log.warning("[FC-Store] Unknown field '%s' for %s", k, job_id)
             await self._save()
             return job
 
     async def remove(self, job_id: str) -> None:
-        """Remove a job by ID."""
         async with self._lock:
             if job_id in self._jobs:
                 del self._jobs[job_id]
@@ -160,12 +155,9 @@ class FCJobStore:
 
     async def try_claim_delivery(self, job_id: str) -> bool:
         """
-        Atomically claim this job for delivery by moving it from
-        'processing' → 'completed'.  Only the first caller returns True;
-        all subsequent callers (webhook retry, startup poller) return False.
-
-        Also refuses the claim if uploaded=True — once the file is in
-        Telegram, no path should ever be allowed to re-deliver.
+        Atomically claim this job for delivery (processing → completed).
+        Returns True only once; all subsequent callers return False.
+        Also refuses if uploaded=True — once in Telegram, never re-deliver.
         """
         async with self._lock:
             job = self._jobs.get(job_id)
@@ -180,11 +172,7 @@ class FCJobStore:
             return True
 
     async def mark_uploaded(self, job_id: str) -> None:
-        """
-        Call this IMMEDIATELY after upload_file() returns successfully.
-        Flags the file as delivered so any post-upload exception cannot
-        trigger a duplicate on next poll / restart.
-        """
+        """Call IMMEDIATELY after upload_file() succeeds to prevent duplicates."""
         async with self._lock:
             job = self._jobs.get(job_id)
             if job:
@@ -192,7 +180,6 @@ class FCJobStore:
                 await self._save()
 
     async def list_by_uid(self, uid: int) -> list[FCJob]:
-        """Return all jobs belonging to a user, newest first."""
         async with self._lock:
             return sorted(
                 [j for j in self._jobs.values() if j.uid == uid],
@@ -201,7 +188,6 @@ class FCJobStore:
             )
 
     async def list_processing(self) -> list[FCJob]:
-        """Return all jobs still in 'processing' state."""
         async with self._lock:
             return [j for j in self._jobs.values() if j.status == "processing"]
 

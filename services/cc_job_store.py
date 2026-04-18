@@ -9,6 +9,12 @@ Fields per job:
   progress_at, created_at
 
 Finished/error jobs linger for 6 h then are evicted.
+
+FIX RESTART-STALE: _load() now resets any job where notified=True but
+  uploaded=False.  These are "claimed-but-not-yet-delivered" jobs from
+  a previous session; on restart no delivery is in progress, so the
+  claim is stale.  Resetting notified→False puts them back into
+  undelivered_jobs() so the startup poller can re-deliver them.
 """
 from __future__ import annotations
 
@@ -71,6 +77,22 @@ class CCJobStore:
             pass
         except Exception as exc:
             log.warning("[CCJobStore] Load error: %s", exc)
+
+        # FIX RESTART-STALE: Any job with notified=True but uploaded=False
+        # was mid-delivery when the bot crashed/restarted.  Since no delivery
+        # task is running now, the claim is stale.  Reset it so these jobs
+        # surface in undelivered_jobs() and the startup poller can re-deliver.
+        _reset = 0
+        for job in self._jobs.values():
+            if job.notified and not job.uploaded:
+                job.notified = False
+                job.delivering_since = 0.0
+                _reset += 1
+        if _reset:
+            log.info(
+                "[CCJobStore] Reset %d stale delivery claim(s) after restart — "
+                "will be re-delivered by startup poller", _reset
+            )
 
     def _save(self) -> None:
         try:
@@ -144,7 +166,7 @@ class CCJobStore:
                 job.notified = True
                 self._save()
 
-    _DELIVERY_STALE_AFTER = 300  # 5 min — if a claim hasn't completed by then, another path may retry
+    _DELIVERY_STALE_AFTER = 300  # 5 min
 
     async def try_claim_delivery(self, job_id: str) -> bool:
         """
@@ -158,24 +180,18 @@ class CCJobStore:
           - job.notified is False (no active delivery path has claimed)
           - no other path claimed within the last 5 minutes
 
-        On success, sets notified=True and delivering_since=now() so a
-        concurrent path will see the claim and bail out.
+        On success, sets notified=True and delivering_since=now().
         """
         async with self._lock:
             job = self._jobs.get(job_id)
             if not job:
                 return False
             if job.uploaded:
-                # Already uploaded earlier — the 'notified' flag may have been
-                # reset by the legacy retry logic, but the file IS in Telegram.
-                # Re-latch notified so we stop re-scanning this job.
                 if not job.notified:
                     job.notified = True
                     self._save()
                 return False
             if job.notified:
-                # Another path is in-flight. Only let a second claim through if
-                # the first one has clearly stalled (>5 min without completing).
                 if time.time() - (job.delivering_since or 0) < self._DELIVERY_STALE_AFTER:
                     return False
                 log.warning("[CCJobStore] Stale delivery claim on %s — releasing", job_id)
@@ -187,9 +203,8 @@ class CCJobStore:
     async def mark_uploaded(self, job_id: str) -> None:
         """
         Call this IMMEDIATELY after upload_file() returns successfully.
-        Sets uploaded=True so any post-upload exception (LOG_CHANNEL forward
-        failure, cleanup error, etc.) can no longer trigger a duplicate
-        delivery on the next poll cycle.
+        Sets uploaded=True so any post-upload exception cannot trigger a
+        duplicate delivery on the next poll cycle.
         """
         async with self._lock:
             job = self._jobs.get(job_id)
@@ -230,8 +245,8 @@ class CCJobStore:
     def undelivered_jobs(self) -> list[CCJob]:
         """
         Jobs that finished successfully but have not been uploaded to Telegram yet.
-        Excludes uploaded jobs (user already has the file) to prevent duplicates
-        even if the notified flag was stomped by a prior retry.
+        Excludes jobs with notified=True (already claimed for delivery).
+        Excludes uploaded jobs (user already has the file).
         """
         return [
             j for j in self._jobs.values()
@@ -244,5 +259,5 @@ class CCJobStore:
         return list(self._jobs.values())
 
 
-# Singleton shared across plugins
+# Singleton shared across all plugins
 cc_job_store = CCJobStore()
