@@ -21,6 +21,25 @@ CRITICAL FIX — BUG-12: _verify_signature now strips the "sha256=" prefix.
   because expected was just <hex> while signature was "sha256=<hex>".
   Effect: every webhook was rejected with 403 whenever CC_WEBHOOK_SECRET was set,
   making the webhook feature completely non-functional in production.
+
+CRITICAL FIX — BUG-WH-DOUBLE: start_webhook_server() no longer calls
+  _register_webhook_all_keys() (previously at the preset-URL path AND the
+  cloudflare/ngrok tunnel path). That caused TWO webhook registration passes
+  per startup:
+    Pass 1 (start_webhook_server): creates N webhooks (1 per CC key).
+    Pass 2 (on_tunnel_ready in main.py): deletes Pass-1 webhooks + N more old
+      ones (paginated), then creates N fresh ones.
+  Net: N webhooks — but Pass 1 used a non-paginated GET so it only ever cleaned
+  up page-1 worth of stale webhooks. Over many restarts (e.g. Colab sessions)
+  these accumulate (user hit 52). Now start_webhook_server() only starts the
+  HTTP server, opens the tunnel, and calls set_tunnel_url(). ALL webhook
+  registration/cleanup is handled exclusively by on_tunnel_ready() → sync_cc_webhooks()
+  which paginates properly and is the single authoritative registration path.
+
+CRITICAL FIX — BUG-WH-FINISH: _deliver_cc_job_direct() now calls
+  cc_job_store.finish() instead of cc_job_store.update() so that finished_at
+  is set. Without it, delivered jobs never evict from the store and the
+  ccstatus panel shows stale "Uploading…" state permanently.
 """
 from __future__ import annotations
 
@@ -184,8 +203,10 @@ async def _deliver_cc_job_direct(job_id: str, export_url: str, filename: str) ->
         log.info("[CC-Hook] job %s already claimed by poller — skip", job_id)
         return
 
-    # Update store with export URL (keeps status panel in sync).
-    await cc_job_store.update(job_id, status="finished", export_url=export_url)
+    # FIX BUG-WH-FINISH: use finish() not update() so finished_at is set.
+    # Without finished_at the job never evicts from the store and the panel
+    # stays stuck showing the wrong status.
+    await cc_job_store.finish(job_id, export_url=export_url)
 
     log.info("[CC-Hook] Direct-delivering job %s → uid=%d file=%s",
              job_id, job.uid, filename)
@@ -579,13 +600,14 @@ async def start_webhook_server(port: int = LISTEN_PORT) -> str:
         webhook_url = f"{preset_url}/webhook/cloudconvert"
         log.info("[CC-Hook] Using preset WEBHOOK_BASE_URL: %s", webhook_url)
         # Store tunnel base URL so FC jobs can build /fc-webhook URLs
+        # NOTE: Do NOT register webhooks here — main.py calls on_tunnel_ready()
+        # (→ sync_cc_webhooks) which does full paginated cleanup + registration.
+        # Registering here AND there causes double-registration per restart.
         try:
             from core.config import set_tunnel_url
             set_tunnel_url(preset_url)
         except Exception:
             pass
-        if api_key:
-            await _register_webhook_all_keys(webhook_url, api_key, WEBHOOK_SECRET)
         return webhook_url
 
     # 3. Try Cloudflare tunnel (no account needed, always first)
@@ -613,32 +635,25 @@ async def start_webhook_server(port: int = LISTEN_PORT) -> str:
     except Exception:
         pass
 
-    # 5. Auto-register with ALL CloudConvert accounts
-    reg_status = "⚠️ No CC_API_KEY — cannot auto-register webhook"
-    if api_key:
-        ok, total = await _register_webhook_all_keys(webhook_url, api_key, WEBHOOK_SECRET)
-        if total == 0:
-            reg_status = "⚠️ No valid API keys found in CC_API_KEY"
-        elif ok == total:
-            reg_status = f"✅ Webhook registered on all {total} CC account(s)"
-        else:
-            reg_status = (
-                f"⚠️ Registered on {ok}/{total} CC accounts — "
-                "check logs for failed keys"
-            )
+    # NOTE: Do NOT register webhooks here.
+    # main.py calls on_tunnel_ready() → sync_cc_webhooks() which does:
+    #   1. Paginated list of ALL existing webhooks (no page-1-only truncation)
+    #   2. Delete every stale one
+    #   3. Register exactly ONE fresh webhook per API key
+    # Registering here as well (step 5 in the old code) caused two webhook
+    # registrations on every restart, leading to the 52-webhook accumulation.
 
-    # 6. Notify owner via Telegram
+    # Notify owner: tunnel is up, webhook sync will follow in main.py
     try:
         from core.session import get_client
         client = get_client()
         tunnel_type = "Cloudflare" if "trycloudflare" in public_url else "ngrok"
         await client.send_message(
             cfg.owner_id,
-            f"🌐 <b>{tunnel_type} Webhook Active</b>\n"
+            f"🌐 <b>{tunnel_type} Tunnel Active</b>\n"
             f"──────────────────────\n\n"
             f"<code>{webhook_url}</code>\n\n"
-            f"{reg_status}\n\n"
-            "<i>Auto-registration handles it automatically.</i>",
+            "<i>Webhook sync (cleanup + registration) running now…</i>",
             parse_mode="html",
             disable_web_page_preview=True,
         )
