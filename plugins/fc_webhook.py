@@ -178,12 +178,29 @@ async def _handle_completion(job, data: dict) -> None:
                 "⬆️ Uploading…",
             )
             await upload_file(client, st, local_path, user_id=job.uid)
+            # CRITICAL: flag upload-completed IMMEDIATELY so any post-upload
+            # exception (cleanup, remove, etc.) cannot cause duplicate delivery
+            # on bot restart or via _poll_fc_pending.
+            try:
+                await fc_job_store.mark_uploaded(job.job_id)
+            except Exception as _e:
+                log.warning("[FC-WH] mark_uploaded failed for %s: %s", job.job_id, _e)
         else:
             log.error("[FC-WH] No Pyrogram client available — cannot upload for uid=%d", job.uid)
 
     except Exception as exc:
         log.error("[FC-WH] Completion handler failed for job %s: %s", job.job_id, exc, exc_info=True)
-        await _notify_failure(job, str(exc)[:200])
+        # Only notify failure if the file DID NOT reach Telegram.  Otherwise
+        # the user already has it and a follow-up "failed" message is a lie.
+        try:
+            refreshed = await fc_job_store.get(job.job_id)
+        except Exception:
+            refreshed = None
+        if not (refreshed and refreshed.uploaded):
+            await _notify_failure(job, str(exc)[:200])
+        else:
+            log.info("[FC-WH] Post-upload error ignored for %s — "
+                     "user already received the file", job.job_id)
     finally:
         cleanup(tmp)
         try:

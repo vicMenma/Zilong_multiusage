@@ -154,15 +154,32 @@ async def _download_export(url: str, dest_path: str) -> None:
 
 
 async def _deliver_job(job: CCJob) -> None:
-    """Download finished job from CC and upload to Telegram."""
+    """
+    Download finished job from CC and upload to Telegram.
+
+    DUPLICATE-DELIVERY FIX
+    ──────────────────────
+    Previously this function reset notified=False on ANY exception in the
+    try block, including post-upload errors (LOG_CHANNEL forward, cleanup).
+    That meant a successful user-upload followed by a failed LOG_CHANNEL
+    forward would cause the poller to re-deliver on its next cycle — the
+    root cause of users receiving 2-3 copies of the same output.
+
+    Now:
+      1. mark_uploaded() runs IMMEDIATELY after upload_file() returns.
+         Once called, no path will ever re-deliver this job.
+      2. The exception handler only retries if upload did NOT complete
+         (uploaded flag still False).
+    """
     from core.session import get_client
     from services.utils import make_tmp, cleanup
     from services.uploader import upload_file
 
-    client = get_client()
-    tmp    = make_tmp(cfg.download_dir, job.uid)
-    fname  = job.output_name or job.fname or "output.mp4"
-    dest   = os.path.join(tmp, fname)
+    client    = get_client()
+    tmp       = make_tmp(cfg.download_dir, job.uid)
+    fname     = job.output_name or job.fname or "output.mp4"
+    dest      = os.path.join(tmp, fname)
+    uploaded  = False   # local flag in case store write fails
 
     try:
         await client.send_message(
@@ -176,42 +193,53 @@ async def _deliver_job(job: CCJob) -> None:
 
         await _download_export(job.export_url, dest)
 
-        # Send a real status message so upload progress is visible
         st = await client.send_message(
             job.uid,
             f"📤 <b>Uploading…</b>\n<code>{fname[:50]}</code>",
             parse_mode="html",
         )
         await upload_file(client, st, dest)
-        # job is already marked notified before this task was spawned,
-        # but call again as a safe no-op in case of any edge case.
-        await cc_job_store.mark_notified(job.job_id)
+
+        # CRITICAL: mark uploaded IMMEDIATELY so no post-upload failure
+        # (LOG_CHANNEL forward, cleanup, etc.) can cause a re-delivery.
+        uploaded = True
+        try:
+            await cc_job_store.mark_uploaded(job.job_id)
+        except Exception as _e:
+            log.warning("[CCStatus] mark_uploaded failed for %s: %s — "
+                        "continuing (local guard prevents retry)", job.job_id, _e)
         log.info("[CCStatus] Delivered job %s to uid=%d", job.job_id, job.uid)
 
     except Exception as exc:
         log.error("[CCStatus] Delivery failed for job %s: %s", job.job_id, exc)
-        # FIX C-04 (audit v3): un-mark notified so the poller retries delivery
-        # on the next cycle. The job will be retried up to 3 times.
-        retry_count = getattr(job, "_delivery_retries", 0)
-        if retry_count < 3:
-            job._delivery_retries = retry_count + 1
+
+        if uploaded:
+            # File IS in Telegram. Do NOT schedule a retry — that causes
+            # duplicate copies. Log and move on.
+            log.info("[CCStatus] Post-upload error for %s ignored — "
+                     "user already received the file", job.job_id)
+        else:
+            # Upload did not complete — release the claim so the poller
+            # can retry on its next cycle (up to 3 times).
+            retry_count = getattr(job, "_delivery_retries", 0)
+            if retry_count < 3:
+                job._delivery_retries = retry_count + 1
+                try:
+                    await cc_job_store.release_claim(job.job_id)
+                    log.info("[CCStatus] Will retry delivery for %s (attempt %d/3)",
+                             job.job_id, retry_count + 1)
+                except Exception:
+                    pass
             try:
-                # Reset notified flag so poller picks it up again
-                await cc_job_store.update(job.job_id, notified=False)
-                log.info("[CCStatus] Will retry delivery for %s (attempt %d/3)",
-                         job.job_id, retry_count + 1)
+                await client.send_message(
+                    job.uid,
+                    f"❌ <b>CloudConvert delivery failed</b>\n"
+                    f"<code>{fname}</code>\n\n"
+                    f"<code>{str(exc)[:200]}</code>",
+                    parse_mode="html",
+                )
             except Exception:
                 pass
-        try:
-            await client.send_message(
-                job.uid,
-                f"❌ <b>CloudConvert delivery failed</b>\n"
-                f"<code>{fname}</code>\n\n"
-                f"<code>{str(exc)[:200]}</code>",
-                parse_mode="html",
-            )
-        except Exception:
-            pass
     finally:
         cleanup(tmp)
 
@@ -271,13 +299,17 @@ async def _poll_loop() -> None:
 
                     if export_url:
                         await cc_job_store.finish(job.job_id, export_url=export_url)
-                        # Mark notified BEFORE spawning the task so a second poller
-                        # cycle or a restart cannot pick up the same job and double-upload.
-                        # FIX C-04: if _deliver_job fails, it resets notified for retry.
-                        await cc_job_store.mark_notified(job.job_id)
-                        asyncio.create_task(_deliver_job(
-                            cc_job_store.get(job.job_id) or job
-                        ))
+                        # Use try_claim_delivery — returns False if the webhook
+                        # already claimed this job (normal instant-delivery case)
+                        # or if an earlier poll cycle is still in flight.
+                        claimed = await cc_job_store.try_claim_delivery(job.job_id)
+                        if claimed:
+                            asyncio.create_task(_deliver_job(
+                                cc_job_store.get(job.job_id) or job
+                            ))
+                        else:
+                            log.info("[CCStatus] job %s already claimed "
+                                     "(webhook likely beat poller) — skip", job.job_id)
                     else:
                         await cc_job_store.finish(
                             job.job_id,
@@ -311,13 +343,16 @@ async def _poll_loop() -> None:
                 else:
                     log.debug("[CCStatus] Panel edit uid=%d: %s", uid, err)
 
-        # Deliver any jobs resolved by the webhook (status=finished, export_url set, not yet notified).
-        # The webhook updates cc_job_store but never calls _deliver_job directly to avoid double-upload.
-        # The poller is the single authoritative delivery path — we must pick these up here.
+        # Pick up jobs resolved on CC but not yet delivered to Telegram
+        # (e.g. webhook arrived while bot was offline, or job completed via
+        # the active-jobs poll path above and is waiting for its delivery
+        # coroutine to be scheduled).  try_claim_delivery is race-safe with
+        # the webhook handler and with itself on back-to-back polls.
         for job in cc_job_store.undelivered_jobs():
-            log.info("[CCStatus] Delivering webhook-resolved job %s to uid=%d", job.job_id, job.uid)
-            # Mark notified immediately to prevent re-delivery on next poll cycle
-            await cc_job_store.mark_notified(job.job_id)
+            claimed = await cc_job_store.try_claim_delivery(job.job_id)
+            if not claimed:
+                continue
+            log.info("[CCStatus] Claim-delivering job %s to uid=%d", job.job_id, job.uid)
             asyncio.create_task(_deliver_job(job))
 
         if not cc_job_store.active_jobs() and not cc_job_store.undelivered_jobs() and not _open_panels:
