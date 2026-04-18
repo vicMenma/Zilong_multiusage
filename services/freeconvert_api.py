@@ -1,9 +1,16 @@
 """
-services/freeconvert_api.py  —  PATCHED v2
+services/freeconvert_api.py  —  PATCHED v3
 FreeConvert.com API v1 client.
 
-WHAT CHANGED vs previous version
-────────────────────────────────
+FIX FC-OP (CRITICAL): create_hardsub_job, create_convert_job, create_compress_job
+  all used "operation": "command" which is CloudConvert-exclusive.
+  FreeConvert rejects it with 400 "operation command is invalid".
+  Fixed to use FreeConvert's native operations:
+    hardsub  → "operation": "convert"  with subtitle_file option
+    convert  → "operation": "convert"  with video_height/crf/preset options
+    compress → "operation": "compress" with target_size option
+  Also fixed "depends_on" → "input" (another CC-ism FC doesn't support).
+
 FIX FC-USAGE-EP (CRITICAL): _fc_get_usage() was hitting
   https://api.freeconvert.com/v1/process/usage  ← this endpoint does NOT
   exist in FreeConvert's public API.  Every request returned 404 →
@@ -29,10 +36,6 @@ FIX FC-WH-AUTO: every submit_*() helper now AUTOMATICALLY injects the
 
 FIX FC-PRESET: create_hardsub_job now accepts `preset` parameter (medium,
   fast, slow, etc.) so callers can pick it per job (see hardsub.py UI).
-
-FIX FC-03a: convert/compress now use 'command' + FFmpeg args (same as
-  hardsub) rather than the fragile 'convert'/'compress' operations that
-  FreeConvert rejects with validation errors on many free-tier accounts.
 """
 from __future__ import annotations
 
@@ -234,30 +237,29 @@ async def create_hardsub_job(
     else:
         tasks["import-subtitle"] = {"operation": "import/upload"}
 
-    sub_path    = f"/input/import-subtitle/{s_safe}"
-    sub_escaped = sub_path.replace(":", "\\:")
+    # FIX FC-OP-01: "operation": "command" is CloudConvert-only — FC rejects it with 400.
+    # Use FreeConvert's native "convert" operation with subtitle_file option instead.
+    v_ext = os.path.splitext(v_safe)[1].lstrip(".").lower() or "mkv"
 
-    vf  = (f"scale=-2:{scale_height},subtitles='{sub_escaped}'"
-           if scale_height > 0 else f"subtitles='{sub_escaped}'")
-    # FIX: user-required preset always uses 128k audio regardless of resolution
-    abr = "128k"
-
-    ffmpeg_args = (
-        f"-i /input/import-video/{v_safe} "
-        f"-vf {vf} "
-        f"-c:v libx264 -crf {crf} -preset {preset} "
-        f"-c:a aac -b:a {abr} "
-        f"-movflags +faststart "
-        f"/output/{o_safe}"
-    )
+    hs_options: dict = {
+        "video_codec":   "h264",
+        "crf":           crf,
+        "preset":        preset,
+        "audio_codec":   "aac",
+        "audio_bitrate": "128k",
+        "subtitle_file": "import-subtitle",  # FC: reference subtitle task by name
+    }
+    if scale_height > 0:
+        hs_options["video_height"] = scale_height
 
     tasks["hardsub"] = {
-        "operation":  "command",
-        "depends_on": ["import-video", "import-subtitle"],
-        "command":    "ffmpeg",
-        "arguments":  ffmpeg_args,
+        "operation":     "convert",
+        "input":         "import-video",   # FC uses "input", not "depends_on"
+        "input_format":  v_ext,
+        "output_format": "mp4",
+        "options":       hs_options,
     }
-    tasks["export"] = {"operation": "export/url", "depends_on": ["hardsub"]}
+    tasks["export"] = {"operation": "export/url", "input": "hardsub"}
 
     payload: dict = {"tasks": tasks}
     # FIX FC-WH-AUTO: fall back to auto-derived URL if caller didn't pass one
@@ -323,26 +325,27 @@ async def create_convert_job(
     else:
         tasks["import-file"] = {"operation": "import/upload"}
 
-    vf  = f"-vf scale=-2:{scale_height}" if scale_height > 0 else ""
-    # Always 128k — matches user's hardsub preset spec, applied here for consistency
-    abr = "128k"
+    # FIX FC-OP-02: use FreeConvert's native "convert" operation.
+    in_ext = os.path.splitext(input_name)[1].lstrip(".").lower() or "mp4"
 
-    ffmpeg_args = (
-        f"-i /input/import-file/{input_name} "
-        f"{vf} "
-        f"-c:v libx264 -crf {crf} -preset {preset} "
-        f"-c:a aac -b:a {abr} "
-        f"-movflags +faststart "
-        f"/output/{out_name}"
-    ).strip()
+    cv_options: dict = {
+        "video_codec":   "h264",
+        "crf":           crf,
+        "preset":        preset,
+        "audio_codec":   "aac",
+        "audio_bitrate": "128k",
+    }
+    if scale_height > 0:
+        cv_options["video_height"] = scale_height
 
     tasks["convert-file"] = {
-        "operation":  "command",
-        "depends_on": ["import-file"],
-        "command":    "ffmpeg",
-        "arguments":  ffmpeg_args,
+        "operation":     "convert",
+        "input":         "import-file",
+        "input_format":  in_ext,
+        "output_format": output_format,
+        "options":       cv_options,
     }
-    tasks["export"] = {"operation": "export/url", "depends_on": ["convert-file"]}
+    tasks["export"] = {"operation": "export/url", "input": "convert-file"}
 
     payload: dict = {"tasks": tasks}
     effective_wh = webhook_url or _auto_webhook()
@@ -383,28 +386,15 @@ async def create_compress_job(
     if not input_url and not input_path:
         raise ValueError("[FC] Provide either input_url or input_path")
 
-    # Compute target video bitrate assuming ~30 min default if duration unknown
-    # FC's own compress op often mis-estimates; we use 2-pass via command instead
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     input_name = _safe(
         os.path.basename(input_path) if input_path
         else (input_url.split("/")[-1].split("?")[0] if input_url else "in.mp4")
     )
-    out_name = f"out.{output_format}"
 
-    # Assume ~3600s worst-case for bitrate calc; FFmpeg -fs will hard-cap
-    # Use crf + -fs for simple one-pass size-capped encode
-    target_bytes = int(target_mb * 1024 * 1024)
-
-    ffmpeg_args = (
-        f"-i /input/import-file/{input_name} "
-        f"-c:v libx264 -crf 28 -preset medium "
-        f"-c:a aac -b:a 96k "
-        f"-fs {target_bytes} "
-        f"-movflags +faststart "
-        f"/output/{out_name}"
-    )
+    # FIX FC-OP-03: use FreeConvert's native "compress" operation.
+    in_ext = os.path.splitext(input_name)[1].lstrip(".").lower() or "mp4"
 
     tasks: dict = {}
     if input_url:
@@ -415,12 +405,15 @@ async def create_compress_job(
         tasks["import-file"] = {"operation": "import/upload"}
 
     tasks["compress-file"] = {
-        "operation":  "command",
-        "depends_on": ["import-file"],
-        "command":    "ffmpeg",
-        "arguments":  ffmpeg_args,
+        "operation":     "compress",
+        "input":         "import-file",
+        "input_format":  in_ext,
+        "output_format": output_format,
+        "options": {
+            "target_size": int(target_mb),  # MB — FreeConvert native unit
+        }
     }
-    tasks["export"] = {"operation": "export/url", "depends_on": ["compress-file"]}
+    tasks["export"] = {"operation": "export/url", "input": "compress-file"}
 
     payload: dict = {"tasks": tasks}
     effective_wh = webhook_url or _auto_webhook()
