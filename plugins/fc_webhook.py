@@ -127,7 +127,10 @@ async def _fc_poll_loop() -> None:
                         log.info("[FC-Poller] Job %s already claimed — skip", job.job_id)
 
                 elif status in ("failed", "error", "cancelled"):
-                    err = (jdata.get("message") or status)[:200]
+                    # FreeConvert uses result.errorCode + result.msg; also check message
+                    r = jdata.get("result") or {}
+                    err = (r.get("msg") or r.get("errorCode") or
+                           jdata.get("message") or jdata.get("msg") or status)[:200]
                     log.warning("[FC-Poller] Job %s %s: %s", job.job_id, status, err)
                     await fc_job_store.update(job.job_id, status="failed", error=err)
                     await _notify_failure(job, err)
@@ -187,7 +190,9 @@ async def _process_webhook(job_id: str, status: str, data: dict) -> None:
         return
 
     if status in ("failed", "error", "cancelled"):
-        err = data.get("message") or f"Job {status}"
+        r = data.get("result") or {}
+        err = (r.get("msg") or r.get("errorCode") or
+               data.get("message") or data.get("msg") or f"Job {status}")
         log.warning("[FC-WH] job %s failed: %s", job_id, err)
         await fc_job_store.update(job_id, status="failed", error=err[:200])
         await _notify_failure(job, err)
@@ -327,27 +332,44 @@ async def _notify_failure(job: FCJob, error_msg: str) -> None:
 # ─────────────────────────────────────────────────────────────
 
 def _extract_download_url(data: dict) -> str:
-    """Extract the output file URL from a completed FreeConvert job dict."""
+    """Extract the output file URL from a completed FreeConvert job dict.
+
+    FreeConvert API returns the export URL as a flat string in result.url —
+    NOT as result.files[0].url (that is CloudConvert's format).
+    We support both shapes so the code works regardless of API version.
+    """
     tasks = data.get("tasks") or []
+
+    def _url_from_result(result: dict) -> str:
+        # FreeConvert v1: result.url  (string)
+        url = result.get("url") or ""
+        if isinstance(url, str) and url:
+            return url
+        # CloudConvert / legacy: result.files[0].url
+        for key in ("files", "output", "outputs"):
+            files = result.get(key) or []
+            if isinstance(files, list) and files:
+                return files[0].get("url", "") if isinstance(files[0], dict) else ""
+            if isinstance(files, dict):
+                return files.get("url", "")
+        return ""
 
     if isinstance(tasks, list):
         for task in tasks:
             op   = task.get("operation") or task.get("name") or ""
             stat = (task.get("status") or "").lower()
             if "export" in op and stat == "completed":
-                result = task.get("result") or {}
-                files  = result.get("files") or []
-                if files:
-                    return files[0].get("url", "")
+                url = _url_from_result(task.get("result") or {})
+                if url:
+                    return url
     elif isinstance(tasks, dict):
         for _name, task in tasks.items():
             op   = task.get("operation") or ""
             stat = (task.get("status") or "").lower()
             if "export" in op and stat == "completed":
-                result = task.get("result") or {}
-                files  = result.get("files") or []
-                if files:
-                    return files[0].get("url", "")
+                url = _url_from_result(task.get("result") or {})
+                if url:
+                    return url
 
     return ""
 

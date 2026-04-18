@@ -214,7 +214,7 @@ async def _deliver_job(job: CCJob) -> None:
             f"──────────────────────\n\n"
             f"📁 <code>{fname[:50]}</code>\n\n"
             f"⬇️ <i>Downloading from CloudConvert CDN…</i>",
-            parse_mode="html",
+            parse_mode=enums.ParseMode.HTML,
         )
 
         await _download_export(job.export_url, dest)
@@ -222,7 +222,7 @@ async def _deliver_job(job: CCJob) -> None:
         st = await client.send_message(
             job.uid,
             f"📤 <b>Uploading…</b>\n<code>{fname[:50]}</code>",
-            parse_mode="html",
+            parse_mode=enums.ParseMode.HTML,
         )
         # FIX UPLOAD-USER-ID: pass user_id so prefix/suffix/auto-forward apply
         await upload_file(client, st, dest, user_id=job.uid)
@@ -265,7 +265,7 @@ async def _deliver_job(job: CCJob) -> None:
                     f"❌ <b>CloudConvert delivery failed</b>\n"
                     f"<code>{fname}</code>\n\n"
                     f"<code>{str(exc)[:200]}</code>",
-                    parse_mode="html",
+                    parse_mode=enums.ParseMode.HTML,
                 )
             except Exception:
                 pass
