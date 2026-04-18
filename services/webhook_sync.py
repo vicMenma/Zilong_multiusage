@@ -21,6 +21,14 @@ FIX BUG-WS-04 (CRITICAL — why webhook delivery never worked):
   CC would POST to the wrong URL → bot receives nothing → jobs only processed
   via the slow 5-second ccstatus poller, never via instant webhook.
   Fix: changed default to cc_path="/webhook/cloudconvert".
+
+FIX BUG-WS-MULTIKEY (CRITICAL — offline recovery broken for multi-key setups):
+  _poll_cc_pending() was using the raw CC_API_KEY environment variable string
+  directly as a Bearer token. When CC_API_KEY contains multiple keys
+  (e.g. "key1,key2,key3"), the Authorization header became
+  "Bearer key1,key2,key3" — invalid, always returned 401 from CloudConvert.
+  Fix: replaced the manual aiohttp.get() with check_job_status() from
+  cloudconvert_api.py, which already handles multi-key iteration correctly.
 """
 from __future__ import annotations
 
@@ -109,21 +117,24 @@ async def _poll_cc_pending() -> None:
         log.info("[WH-Sync] %d pending CC job(s) to poll", len(pending))
 
         import aiohttp as _ah
-        api_key = os.environ.get("CC_API_KEY", "").strip()
-        if not api_key:
+        api_key_raw = os.environ.get("CC_API_KEY", "").strip()
+        if not api_key_raw:
             log.warning("[WH-Sync] CC_API_KEY not set — cannot poll pending jobs")
             return
 
+        # FIX BUG-WS-MULTIKEY: do NOT use the raw CC_API_KEY string directly as
+        # a Bearer token. If CC_API_KEY = "key1,key2", Authorization becomes
+        # "Bearer key1,key2" which is invalid (401 on CloudConvert).
+        # Use check_job_status() which already handles multi-key iteration correctly.
+        from services.cloudconvert_api import check_job_status as _cc_status
+
         for job in pending:
             try:
-                async with _ah.ClientSession(timeout=_ah.ClientTimeout(total=10)) as sess:
-                    async with sess.get(
-                        f"https://api.cloudconvert.com/v2/jobs/{job.job_id}",
-                        headers={"Authorization": f"Bearer {api_key}"},
-                    ) as resp:
-                        data = await resp.json()
+                jdata = await _cc_status(api_key_raw, job.job_id)
+                if not jdata:
+                    log.debug("[WH-Sync] CC job %s not found on any key", job.job_id)
+                    continue
 
-                jdata  = data.get("data") or data
                 status = jdata.get("status", "")
 
                 if status == "finished":
@@ -131,7 +142,7 @@ async def _poll_cc_pending() -> None:
                     try:
                         # FIX BUG-WS-02: correct module (not plugins.webhook)
                         from services.cloudconvert_hook import _handle_cc_job
-                        await _handle_cc_job(job.job_id, jdata, api_key)
+                        await _handle_cc_job(job.job_id, jdata, api_key_raw)
                     except Exception as e:
                         log.warning("[WH-Sync] _handle_cc_job failed: %s", e)
 

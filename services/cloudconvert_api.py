@@ -71,12 +71,19 @@ async def check_credits(api_key: str) -> int:
 async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
     if len(api_keys) == 1:
         credits = await check_credits(api_keys[0])
-        if credits == 0:
-            raise RuntimeError(
-                "CloudConvert: 0 credits remaining on your only API key.\n"
-                "Wait for daily reset or add more keys (comma-separated in CC_API_KEY)."
+        # FIX BUG-CC-CRED: use <= 0 not == 0.
+        # check_credits() returns -1 on network/auth errors.
+        # The old check (credits == 0) let -1 pass silently, causing jobs to be
+        # submitted against an unreachable or invalid key.
+        # Consistent with the multi-key path which already uses best_credits <= 0.
+        if credits <= 0:
+            reason = (
+                "network/auth error — check CC_API_KEY and connectivity"
+                if credits < 0 else
+                "0 credits remaining — wait for daily reset or add more keys (comma-separated)"
             )
-        return api_keys[0], max(credits, 0)
+            raise RuntimeError(f"CloudConvert API key unusable: {reason}")
+        return api_keys[0], credits
 
     tasks   = [check_credits(key) for key in api_keys]
     results = await asyncio.gather(*tasks)
