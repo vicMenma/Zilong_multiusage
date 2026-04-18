@@ -53,6 +53,7 @@ import re
 import atexit
 
 from aiohttp import web
+from pyrogram import enums as _pyro_enums
 
 log = logging.getLogger(__name__)
 
@@ -126,7 +127,7 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
             await client.send_message(
                 owner_id,
                 f"❌ <b>CloudConvert download failed</b>\n<code>{filename}</code>\n<i>No output file found.</i>",
-                parse_mode="html",
+                parse_mode=_pyro_enums.ParseMode.HTML,
             )
             cleanup(tmp)
             return
@@ -137,7 +138,7 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
                 owner_id,
                 f"❌ <b>CloudConvert file too large</b>\n<code>{filename}</code>\n"
                 f"Size: <code>{human_size(fsize)}</code>\nLimit: <code>{human_size(cfg.file_limit_b)}</code>",
-                parse_mode="html",
+                parse_mode=_pyro_enums.ParseMode.HTML,
             )
             cleanup(tmp)
             return
@@ -172,7 +173,7 @@ async def _process_file(url: str, filename: str, owner_id: int) -> None:
                 owner_id,
                 f"❌ <b>CloudConvert auto-upload failed</b>\n<code>{filename}</code>\n"
                 f"<code>{str(exc)[:200]}</code>",
-                parse_mode="html",
+                parse_mode=_pyro_enums.ParseMode.HTML,
             )
         except Exception:
             pass
@@ -260,7 +261,7 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
                                 f"❌ <b>CloudConvert failed</b>\n"
                                 f"<code>{job_rec.fname[:50]}</code>\n\n"
                                 f"<code>{err_msg[:200]}</code>",
-                                parse_mode="html",
+                                parse_mode=_pyro_enums.ParseMode.HTML,
                             )
                             await cc_job_store.mark_notified(job_id)
                         except Exception as exc:
@@ -654,7 +655,7 @@ async def start_webhook_server(port: int = LISTEN_PORT) -> str:
             f"──────────────────────\n\n"
             f"<code>{webhook_url}</code>\n\n"
             "<i>Webhook sync (cleanup + registration) running now…</i>",
-            parse_mode="html",
+            parse_mode=_pyro_enums.ParseMode.HTML,
             disable_web_page_preview=True,
         )
     except Exception as notify_exc:

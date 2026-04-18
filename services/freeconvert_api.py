@@ -487,14 +487,17 @@ async def wait_for_job(
             return job
         elif status in ("failed", "cancelled", "error"):
             tasks   = job.get("tasks") or []
-            err_msg = job.get("message") or ""
+            # FreeConvert top-level error fields
+            err_msg = job.get("message") or job.get("msg") or ""
             for t in tasks:
                 if (t.get("status") or "") in ("error", "failed"):
-                    # Check both result.message and top-level message
+                    r = t.get("result") or {}
+                    # FreeConvert v1 uses result.errorCode + result.msg
+                    # Also support result.message / result.error for compatibility
                     t_err = (
-                        ((t.get("result") or {}).get("message") or
-                         (t.get("result") or {}).get("error") or
-                         t.get("message") or "")
+                        r.get("msg") or r.get("errorCode") or
+                        r.get("message") or r.get("error") or
+                        t.get("message") or t.get("msg") or ""
                     )
                     if t_err:
                         err_msg = t_err
@@ -525,10 +528,15 @@ def get_export_url(job: dict) -> str:
     tasks = job.get("tasks") or []
     def _try_extract(task: dict) -> str:
         result = task.get("result") or {}
+        # FreeConvert v1: result.url is a plain string
+        url = result.get("url") or ""
+        if isinstance(url, str) and url:
+            return url
+        # CloudConvert / legacy list formats
         for key in ("files", "output", "outputs"):
             files = result.get(key) or []
             if isinstance(files, list) and files:
-                return files[0].get("url", "")
+                return files[0].get("url", "") if isinstance(files[0], dict) else ""
             if isinstance(files, dict):
                 return files.get("url", "")
         return ""
