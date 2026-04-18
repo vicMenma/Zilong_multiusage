@@ -205,16 +205,18 @@ async def main() -> None:
         else:
             log.info("☁️  Webhook server on port 8765 (no public URL)")
 
-        # MAIN-03: explicit cc_path to avoid any default value confusion
+        # MAIN-03: explicit cc_path to avoid any default value confusion.
+        # on_tunnel_ready() handles BOTH CC and FC webhook sync — call it
+        # whenever a tunnel URL is available, regardless of which API keys are set.
         try:
             from services.webhook_sync import on_tunnel_ready, poll_pending_jobs
             from core.config import get_tunnel_url
             _turl = get_tunnel_url()
-            if _turl and cc_api_key:
+            if _turl:
                 await on_tunnel_ready(_turl, cc_path="/webhook/cloudconvert")
-                log.info("🔄 CC webhooks synced → %s", _turl)
-            elif not _turl:
-                log.warning("⚠️  No tunnel URL — CC webhook sync skipped")
+                log.info("🔄 Webhook sync complete → %s", _turl)
+            else:
+                log.warning("⚠️  No tunnel URL — webhook sync skipped")
             await poll_pending_jobs()
             log.info("🔄 Pending jobs recovery complete")
         except Exception as exc:

@@ -467,17 +467,8 @@ async def _notify(uid, tunnel_url, cc, cc_path):
 """, "webhook_sync.py (all BUG-WS fixes)")
 
 
-# ── PATCH: services/downloader.py — PanelUpdater interval ─────────────────
-_patch_file("services/downloader.py",
-    "_updater = PanelUpdater(msg, _build_dl_panel, interval=1.0)",
-    "_updater = PanelUpdater(msg, _build_dl_panel, interval=5.0)",
-    "BUG-UH-04: downloader interval 1→5s")
-
-# ── PATCH: services/tg_download.py — PanelUpdater interval ────────────────
-_patch_file("services/tg_download.py",
-    "async with PanelUpdater(msg, _build, interval=1.0) as pu:",
-    "async with PanelUpdater(msg, _build, interval=3.0) as pu:",
-    "BUG-UH-04: tg_download interval 1→3s")
+# Panel interval patches removed — PanelUpdater now self-regulates at 1 s base
+# with adaptive FloodWait backoff (see services/utils.py).
 
 # ── PATCH: cloudconvert_hook.py — BUG-12 signature prefix ─────────────────
 _patch_file("services/cloudconvert_hook.py",

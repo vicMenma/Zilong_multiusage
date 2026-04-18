@@ -119,9 +119,13 @@ Cancel checks both `_task_handles` (submit-based) and `_raw_tasks` (self-registe
 **Solution**: `PanelUpdater` is a context manager that runs a background task editing the message on an interval, completely decoupled from the transfer coroutine.
 
 ```python
-async with PanelUpdater(client, msg, record, tracker, interval=5.0) as pu:
+async with PanelUpdater(client, msg, record, tracker, interval=1.0) as pu:
     await do_the_actual_transfer(progress_cb=pu.update_progress)
 ```
+
+Interval is the BASE interval (default 1.0 s, user-requested). PanelUpdater
+automatically doubles the effective interval on each FloodWait (up to 30 s)
+and restores the base after 10 consecutive healthy edits.
 
 `PanelUpdater` lives in `services/utils.py`. Used in:
 - `services/uploader.py`
@@ -169,7 +173,7 @@ In-memory file-processing sessions with 30-min TTL (measured from last access). 
 | `"direct"` | 4-attempt fallback chain via aiohttp |
 | `"tg"` | `tg_download()` |
 
-`PanelUpdater` interval = **5.0 s** (was 1s — caused FloodWait accumulation on long downloads, BUG-UH-04).
+`PanelUpdater` base interval = **1.0 s** with adaptive FloodWait backoff (supersedes BUG-UH-04).
 
 `_YTDLP_POOL`: `ProcessPoolExecutor` for yt-dlp — shut down in `runner.stop()`.
 
@@ -333,7 +337,7 @@ PORT=8000
 | BUG-12 | CC signature verify always failed — `"sha256="` prefix not stripped | `sig_hex = signature.removeprefix("sha256=")` |
 | BUG-UH-01 | Upload aborted after magnet download — FloodWait from PanelUpdater cascaded into `send_message` | `_floodwait_send()` with retries; PanelUpdater interval → 5s |
 | BUG-UH-03 | Seedr panel frozen on slow torrents | 30s heartbeat in `poll_until_ready()` |
-| BUG-UH-04 | PanelUpdater at 1s interval accumulated FLOOD_WAIT on long downloads | Interval raised to 5.0s |
+| BUG-UH-04 | PanelUpdater at 1s interval accumulated FLOOD_WAIT on long downloads | Replaced with adaptive backoff: 1s base, doubles to 30s on FloodWait, restores after 10 healthy edits |
 | BUG-11 | SessionStore TTL measured from creation, not last access | `s.created = now` on each `get()` |
 | BUG-10 | Magnet cache TTL bypass in nyaa | `_magnet_cache_put()` wrapper |
 | M-04 | `is_downloaded()` returned True for deleted files | Added `os.path.isfile()` check |
