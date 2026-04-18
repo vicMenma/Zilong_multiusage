@@ -485,9 +485,18 @@ class PanelUpdater:
        — this is a plain dict update, O(1), never awaited, never blocks.
     2. A background asyncio.Task wakes up every `interval` seconds,
        calls build_fn(state) to render the panel, and edits the message.
-    3. FloodWait → back off by the required seconds, skip edits silently.
+    3. FloodWait → track the wait, apply adaptive interval expansion, skip
+       edits silently until the wait expires. The base interval is restored
+       after 10 consecutive successful edits.
     4. MESSAGE_NOT_MODIFIED → content unchanged, skip silently.
     5. Message deleted / invalid → stop the task gracefully.
+
+    ADAPTIVE PACING (user-requested 1s updates)
+    ────────────────────────────────────────────
+    Base interval defaults to 1.0 s for near-real-time progress feedback.
+    On FloodWait, effective sleep is doubled (up to 30 s) until 10 successful
+    edits in a row restore the base. This keeps the panel snappy on healthy
+    connections and well-behaved when Telegram throttles us.
 
     USAGE
     ─────
@@ -502,6 +511,9 @@ class PanelUpdater:
         # __aexit__ cancels the background task and does one final edit.
     """
 
+    _MAX_EFFECTIVE_INTERVAL = 30.0
+    _RESTORE_AFTER_OK       = 10
+
     def __init__(
         self,
         msg,
@@ -509,14 +521,22 @@ class PanelUpdater:
         interval: float = 1.0,
         start_state: Optional[dict] = None,
     ):
-        self._msg       = msg
-        self._build     = build_fn
-        self._interval  = interval
+        self._msg              = msg
+        self._build            = build_fn
+        self._base_interval    = max(0.5, float(interval))
+        self._effective_interval = self._base_interval
         self._state:    dict = dict(start_state or {})
         self._task:     Optional[asyncio.Task] = None
         self._last_text: str = ""
         self._flood_until: float = 0.0
         self._stopped:  bool = False
+        self._ok_streak: int = 0
+        self._floods:   int = 0
+
+    # Back-compat: some callers read ._interval
+    @property
+    def _interval(self) -> float:
+        return self._effective_interval
 
     # ── Non-blocking state update (called from progress callbacks) ──
 
@@ -554,10 +574,27 @@ class PanelUpdater:
     async def _loop(self) -> None:
         while True:
             try:
-                await asyncio.sleep(self._interval)
+                await asyncio.sleep(self._effective_interval)
             except asyncio.CancelledError:
                 return
             await self._try_edit()
+
+    def _register_ok(self) -> None:
+        self._ok_streak += 1
+        if self._ok_streak >= self._RESTORE_AFTER_OK and \
+           self._effective_interval > self._base_interval:
+            self._effective_interval = self._base_interval
+            self._ok_streak = 0
+
+    def _register_flood(self, wait_s: float) -> None:
+        self._floods += 1
+        self._ok_streak = 0
+        # Adaptive: double the effective interval each time we flood, cap at 30s
+        self._effective_interval = min(
+            max(self._effective_interval * 2.0, self._base_interval * 2.0),
+            self._MAX_EFFECTIVE_INTERVAL,
+        )
+        self._flood_until = time.time() + max(1.0, wait_s)
 
     async def _try_edit(self) -> None:
         if self._msg is None:
@@ -571,11 +608,13 @@ class PanelUpdater:
             if len(text) > _TG_MAX:
                 text = text[:_TG_MAX - 64] + "\n\n<i>⚠️ Truncated</i>"
             if text == self._last_text:
+                self._register_ok()  # no-op still counts as "healthy"
                 return   # nothing changed — no-op, saves an API round-trip
             from pyrogram import enums as _pe
             await self._msg.edit(text, parse_mode=_pe.ParseMode.HTML,
                                  disable_web_page_preview=True)
             self._last_text = text
+            self._register_ok()
         except asyncio.CancelledError:
             return
         except Exception as exc:
@@ -584,13 +623,15 @@ class PanelUpdater:
                 import re as _re_fw
                 m = _re_fw.search(r"FLOOD_WAIT_(\d+)", err)
                 wait = int(m.group(1)) if m else 30
-                self._flood_until = time.time() + wait
-                log.debug("PanelUpdater flood-wait %ds", wait)
+                self._register_flood(wait)
+                log.debug("PanelUpdater flood-wait %ds (effective interval → %.1fs)",
+                          wait, self._effective_interval)
             elif any(x in err for x in (
                 "MESSAGE_NOT_MODIFIED", "message was not modified",
                 "Bad Request: message is not modified",
             )):
                 self._last_text = ""  # force re-render next tick
+                self._register_ok()
             elif any(x in err for x in (
                 "MESSAGE_ID_INVALID", "message to edit not found",
                 "peer_id_invalid", "Chat not found",

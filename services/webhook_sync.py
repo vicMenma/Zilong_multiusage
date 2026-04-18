@@ -39,20 +39,24 @@ async def on_tunnel_ready(
     cc_path:    str        = "/webhook/cloudconvert",
 ) -> dict:
     """
-    Sync CloudConvert webhook subscriptions for the new tunnel URL.
-    FreeConvert is NOT synced here — FC webhooks are per-job.
+    Sync CloudConvert AND FreeConvert webhook subscriptions for the new
+    tunnel URL.
+
+    CloudConvert has a global /v2/webhooks endpoint (always used).
+    FreeConvert prefers per-job webhook_url embedding, but we also try an
+    account-level endpoint opportunistically (see services/fc_webhook_mgr.py).
+
+    IMPORTANT: set_tunnel_url() is called BEFORE any FC submit_*() runs,
+    so even jobs started a millisecond after this function returns will
+    auto-embed the new webhook URL.
     """
     if not tunnel_url:
         log.warning("[WH-Sync] tunnel_url is empty — skipping")
-        return {"tunnel": "", "cc": []}
+        return {"tunnel": "", "cc": [], "fc": []}
 
     tunnel_url = tunnel_url.rstrip("/")
-    log.info("[WH-Sync] Syncing CC webhooks → %s%s", tunnel_url, cc_path)
 
-    from services.cc_webhook_mgr import sync_cc_webhooks
-    cc_results = await sync_cc_webhooks(tunnel_url, webhook_path=cc_path)
-
-    # Update cfg so FC submit_*() calls use the new URL
+    # Update cfg BEFORE sync so per-job webhooks embed the latest URL
     try:
         from core.config import set_tunnel_url
         set_tunnel_url(tunnel_url)
@@ -60,11 +64,23 @@ async def on_tunnel_ready(
     except Exception as exc:
         log.debug("[WH-Sync] cfg update: %s", exc)
 
+    log.info("[WH-Sync] Syncing CC webhooks → %s%s", tunnel_url, cc_path)
+    from services.cc_webhook_mgr import sync_cc_webhooks
+    cc_results = await sync_cc_webhooks(tunnel_url, webhook_path=cc_path)
+
+    # FC auto-setting — mirror of CC sync (may no-op if account endpoint absent)
+    fc_results: list = []
+    try:
+        from services.fc_webhook_mgr import sync_fc_webhooks
+        fc_results = await sync_fc_webhooks(tunnel_url)
+    except Exception as exc:
+        log.warning("[WH-Sync] FC sync error: %s — per-job webhooks still active", exc)
+
     uid = notify_uid or _admin_uid()
     if uid:
-        asyncio.create_task(_notify(uid, tunnel_url, cc_results, cc_path))
+        asyncio.create_task(_notify(uid, tunnel_url, cc_results, cc_path, fc_results))
 
-    return {"tunnel": tunnel_url, "cc": cc_results}
+    return {"tunnel": tunnel_url, "cc": cc_results, "fc": fc_results}
 
 
 async def on_tunnel_reconnected(new_url: str) -> None:
@@ -199,34 +215,50 @@ async def _notify(
     tunnel_url: str,
     cc: list,
     cc_path: str = "/webhook/cloudconvert",
+    fc: list | None = None,
 ) -> None:
     try:
         from core.session import get_client
         from pyrogram import enums
         client = get_client()
 
-        lines = []
+        cc_lines = []
         for r in cc:
             tail = r.get("key_tail", "?")
             d    = r.get("deleted", 0)
             reg  = r.get("registered")
             err  = r.get("error", "")
             if err:
-                lines.append(f"  {tail}  ❌ {err[:50]}")
+                cc_lines.append(f"  {tail}  ❌ {err[:50]}")
             else:
-                lines.append(f"  {tail}  {d} deleted · ✅ <code>{str(reg)[:12]}</code>")
+                cc_lines.append(f"  {tail}  {d} deleted · ✅ <code>{str(reg)[:12]}</code>")
+        cc_section = "\n".join(cc_lines) if cc_lines else "  (no CC keys configured)"
 
-        cc_section   = "\n".join(lines) if lines else "  (no CC keys configured)"
-        webhook_full = f"{tunnel_url}{cc_path}"
+        fc_lines = []
+        for r in (fc or []):
+            tail = r.get("key_tail", "?")
+            mode = r.get("mode", "per-job")
+            reg  = r.get("registered")
+            err  = r.get("error", "")
+            if err and not reg:
+                fc_lines.append(f"  {tail}  per-job ✅  <i>(account: {err[:40]})</i>")
+            elif mode == "account" and reg:
+                fc_lines.append(f"  {tail}  account ✅ <code>{str(reg)[:12]}</code>")
+            else:
+                fc_lines.append(f"  {tail}  per-job ✅")
+        fc_section = "\n".join(fc_lines) if fc_lines else \
+                     "  Per-job — URL embedded at job submission ✅"
+
+        cc_full = f"{tunnel_url}{cc_path}"
+        fc_full = f"{tunnel_url}/fc-webhook"
 
         text = (
             "✅ <b>Webhook sync complete</b>\n"
             "──────────────────────\n\n"
-            f"🔗 CC endpoint:\n<code>{webhook_full}</code>\n\n"
+            f"🔗 CC endpoint:\n<code>{cc_full}</code>\n"
+            f"🔗 FC endpoint:\n<code>{fc_full}</code>\n\n"
             f"☁️ <b>CloudConvert</b>\n{cc_section}\n\n"
-            "🆓 <b>FreeConvert</b>\n"
-            "  Per-job — no registration needed ✅\n"
-            "  <i>(URL embedded at job submission time)</i>"
+            f"🆓 <b>FreeConvert</b>\n{fc_section}"
         )
         await client.send_message(
             uid, text,

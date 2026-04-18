@@ -53,8 +53,8 @@ async def tg_download(
             style      = panel_style,
         )
 
-    # FIX BUG-UH-04: interval raised from 1.0 → 3.0 to reduce FloodWait pressure.
-    async with PanelUpdater(msg, _build, interval=3.0) as pu:
+    # 1-second base interval — PanelUpdater's adaptive backoff handles FloodWait.
+    async with PanelUpdater(msg, _build, interval=1.0) as pu:
 
         async def _prog(current: int, total: int) -> None:
             elapsed = time.time() - start

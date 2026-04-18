@@ -641,10 +641,12 @@ async def smart_download(
             style      = panel_style,
         )
 
-    # FIX BUG-UH-04: interval raised from 1.0 → 5.0 to reduce FloodWait pressure.
-    # 1 s over a multi-hour download = thousands of edits → FloodWait budget exhausted
-    # → subsequent send_message (upload start) silently fails.
-    _updater = PanelUpdater(msg, _build_dl_panel, interval=5.0)
+    # User-requested 1-second updates. PanelUpdater now has adaptive
+    # FloodWait backoff — it doubles the effective interval on each FLOOD_WAIT
+    # (up to 30 s) and restores the 1 s base after 10 consecutive healthy edits,
+    # so we get snappy progress when Telegram is happy and back off gracefully
+    # when it throttles us. This fully supersedes BUG-UH-04.
+    _updater = PanelUpdater(msg, _build_dl_panel, interval=1.0)
 
     async def _tracked_progress(done: int, total: int, speed: float, eta: int) -> None:
         record.update(done=done, total=total, speed=speed, eta=eta, state="📥 Downloading")
