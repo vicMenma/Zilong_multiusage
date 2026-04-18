@@ -10,52 +10,139 @@ a job's status changes.  This module:
   3. On "completed": downloads the output file and uploads it to Telegram.
   4. On "failed":    notifies the user with the error message.
 
-REGISTRATION
-────────────
-Add this route to your aiohttp app (in main.py / server.py):
+NEW — RECURRING FC POLLER
+─────────────────────────
+FreeConvert's primary webhook mechanism is per-job (webhook_url embedded
+in the job payload). But webhooks can fail: the tunnel may be down, FC
+may retry with the wrong URL after a bot restart, or FC may drop the
+callback entirely.
 
-    from plugins.fc_webhook import handle_fc_webhook
-    app.router.add_post("/fc-webhook", handle_fc_webhook)
+_fc_poll_loop() is a background task (like CC's _poll_loop in ccstatus.py)
+that periodically polls the FC API for every job in "processing" state and
+delivers completed jobs independently of webhooks.
 
-Then pass the tunnel URL to FreeConvert jobs:
+  • Polls every 15 s when jobs are active.
+  • Backs off to 30 s when idle; stops after 3 consecutive idle cycles.
+  • _ensure_fc_poller() (re)starts the task when needed.
+  • fc_job_store.set_on_job_added(_ensure_fc_poller) ensures the poller
+    is (re)started automatically whenever a new FC job is submitted,
+    without a circular import.
 
-    from services.freeconvert_api import fc_webhook_url
-    wh = fc_webhook_url(cfg.tunnel_url)   # e.g. "https://xxx.trycloudflare.com/fc-webhook"
-    job_id = await submit_hardsub(api_key, ..., webhook_url=wh)
-
-PAYLOAD SHAPE (FreeConvert → bot)
-──────────────────────────────────
-FreeConvert sends:
-  {
-    "data": {
-      "id": "<job_id>",
-      "status": "completed" | "failed" | "processing",
-      "tasks": [
-        { "name": "export",   "status": "completed",
-          "result": { "files": [{ "url": "...", "filename": "..." }] } },
-        ...
-      ],
-      "message": "<error text on failure>"
-    }
-  }
+DELIVERY RETRY
+──────────────
+After a failed delivery _handle_completion resets the job to "processing"
+in the finally block. _ensure_fc_poller() is then called so the poller
+picks it up on the next cycle.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
+from typing import Optional
 
 from aiohttp import web
 from pyrogram import enums
 
-from services.fc_job_store import fc_job_store
+from services.fc_job_store import fc_job_store, FCJob
 from services.utils import cleanup, make_tmp, human_size
 
 log = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────
+# Recurring FC job poller
+# ─────────────────────────────────────────────────────────────
+
+_fc_poller_task: Optional[asyncio.Task] = None
+
+
+def _ensure_fc_poller() -> None:
+    """(Re)start the FC poll loop if it is not already running."""
+    global _fc_poller_task
+    if _fc_poller_task and not _fc_poller_task.done():
+        return
+    try:
+        _fc_poller_task = asyncio.get_running_loop().create_task(_fc_poll_loop())
+        log.info("[FC-Poller] Started")
+    except RuntimeError:
+        # No running event loop yet (called at import time) — harmless
+        pass
+
+
+async def _fc_poll_loop() -> None:
+    """
+    Background task: poll FC API every 15 s for jobs in 'processing' state.
+    Delivers completed jobs via _handle_completion(), reports failures.
+    Stops automatically after 3 consecutive idle cycles (no processing jobs).
+    """
+    api_key_raw = os.environ.get("FC_API_KEY", "").strip()
+    if not api_key_raw:
+        log.warning("[FC-Poller] No FC_API_KEY — poller disabled")
+        return
+
+    from services.freeconvert_api import parse_fc_keys, _fc_get_job
+    keys = parse_fc_keys(api_key_raw)
+    if not keys:
+        log.warning("[FC-Poller] No valid FC keys found — poller disabled")
+        return
+
+    log.info("[FC-Poller] Running with %d key(s)", len(keys))
+    consecutive_idle = 0
+
+    while True:
+        try:
+            pending = await fc_job_store.list_processing()
+        except Exception as exc:
+            log.warning("[FC-Poller] list_processing failed: %s", exc)
+            await asyncio.sleep(30)
+            continue
+
+        if not pending:
+            consecutive_idle += 1
+            if consecutive_idle >= 3:
+                log.info("[FC-Poller] No active FC jobs — poller stopping")
+                return
+            await asyncio.sleep(30)
+            continue
+
+        consecutive_idle = 0
+
+        for job in pending:
+            # Use the key that originally submitted this job; fall back to first
+            job_key = job.api_key or keys[0]
+            try:
+                jdata  = await _fc_get_job(job_key, job.job_id)
+                status = (jdata.get("status") or "").lower()
+
+                if status == "completed":
+                    log.info("[FC-Poller] Job %s completed — delivering to uid=%d",
+                             job.job_id, job.uid)
+                    claimed = await fc_job_store.try_claim_delivery(job.job_id)
+                    if claimed:
+                        asyncio.get_running_loop().create_task(
+                            _handle_completion(job, jdata)
+                        )
+                    else:
+                        log.info("[FC-Poller] Job %s already claimed — skip", job.job_id)
+
+                elif status in ("failed", "error", "cancelled"):
+                    err = (jdata.get("message") or status)[:200]
+                    log.warning("[FC-Poller] Job %s %s: %s", job.job_id, status, err)
+                    await fc_job_store.update(job.job_id, status="failed", error=err)
+                    await _notify_failure(job, err)
+
+                else:
+                    log.debug("[FC-Poller] Job %s still %s", job.job_id, status)
+
+            except Exception as exc:
+                log.warning("[FC-Poller] Poll error for job %s: %s", job.job_id, exc)
+
+        await asyncio.sleep(15)
+
 
 # ─────────────────────────────────────────────────────────────
-# Main handler
+# Webhook handler (aiohttp route)
 # ─────────────────────────────────────────────────────────────
 
 async def handle_fc_webhook(request: web.Request) -> web.Response:
@@ -79,15 +166,13 @@ async def handle_fc_webhook(request: web.Request) -> web.Response:
 
     log.info("[FC-WH] Received  job=%s  status=%s", job_id, status)
 
-    # Respond immediately — don't block FreeConvert's delivery
-    import asyncio
     asyncio.create_task(_process_webhook(job_id, status, data))
 
     return web.Response(status=200, text="ok")
 
 
 # ─────────────────────────────────────────────────────────────
-# Background processor
+# Background webhook processor
 # ─────────────────────────────────────────────────────────────
 
 async def _process_webhook(job_id: str, status: str, data: dict) -> None:
@@ -98,7 +183,6 @@ async def _process_webhook(job_id: str, status: str, data: dict) -> None:
         return
 
     if status == "processing":
-        # Intermediate update — nothing to do yet
         log.debug("[FC-WH] job %s still processing, ignoring", job_id)
         return
 
@@ -110,12 +194,11 @@ async def _process_webhook(job_id: str, status: str, data: dict) -> None:
         return
 
     if status == "completed":
-        # FIX: Atomically claim this job for delivery.
-        # Prevents a double-upload race with _poll_fc_pending running simultaneously
-        # (e.g. bot restarts, poller fires, then FC retries the webhook delivery).
+        # Atomically claim delivery — prevents race with _fc_poll_loop.
         claimed = await fc_job_store.try_claim_delivery(job_id)
         if not claimed:
-            log.info("[FC-WH] job %s already claimed for delivery — skipping duplicate", job_id)
+            log.info("[FC-WH] job %s already claimed for delivery — skipping duplicate",
+                     job_id)
             return
         await _handle_completion(job, data)
         return
@@ -127,7 +210,7 @@ async def _process_webhook(job_id: str, status: str, data: dict) -> None:
 # Completion: download + upload
 # ─────────────────────────────────────────────────────────────
 
-async def _handle_completion(job, data: dict) -> None:
+async def _handle_completion(job: FCJob, data: dict) -> None:
     from services.downloader import download_direct
     from services.uploader import upload_file
 
@@ -157,7 +240,6 @@ async def _handle_completion(job, data: dict) -> None:
         fsize = os.path.getsize(local_path)
         log.info("[FC-WH] Downloaded %s (%s) for uid=%d", fname, human_size(fsize), job.uid)
 
-        # Send status message then upload
         client = _get_client()
         if client:
             _type_label = {
@@ -179,19 +261,18 @@ async def _handle_completion(job, data: dict) -> None:
             )
             await upload_file(client, st, local_path, user_id=job.uid)
             # CRITICAL: flag upload-completed IMMEDIATELY so any post-upload
-            # exception (cleanup, remove, etc.) cannot cause duplicate delivery
-            # on bot restart or via _poll_fc_pending.
+            # exception cannot trigger a duplicate on next poll / restart.
             try:
                 await fc_job_store.mark_uploaded(job.job_id)
             except Exception as _e:
                 log.warning("[FC-WH] mark_uploaded failed for %s: %s", job.job_id, _e)
         else:
-            log.error("[FC-WH] No Pyrogram client available — cannot upload for uid=%d", job.uid)
+            log.error("[FC-WH] No Pyrogram client available — cannot upload for uid=%d",
+                      job.uid)
 
     except Exception as exc:
-        log.error("[FC-WH] Completion handler failed for job %s: %s", job.job_id, exc, exc_info=True)
-        # Only notify failure if the file DID NOT reach Telegram.  Otherwise
-        # the user already has it and a follow-up "failed" message is a lie.
+        log.error("[FC-WH] Completion handler failed for job %s: %s",
+                  job.job_id, exc, exc_info=True)
         try:
             refreshed = await fc_job_store.get(job.job_id)
         except Exception:
@@ -203,25 +284,19 @@ async def _handle_completion(job, data: dict) -> None:
                      "user already received the file", job.job_id)
     finally:
         cleanup(tmp)
-        # FIX BUG-FC-REMOVE: only remove the job from the store if the file was
-        # actually delivered to Telegram (uploaded=True).
-        # The old code removed unconditionally in finally, so a failed download
-        # or Telegram upload error would silently delete the job — the poller
-        # and FC webhook retries would both find nothing in the store and give up,
-        # leaving the user with a failure notification but no file, even though
-        # the FC export URL is valid for up to 24 hours.
-        # Now: on failure, the job stays in the store as "processing" so that
-        # _poll_fc_pending() can re-attempt delivery on the next cycle.
+        # FIX DELIVERY-RETRY-RESTART: after the store update, re-ensure the
+        # poller is running so any retry (job reset to "processing") is picked up.
         try:
             refreshed = await fc_job_store.get(job.job_id)
             if refreshed and refreshed.uploaded:
                 await fc_job_store.remove(job.job_id)
             elif refreshed:
-                # Reset to "processing" so the poller can retry delivery.
-                # try_claim_delivery only claims jobs with status="processing".
+                # Delivery failed — reset to "processing" so the poller retries.
                 await fc_job_store.update(job.job_id, status="processing")
                 log.info("[FC-WH] Delivery failed for %s — reset to 'processing' for retry",
                          job.job_id)
+                # Restart poller so it picks up the retry immediately.
+                _ensure_fc_poller()
         except Exception as _re:
             log.warning("[FC-WH] Store cleanup for %s: %s", job.job_id, _re)
 
@@ -230,7 +305,7 @@ async def _handle_completion(job, data: dict) -> None:
 # Failure notification
 # ─────────────────────────────────────────────────────────────
 
-async def _notify_failure(job, error_msg: str) -> None:
+async def _notify_failure(job: FCJob, error_msg: str) -> None:
     client = _get_client()
     if not client:
         return
@@ -252,10 +327,7 @@ async def _notify_failure(job, error_msg: str) -> None:
 # ─────────────────────────────────────────────────────────────
 
 def _extract_download_url(data: dict) -> str:
-    """
-    Extract the output file URL from a completed FreeConvert job dict.
-    Checks both list-form and dict-form tasks.
-    """
+    """Extract the output file URL from a completed FreeConvert job dict."""
     tasks = data.get("tasks") or []
 
     if isinstance(tasks, list):
@@ -281,7 +353,6 @@ def _extract_download_url(data: dict) -> str:
 
 
 def _get_client():
-    """Return the running Pyrogram client, or None."""
     try:
         from core.session import get_client
         return get_client()
@@ -290,7 +361,7 @@ def _get_client():
 
 
 async def _floodwait_send(client, uid: int, text: str, max_retries: int = 5):
-    """FloodWait-safe send_message (same pattern as url_handler.py)."""
+    """FloodWait-safe send_message."""
     from pyrogram.errors import FloodWait
     import asyncio as _asyncio
 
@@ -313,11 +384,26 @@ async def _floodwait_send(client, uid: int, text: str, max_retries: int = 5):
 
 
 # ─────────────────────────────────────────────────────────────
-# Startup helper — load store
+# Startup
 # ─────────────────────────────────────────────────────────────
 
 async def startup_load() -> None:
-    """Call once at bot startup to load persisted FC jobs."""
+    """
+    Call once at bot startup to load persisted FC jobs and start the poller.
+
+    NEW: Registers _ensure_fc_poller as the on_job_added callback on
+    fc_job_store so the poller is (re)started automatically every time a
+    new FC job is submitted anywhere in the codebase — without circular
+    imports.
+    """
     await fc_job_store.load()
     count = await fc_job_store.count()
     log.info("[FC-WH] Job store ready — %d job(s) loaded", count)
+
+    # Register callback: any future fc_job_store.add() will restart the poller
+    fc_job_store.set_on_job_added(_ensure_fc_poller)
+
+    # Start the recurring poller immediately (picks up jobs from previous session
+    # and any jobs submitted between now and the first webhook delivery)
+    _ensure_fc_poller()
+    log.info("[FC-WH] Recurring FC job poller started")

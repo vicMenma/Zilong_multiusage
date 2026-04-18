@@ -2,15 +2,34 @@
 services/ccstatus.py
 /ccstatus — live panel showing CloudConvert hardsub/convert jobs.
 
-Adaptive polling: 5 s when any job is processing, 60 s when idle.
+Adaptive polling: 5 s when any job is processing/undelivered/in-flight,
+60 s when idle.
+
 Primary delivery: poller checks CC API, then downloads export URL via
 aiohttp and uploads to Telegram directly — no webhook dependency.
 Webhook is a bonus; this poller is the authoritative delivery path.
 
+FIX POLLER-PREMATURE-STOP: _deliver_job now tracks each active delivery
+  in _in_flight_delivery_tids.  The idle check in _poll_loop includes
+  this set, so the poller keeps running as long as any delivery task is
+  in-flight — even after the job moves from active_jobs() to
+  undelivered_jobs() and the claim is taken (notified=True).
+
+  Previously, once a job was claimed (notified=True), it disappeared from
+  both active_jobs() and undelivered_jobs().  With an empty _open_panels,
+  the poller counted "idle" and stopped after 3 × 60 s = 180 s.  For a
+  1-2 GB file, download + upload easily exceeds 180 s.  If the upload
+  then failed, release_claim() set notified=False — but the poller was
+  already gone and the job was permanently orphaned.
+
+FIX DELIVERY-RETRY-RESTART: After release_claim() re-opens a job for
+  retry, _ensure_poller() is called to guarantee the poller is running
+  to pick it up on the next cycle.
+
+FIX UPLOAD-USER-ID: upload_file() now receives user_id=job.uid so user
+  settings (prefix/suffix, auto_forward, progress_style) are applied.
+
 FIX C-04 (audit v3): _deliver_job now retries up to 3 times on failure.
-Previously, if delivery failed (network error, disk full), the job was
-permanently marked "notified" and would never be retried — the user got
-no file and no retry ever happened.
 """
 from __future__ import annotations
 
@@ -35,6 +54,11 @@ log = logging.getLogger(__name__)
 _open_panels: dict[int, Message] = {}
 
 _poller_task: Optional[asyncio.Task] = None
+
+# FIX POLLER-PREMATURE-STOP: track delivery tasks currently running so
+# the poller does not incorrectly declare itself "idle" and exit while
+# a long download+upload is still in progress.
+_in_flight_delivery_tids: set = set()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -157,29 +181,31 @@ async def _deliver_job(job: CCJob) -> None:
     """
     Download finished job from CC and upload to Telegram.
 
-    DUPLICATE-DELIVERY FIX
-    ──────────────────────
-    Previously this function reset notified=False on ANY exception in the
-    try block, including post-upload errors (LOG_CHANNEL forward, cleanup).
-    That meant a successful user-upload followed by a failed LOG_CHANNEL
-    forward would cause the poller to re-deliver on its next cycle — the
-    root cause of users receiving 2-3 copies of the same output.
+    FIX POLLER-PREMATURE-STOP: registers job.job_id in
+    _in_flight_delivery_tids at entry and removes it in finally, so the
+    poll loop knows a delivery is active even after the job leaves
+    active_jobs() and undelivered_jobs().
 
-    Now:
-      1. mark_uploaded() runs IMMEDIATELY after upload_file() returns.
-         Once called, no path will ever re-deliver this job.
-      2. The exception handler only retries if upload did NOT complete
-         (uploaded flag still False).
+    FIX DELIVERY-RETRY-RESTART: after release_claim(), calls
+    _ensure_poller() so the retry is picked up even if the poller had
+    already declared itself idle.
+
+    FIX DUPLICATE-DELIVERY: mark_uploaded() is called IMMEDIATELY after
+    upload_file() returns so any post-upload exception cannot re-trigger
+    delivery.
     """
     from core.session import get_client
     from services.utils import make_tmp, cleanup
     from services.uploader import upload_file
 
+    # Register as in-flight so poller does not stop prematurely
+    _in_flight_delivery_tids.add(job.job_id)
+
     client    = get_client()
     tmp       = make_tmp(cfg.download_dir, job.uid)
     fname     = job.output_name or job.fname or "output.mp4"
     dest      = os.path.join(tmp, fname)
-    uploaded  = False   # local flag in case store write fails
+    uploaded  = False
 
     try:
         await client.send_message(
@@ -198,7 +224,8 @@ async def _deliver_job(job: CCJob) -> None:
             f"📤 <b>Uploading…</b>\n<code>{fname[:50]}</code>",
             parse_mode="html",
         )
-        await upload_file(client, st, dest)
+        # FIX UPLOAD-USER-ID: pass user_id so prefix/suffix/auto-forward apply
+        await upload_file(client, st, dest, user_id=job.uid)
 
         # CRITICAL: mark uploaded IMMEDIATELY so no post-upload failure
         # (LOG_CHANNEL forward, cleanup, etc.) can cause a re-delivery.
@@ -214,8 +241,7 @@ async def _deliver_job(job: CCJob) -> None:
         log.error("[CCStatus] Delivery failed for job %s: %s", job.job_id, exc)
 
         if uploaded:
-            # File IS in Telegram. Do NOT schedule a retry — that causes
-            # duplicate copies. Log and move on.
+            # File IS in Telegram — do NOT schedule a retry.
             log.info("[CCStatus] Post-upload error for %s ignored — "
                      "user already received the file", job.job_id)
         else:
@@ -228,6 +254,9 @@ async def _deliver_job(job: CCJob) -> None:
                     await cc_job_store.release_claim(job.job_id)
                     log.info("[CCStatus] Will retry delivery for %s (attempt %d/3)",
                              job.job_id, retry_count + 1)
+                    # FIX DELIVERY-RETRY-RESTART: ensure the poller is running
+                    # to pick up the re-opened job — it may have gone idle.
+                    _ensure_poller()
                 except Exception:
                     pass
             try:
@@ -241,6 +270,8 @@ async def _deliver_job(job: CCJob) -> None:
             except Exception:
                 pass
     finally:
+        # Unregister from in-flight tracking regardless of outcome
+        _in_flight_delivery_tids.discard(job.job_id)
         cleanup(tmp)
 
 
@@ -269,9 +300,13 @@ async def _poll_loop() -> None:
     while True:
         active      = cc_job_store.active_jobs()
         undelivered = cc_job_store.undelivered_jobs()
-        # Use 5 s interval whenever there is real work: active jobs being processed,
-        # or finished jobs waiting to be downloaded and uploaded to Telegram.
-        interval = 5 if (active or undelivered) else 60
+        # FIX POLLER-PREMATURE-STOP: include in-flight deliveries in "busy" check.
+        # Without this, the poller went idle as soon as a job was claimed
+        # (notified=True removes it from undelivered_jobs), even though a
+        # download+upload task could still be running for many minutes.
+        in_flight   = bool(_in_flight_delivery_tids)
+
+        interval = 5 if (active or undelivered or in_flight) else 60
 
         for job in active:
             try:
@@ -299,9 +334,6 @@ async def _poll_loop() -> None:
 
                     if export_url:
                         await cc_job_store.finish(job.job_id, export_url=export_url)
-                        # Use try_claim_delivery — returns False if the webhook
-                        # already claimed this job (normal instant-delivery case)
-                        # or if an earlier poll cycle is still in flight.
                         claimed = await cc_job_store.try_claim_delivery(job.job_id)
                         if claimed:
                             asyncio.create_task(_deliver_job(
@@ -344,10 +376,6 @@ async def _poll_loop() -> None:
                     log.debug("[CCStatus] Panel edit uid=%d: %s", uid, err)
 
         # Pick up jobs resolved on CC but not yet delivered to Telegram
-        # (e.g. webhook arrived while bot was offline, or job completed via
-        # the active-jobs poll path above and is waiting for its delivery
-        # coroutine to be scheduled).  try_claim_delivery is race-safe with
-        # the webhook handler and with itself on back-to-back polls.
         for job in cc_job_store.undelivered_jobs():
             claimed = await cc_job_store.try_claim_delivery(job.job_id)
             if not claimed:
@@ -355,10 +383,20 @@ async def _poll_loop() -> None:
             log.info("[CCStatus] Claim-delivering job %s to uid=%d", job.job_id, job.uid)
             asyncio.create_task(_deliver_job(job))
 
-        if not cc_job_store.active_jobs() and not cc_job_store.undelivered_jobs() and not _open_panels:
+        # FIX POLLER-PREMATURE-STOP: only count idle when ALL of these are empty:
+        #   active_jobs, undelivered_jobs, open panels, in-flight deliveries.
+        # Previously in_flight was missing — poller stopped while uploads ran.
+        is_idle = (
+            not cc_job_store.active_jobs()
+            and not cc_job_store.undelivered_jobs()
+            and not _open_panels
+            and not _in_flight_delivery_tids
+        )
+        if is_idle:
             consecutive_idle += 1
             if consecutive_idle >= 3:
-                log.info("[CCStatus] Poller stopping — no active jobs, no open panels")
+                log.info("[CCStatus] Poller stopping — no active jobs, no open panels, "
+                         "no in-flight deliveries")
                 return
         else:
             consecutive_idle = 0
