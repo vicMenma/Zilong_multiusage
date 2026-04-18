@@ -298,6 +298,39 @@ async def _submit_one_job(
     # CloudConvert
     from services.cloudconvert_api import submit_hardsub
     from services.cc_job_store import cc_job_store, CCJob
+    from services.task_runner import tracker, TaskRecord
+    from services.utils import human_size
+    import time as _hs_time
+
+    # Register an upload task so /status shows CC upload progress
+    ul_tid = tracker.new_tid()
+    _vid_size = os.path.getsize(video.get("path", "")) if video.get("path") else 0
+    _sub_size = os.path.getsize(sub_path) if os.path.isfile(sub_path) else 0
+    ul_rec = TaskRecord(
+        tid=ul_tid, user_id=uid,
+        label=f"CC↑ {video_fname}",
+        fname=video_fname,
+        mode="ul", engine="http",
+        state="☁️ Uploading to CC",
+        total=_vid_size + _sub_size,
+    )
+    await tracker.register(ul_rec)
+    _hs_ul_start = _hs_time.time()
+
+    async def _hs_upload_progress(phase: str, done: int, total: int) -> None:
+        phase_label = "📄 Sub" if phase == "sub" else "🎬 Video"
+        ul_done  = (done if phase == "sub" else _sub_size + done)
+        ul_total = _sub_size + _vid_size
+        elapsed  = _hs_time.time() - _hs_ul_start
+        speed    = ul_done / elapsed if elapsed else 0.0
+        eta      = int((ul_total - ul_done) / speed) if (speed and ul_total > ul_done) else 0
+        await tracker.update(
+            ul_tid,
+            state=f"☁️ {phase_label} {human_size(done)}/{human_size(total)}",
+            done=ul_done, total=ul_total,
+            speed=speed, eta=eta, elapsed=elapsed,
+        )
+
     try:
         job_id = await submit_hardsub(
             api_key,
@@ -308,7 +341,9 @@ async def _submit_one_job(
             scale_height=0,
             crf=crf,
             preset=preset,   # NEW — passed through
+            upload_progress_cb=_hs_upload_progress,
         )
+        await tracker.finish(ul_tid, success=True)
         await cc_job_store.add(CCJob(
             job_id=job_id, uid=uid, fname=video_fname,
             sub_fname=sub_fname, output_name=output_name,
@@ -320,6 +355,7 @@ async def _submit_one_job(
         except Exception: pass
         return video_fname, job_id, True
     except Exception as exc:
+        await tracker.finish(ul_tid, success=False, msg=str(exc)[:60])
         log.error("[Hardsub-CC] %s failed: %s", video_fname, exc)
         return video_fname, str(exc)[:80], False
 

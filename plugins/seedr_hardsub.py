@@ -453,6 +453,9 @@ async def _submit_to_cc(
     from services.cloudconvert_api import submit_hardsub, parse_api_keys, pick_best_key
     from services.cc_job_store import cc_job_store, CCJob
     from services.cc_sanitize import build_cc_output_name
+    from services.task_runner import tracker, TaskRecord
+    from services.utils import human_size
+    import time as _time
 
     api_key     = os.environ.get("CC_API_KEY", "").strip()
     output_name = build_cc_output_name(video_fname, "VOSTFR")
@@ -469,6 +472,41 @@ async def _submit_to_cc(
         parse_mode=enums.ParseMode.HTML,
     )
 
+    # ── Register CC-upload task in task runner panel ──────────
+    ul_tid = tracker.new_tid()
+    ul_rec = TaskRecord(
+        tid=ul_tid, user_id=uid,
+        label=f"CC↑ {video_fname}",
+        fname=video_fname,
+        mode="ul", engine="http",
+        state="☁️ Uploading to CC",
+        total=os.path.getsize(video_path) + os.path.getsize(sub_path),
+    )
+    await tracker.register(ul_rec)
+
+    sub_size   = os.path.getsize(sub_path)
+    vid_size   = os.path.getsize(video_path)
+    _ul_start  = _time.time()
+
+    async def _upload_progress(phase: str, done: int, total: int) -> None:
+        if phase == "sub":
+            pct_label = f"📄 Sub {human_size(done)}/{human_size(sub_size)}"
+            ul_done = done
+            ul_total = sub_size + vid_size
+        else:
+            pct_label = f"🎬 Video {human_size(done)}/{human_size(vid_size)}"
+            ul_done = sub_size + done
+            ul_total = sub_size + vid_size
+        elapsed = _time.time() - _ul_start
+        speed   = ul_done / elapsed if elapsed else 0.0
+        eta     = int((ul_total - ul_done) / speed) if (speed and ul_total > ul_done) else 0
+        await tracker.update(
+            ul_tid,
+            state=f"☁️ {pct_label}",
+            done=ul_done, total=ul_total,
+            speed=speed, eta=eta, elapsed=elapsed,
+        )
+
     try:
         keys = parse_api_keys(api_key)
         if len(keys) > 1:
@@ -483,7 +521,10 @@ async def _submit_to_cc(
             video_path=video_path,
             subtitle_path=sub_path,
             output_name=output_name,
+            upload_progress_cb=_upload_progress,
         )
+
+        await tracker.finish(ul_tid, success=True)
 
         await cc_job_store.add(CCJob(
             job_id=job_id,
@@ -522,6 +563,7 @@ async def _submit_to_cc(
         )
 
     except Exception as exc:
+        await tracker.finish(ul_tid, success=False, msg=str(exc)[:60])
         log.error("[SeedrHS] CC submit failed: %s", exc, exc_info=True)
         await safe_edit(
             st,

@@ -166,20 +166,35 @@ async def ccstatus_cb(client: Client, cb: CallbackQuery):
 # Export download + Telegram upload
 # ─────────────────────────────────────────────────────────────
 
-async def _download_export(url: str, dest_path: str) -> None:
-    """Stream download from CloudConvert export URL — 8 MB chunks, 2 h timeout."""
+async def _download_export(url: str, dest_path: str, progress_cb=None) -> int:
+    """Stream download from CloudConvert export URL — 8 MB chunks, 2 h timeout.
+    Returns number of bytes written.
+    If progress_cb is provided it is called as: await progress_cb(done, total)
+    """
     timeout = aiohttp.ClientTimeout(total=7200)
+    total = 0
+    done  = 0
     async with aiohttp.ClientSession(timeout=timeout) as sess:
         async with sess.get(url, allow_redirects=True) as resp:
             resp.raise_for_status()
+            total = int(resp.headers.get("Content-Length", 0))
             with open(dest_path, "wb") as fh:
                 async for chunk in resp.content.iter_chunked(8 * 1024 * 1024):
                     fh.write(chunk)
+                    done += len(chunk)
+                    if progress_cb:
+                        try:
+                            await progress_cb(done, total)
+                        except Exception:
+                            pass
+    return done
 
 
 async def _deliver_job(job: CCJob) -> None:
     """
     Download finished job from CC and upload to Telegram.
+    Registers TaskRecords in the global tracker so the /status panel
+    shows CC-download progress and TG-upload progress.
 
     FIX POLLER-PREMATURE-STOP: registers job.job_id in
     _in_flight_delivery_tids at entry and removes it in finally, so the
@@ -195,8 +210,10 @@ async def _deliver_job(job: CCJob) -> None:
     delivery.
     """
     from core.session import get_client
-    from services.utils import make_tmp, cleanup
+    from services.utils import make_tmp, cleanup, human_size
     from services.uploader import upload_file
+    from services.task_runner import tracker, TaskRecord
+    import time as _time
 
     # Register as in-flight so poller does not stop prematurely
     _in_flight_delivery_tids.add(job.job_id)
@@ -206,6 +223,17 @@ async def _deliver_job(job: CCJob) -> None:
     fname     = job.output_name or job.fname or "output.mp4"
     dest      = os.path.join(tmp, fname)
     uploaded  = False
+
+    # ── TaskRunner: register CC-download task ───────────────
+    dl_tid = tracker.new_tid()
+    dl_rec = TaskRecord(
+        tid=dl_tid, user_id=job.uid,
+        label=f"CC↓ {fname}",
+        fname=fname,
+        mode="dl", engine="http",
+        state="☁️ CloudConvert ready",
+    )
+    await tracker.register(dl_rec)
 
     try:
         await client.send_message(
@@ -217,7 +245,31 @@ async def _deliver_job(job: CCJob) -> None:
             parse_mode=enums.ParseMode.HTML,
         )
 
-        await _download_export(job.export_url, dest)
+        # Progress callback feeds the TaskRunner tracker
+        _dl_start = _time.time()
+        _dl_last  = [_dl_start]
+
+        async def _dl_progress(done: int, total: int) -> None:
+            now = _time.time()
+            if now - _dl_last[0] < 3.0:
+                return
+            _dl_last[0] = now
+            elapsed = now - _dl_start
+            speed   = done / elapsed if elapsed else 0.0
+            eta     = int((total - done) / speed) if (speed and total > done) else 0
+            await tracker.update(
+                dl_tid,
+                state="⬇️ Downloading from CC…",
+                done=done, total=total,
+                speed=speed, eta=eta,
+                elapsed=elapsed,
+            )
+
+        await tracker.update(dl_tid, state="⬇️ Downloading from CC…")
+        dl_bytes = await _download_export(job.export_url, dest, progress_cb=_dl_progress)
+        await tracker.finish(dl_tid, success=True)
+        log.info("[CCStatus] Downloaded %s → %s (%s)",
+                 fname, dest, human_size(dl_bytes))
 
         st = await client.send_message(
             job.uid,
@@ -239,6 +291,10 @@ async def _deliver_job(job: CCJob) -> None:
 
     except Exception as exc:
         log.error("[CCStatus] Delivery failed for job %s: %s", job.job_id, exc)
+        # Mark CC download task as failed if it wasn't completed yet
+        dl_state = tracker._tasks.get(dl_tid)
+        if dl_state and not dl_state.is_terminal:
+            await tracker.finish(dl_tid, success=False, msg=str(exc)[:60])
 
         if uploaded:
             # File IS in Telegram — do NOT schedule a retry.
