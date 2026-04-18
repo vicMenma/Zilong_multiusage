@@ -203,10 +203,27 @@ async def _handle_completion(job, data: dict) -> None:
                      "user already received the file", job.job_id)
     finally:
         cleanup(tmp)
+        # FIX BUG-FC-REMOVE: only remove the job from the store if the file was
+        # actually delivered to Telegram (uploaded=True).
+        # The old code removed unconditionally in finally, so a failed download
+        # or Telegram upload error would silently delete the job — the poller
+        # and FC webhook retries would both find nothing in the store and give up,
+        # leaving the user with a failure notification but no file, even though
+        # the FC export URL is valid for up to 24 hours.
+        # Now: on failure, the job stays in the store as "processing" so that
+        # _poll_fc_pending() can re-attempt delivery on the next cycle.
         try:
-            await fc_job_store.remove(job.job_id)
-        except Exception:
-            pass
+            refreshed = await fc_job_store.get(job.job_id)
+            if refreshed and refreshed.uploaded:
+                await fc_job_store.remove(job.job_id)
+            elif refreshed:
+                # Reset to "processing" so the poller can retry delivery.
+                # try_claim_delivery only claims jobs with status="processing".
+                await fc_job_store.update(job.job_id, status="processing")
+                log.info("[FC-WH] Delivery failed for %s — reset to 'processing' for retry",
+                         job.job_id)
+        except Exception as _re:
+            log.warning("[FC-WH] Store cleanup for %s: %s", job.job_id, _re)
 
 
 # ─────────────────────────────────────────────────────────────
