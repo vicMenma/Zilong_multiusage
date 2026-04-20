@@ -31,6 +31,60 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+
+# ─────────────────────────────────────────────────────────────
+# BUG-SEEDR-01 FIX: Seedr removed 'max_invites' from the
+# get_settings() response.  seedrcc v2.0.2's AccountInfo still
+# declares it as a required positional arg, so every call to
+# get_settings() raises:
+#   AccountInfo.__init__() missing 1 required positional
+#   argument: 'max_invites'
+# This causes _get_client() to ALWAYS treat the saved token as
+# expired and re-authenticate via password — wasting a round-trip
+# on every single API call.
+#
+# Fix: wrap AccountInfo.__init__ so that missing 'max_invites'
+# defaults to 0/None instead of raising TypeError.
+# ─────────────────────────────────────────────────────────────
+
+def _patch_seedrcc_account_info() -> None:
+    """Make AccountInfo tolerant of Seedr dropping 'max_invites'."""
+    try:
+        import seedrcc.models as _seedr_models  # type: ignore
+        _OrigAccountInfo = _seedr_models.AccountInfo
+        _orig_init = _OrigAccountInfo.__init__
+
+        import inspect as _inspect
+        sig = _inspect.signature(_orig_init)
+        params = list(sig.parameters.values())
+        # Only patch if 'max_invites' exists and has no default
+        needs_patch = any(
+            p.name == "max_invites" and p.default is _inspect.Parameter.empty
+            for p in params
+        )
+        if not needs_patch:
+            log.debug("[Seedr] AccountInfo: no patch needed")
+            return
+
+        def _patched_init(self, *args, **kwargs):
+            try:
+                _orig_init(self, *args, **kwargs)
+            except TypeError as exc:
+                if "max_invites" in str(exc):
+                    kwargs.setdefault("max_invites", 0)
+                    _orig_init(self, *args, **kwargs)
+                else:
+                    raise
+
+        _OrigAccountInfo.__init__ = _patched_init
+        log.info("[Seedr] AccountInfo patched — 'max_invites' is now optional")
+    except Exception as exc:
+        log.warning("[Seedr] AccountInfo patch skipped: %s", exc)
+
+
+_patch_seedrcc_account_info()
+
+
 _TOKEN_FILE = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "data", "seedr_token.json")
 )
@@ -131,18 +185,88 @@ async def get_storage_info() -> dict:
 
 
 async def add_magnet(magnet: str) -> dict:
+    """
+    Submit a magnet link to Seedr.
+
+    BUG-SEEDR-02 FIX: Seedr silently removed/renamed the
+    func=add_torrent endpoint (returns HTTP 404 for magnet_link
+    submissions).  We first attempt the seedrcc library built-in
+    method; if it fails we fall through to a direct httpx POST loop
+    that tries every known Seedr func name for magnet submission.
+    """
     client = await _get_client()
     try:
-        result = await client.add_torrent(magnet_link=magnet)
-        log.info("[Seedr] Magnet submitted: hash=%s title=%s",
-                 getattr(result, "torrent_hash", "?"),
-                 getattr(result, "title", "?"))
-        return {
-            "result": True,
-            "user_torrent_id": getattr(result, "user_torrent_id", None),
-            "torrent_hash": getattr(result, "torrent_hash", ""),
-            "title": getattr(result, "title", ""),
-        }
+        # ── Attempt 1: seedrcc library ──────────────────────────────────
+        try:
+            result = await client.add_torrent(magnet_link=magnet)
+            log.info("[Seedr] Magnet submitted via seedrcc: hash=%s title=%s",
+                     getattr(result, "torrent_hash", "?"),
+                     getattr(result, "title", "?"))
+            return {
+                "result": True,
+                "user_torrent_id": getattr(result, "user_torrent_id", None),
+                "torrent_hash": getattr(result, "torrent_hash", ""),
+                "title": getattr(result, "title", ""),
+            }
+        except Exception as lib_err:
+            log.warning(
+                "[Seedr] seedrcc add_torrent failed (%s) — falling back to direct HTTP",
+                lib_err,
+            )
+
+        # ── Attempt 2: direct HTTP — try every plausible func name ──────
+        import httpx
+
+        token_obj = client.token
+        access_token = (
+            token_obj.access_token
+            if hasattr(token_obj, "access_token")
+            else str(token_obj)
+        )
+        base_url = "https://www.seedr.cc/oauth_test/resource.php"
+        # Most-likely-current names first
+        _MAGNET_FUNCS = ("add_magnet", "add_torrent", "torrent_add", "add_torrent_magnet")
+
+        async with httpx.AsyncClient(timeout=60) as http:
+            for func in _MAGNET_FUNCS:
+                try:
+                    resp = await http.post(base_url, data={
+                        "func": func,
+                        "access_token": access_token,
+                        "magnet_link": magnet,
+                    })
+                    log.debug(
+                        "[Seedr] Direct func=%s -> HTTP %d: %s",
+                        func, resp.status_code, resp.text[:300],
+                    )
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                            if data.get("result") is not False:
+                                log.info(
+                                    "[Seedr] Magnet submitted via direct func=%s: %s",
+                                    func, data,
+                                )
+                                return {
+                                    "result": True,
+                                    "user_torrent_id": data.get("user_torrent_id"),
+                                    "torrent_hash": data.get("torrent_hash", ""),
+                                    "title": data.get("title", ""),
+                                }
+                            log.warning("[Seedr] func=%s returned result=false: %s", func, data)
+                        except Exception as parse_err:
+                            log.warning(
+                                "[Seedr] func=%s JSON parse error: %s | body: %s",
+                                func, parse_err, resp.text[:200],
+                            )
+                except Exception as http_err:
+                    log.warning("[Seedr] Direct func=%s HTTP error: %s", func, http_err)
+
+        raise RuntimeError(
+            "All Seedr magnet submission methods failed. "
+            "Seedr may have changed their API — check https://www.seedr.cc "
+            "or update the seedrcc library."
+        )
     finally:
         await client.close()
 
