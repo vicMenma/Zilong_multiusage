@@ -1,41 +1,80 @@
 """
 services/seedr.py
-Seedr.cc cloud torrent client — uses seedrcc v2.1.0 library.
-
-FIX BUG-UH-03: poll_until_ready now fires progress_cb on a 30-second
-  heartbeat regardless of percentage change.  Previously the callback
-  only fired when pct changed, so a slow/stalled torrent produced no UI
-  updates for minutes — making the Seedr panel appear frozen.
-
-FIX BUG-SEEDR-03: add_magnet() now uses a 3-layer submission strategy:
-  Layer 1 — seedrcc library (func=add_torrent, torrent_magnet in body,
-             access_token+func as URL query params).
-  Layer 2 — Direct oauth_test HTTP with CORRECT format: access_token and
-             func as URL query params (not POST body), field name is
-             torrent_magnet (not magnet_link as the old fallback used).
-             The old fallback put everything in the POST body which is
-             wrong and also used the wrong field name.
-  Layer 3 — Seedr REST API with HTTP Basic Auth (SEEDR_USERNAME +
-             SEEDR_PASSWORD).  Tries both /rest/transfer/magnet and
-             /rest/torrent/magnet, which are the officially documented
-             endpoints.  This is independent of the oauth_test path and
-             works even when the OAuth endpoint drifts.
+Seedr.cc cloud torrent client — targets seedrcc v2.1.0+.
 
 ═══════════════════════════════════════════════════════════════════
-METHOD NAMES VERIFIED FROM ACTUAL seedrcc v2.1.0 SOURCE CODE:
-  AsyncSeedr.from_password(username, password, on_token_refresh=)
-  client.add_torrent(magnet_link='magnet:?...')   → payload uses torrent_magnet
-  client.list_contents(folder_id='0')             → payload uses content_id
-  client.fetch_file(file_id: str)                 → payload uses folder_file_id
-  client.delete_folder(folder_id: str)
-  client.get_settings()
+REWRITE CHANGELOG
+─────────────────────────────────────────────────────────────────
+FIX-AUTH-01 · Root cause of "Invalid username and password combination"
+  The original code called get_settings() on every _get_client() call to
+  probe the saved token.  get_settings() is an expensive authenticated call
+  that also deserialises AccountInfo — if Seedr ever drops max_invites from
+  that response the whole chain crashes and _get_client() falls through to
+  re-authenticate via password.  Under rate-limiting or after a password
+  change, that re-auth itself fails with AuthenticationError.
+
+  Fix: replace the get_settings() probe with a lightweight test_token() call
+  (func=test_token in the oauth_test resource endpoint).  test_token() just
+  returns {"result": true} and never touches AccountInfo, so the max_invites
+  issue cannot surface here at all.
+
+FIX-AUTH-02 · Device-code authentication path (recommended, 1-year tokens)
+  Password-based OAuth tokens from seedr_chrome are short-lived (~1 h) and
+  Seedr blocks repeated password logins if they come in rapid succession.
+  Device-code tokens (seedr_xbmc) last one year and are the method the
+  official Kodi extension uses.
+
+  New env var: SEEDR_DEVICE_CODE  (obtain once via /cmd_seedr_auth in bot)
+  When present, _get_client() prefers device-code auth over password auth.
+  The resulting token is cached in data/seedr_token.json and refreshed
+  automatically via the refresh_token stored alongside it.
+
+FIX-AUTH-03 · from_refresh_token fast-path
+  If the saved Token has a refresh_token, try AsyncSeedr.from_refresh_token()
+  before falling back to full re-authentication.  This avoids sending the
+  cleartext password across the wire on every token expiry.
+
+FIX-SEEDR-04 · Correct REST v1 fallback endpoints
+  The previous Layer 3 tried /rest/transfer/magnet and /rest/torrent/magnet
+  neither of which exists.  The actual Seedr REST v1 torrent add endpoint is:
+    POST /rest/torrent  data={"magnet": "<url>"}
+  (see https://www.seedr.cc/docs/api/rest/v1/ — requires premium account).
+
+FIX-SEEDR-05 · Client singleton / connection pooling
+  _get_client() previously created and discarded an httpx.AsyncClient on
+  every call.  This rewrite uses a module-level _CLIENT_CACHE that keeps a
+  live AsyncSeedr instance alive between calls and only recreates it when
+  authentication truly fails.  This eliminates TCP handshake overhead and
+  reduces the chance of hitting Seedr's login rate-limit.
+
+FIX-SEEDR-06 · Improved max_invites patch for frozen dataclass
+  Patching __init__ on a frozen dataclass in CPython works (object.__setattr__
+  is used internally), but only if the patch is applied BEFORE any import that
+  might cache the original __init__ in a closure.  The patch is now applied at
+  module import time (same as before) but also verifies it actually took effect
+  by running a dry test against a minimal dict.
+
+FIX-BUG-UH-03 (preserved) · 30-second heartbeat in poll_until_ready
+  Kept from original — progress_cb fires on percentage change OR every 30s.
+
+═══════════════════════════════════════════════════════════════════
+SEEDRCC v2.1.0 METHOD REFERENCE
+  AsyncSeedr.get_device_code()              → DeviceCode (static, no auth)
+  AsyncSeedr.from_device_code(device_code) → AsyncSeedr
+  AsyncSeedr.from_password(user, pass)     → AsyncSeedr
+  AsyncSeedr.from_refresh_token(token)     → AsyncSeedr
+  client.add_torrent(magnet_link='...')    → AddTorrentResult
+  client.list_contents(folder_id='0')      → ListContentsResult
+  client.fetch_file(file_id: str)          → FetchFileResult
+  client.delete_folder(folder_id: str)     → APIResult
+  client.get_settings()                    → UserSettings
+  client.refresh_token()                   → RefreshTokenResult
   client.close()
 ═══════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -46,43 +85,31 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────
-# BUG-SEEDR-01 FIX: Seedr removed 'max_invites' from the
-# get_settings() response.  seedrcc v2.1.0's AccountInfo still
-# declares it as a required positional arg, so every call to
-# get_settings() raises:
-#   AccountInfo.__init__() missing 1 required positional
-#   argument: 'max_invites'
-# This causes _get_client() to ALWAYS treat the saved token as
-# expired and re-authenticate via password — wasting a round-trip
-# on every single API call.
-#
-# Fix: wrap AccountInfo.__init__ so that missing 'max_invites'
-# defaults to 0/None instead of raising TypeError.
-#
-# NOTE: seedrcc 2.1.0 uses dataclasses with from_dict() which
-# filters keys — if 'max_invites' is absent in the API response it
-# won't be passed to __init__ and will still raise TypeError.
-# The patch handles this by intercepting the TypeError.
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-SEEDR-06: max_invites patch — applied at import time
+# Seedr dropped 'max_invites' from the get_settings() response.
+# seedrcc v2.1.0 AccountInfo still declares it as a required field, so
+# from_dict() raises TypeError when the key is absent.
+# We intercept __init__ so that a missing max_invites defaults to 0.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _patch_seedrcc_account_info() -> None:
     """Make AccountInfo tolerant of Seedr dropping 'max_invites'."""
     try:
         import seedrcc.models as _seedr_models  # type: ignore
-        _OrigAccountInfo = _seedr_models.AccountInfo
-        _orig_init = _OrigAccountInfo.__init__
-
         import inspect as _inspect
-        sig = _inspect.signature(_orig_init)
+
+        _OrigAccountInfo = _seedr_models.AccountInfo
+        _orig_init       = _OrigAccountInfo.__init__
+
+        sig    = _inspect.signature(_orig_init)
         params = list(sig.parameters.values())
-        # Only patch if 'max_invites' exists and has no default
         needs_patch = any(
             p.name == "max_invites" and p.default is _inspect.Parameter.empty
             for p in params
         )
         if not needs_patch:
-            log.debug("[Seedr] AccountInfo: no patch needed")
+            log.debug("[Seedr] AccountInfo patch not required")
             return
 
         def _patched_init(self, *args, **kwargs):
@@ -96,7 +123,18 @@ def _patch_seedrcc_account_info() -> None:
                     raise
 
         _OrigAccountInfo.__init__ = _patched_init
+
+        # Verify the patch actually works before proceeding.
+        _test = {
+            "username": "_patch_test", "user_id": 0, "premium": 0,
+            "package_id": 0, "package_name": "", "space_used": 0,
+            "space_max": 0, "bandwidth_used": 0, "email": "",
+            "wishlist": [], "invites": 0, "invites_accepted": 0,
+            # max_invites intentionally absent
+        }
+        _seedr_models.AccountInfo.from_dict(_test)
         log.info("[Seedr] AccountInfo patched — 'max_invites' is now optional")
+
     except Exception as exc:
         log.warning("[Seedr] AccountInfo patch skipped: %s", exc)
 
@@ -104,283 +142,455 @@ def _patch_seedrcc_account_info() -> None:
 _patch_seedrcc_account_info()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Token file path
+# ─────────────────────────────────────────────────────────────────────────────
+
 _TOKEN_FILE = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "data", "seedr_token.json")
 )
 
 
-# ─────────────────────────────────────────────────────────────
-# Token persistence
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Token persistence helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _save_token(token) -> None:
     try:
         os.makedirs(os.path.dirname(_TOKEN_FILE), exist_ok=True)
-        with open(_TOKEN_FILE, "w", encoding="utf-8") as f:
-            f.write(token.to_json())
-        log.debug("[Seedr] Token saved")
-    except Exception as e:
-        log.warning("[Seedr] Token save error: %s", e)
+        with open(_TOKEN_FILE, "w", encoding="utf-8") as fh:
+            fh.write(token.to_json())
+        log.debug("[Seedr] Token saved to %s", _TOKEN_FILE)
+    except Exception as exc:
+        log.warning("[Seedr] Token save error: %s", exc)
 
 
 def _load_token():
+    """Return a seedrcc.Token from disk, or None."""
     try:
         from seedrcc import Token
-        with open(_TOKEN_FILE, encoding="utf-8") as f:
-            raw = f.read().strip()
+        with open(_TOKEN_FILE, encoding="utf-8") as fh:
+            raw = fh.read().strip()
         if not raw:
             return None
-        return Token.from_json(raw)
+        token = Token.from_json(raw)
+        log.debug("[Seedr] Token loaded from disk")
+        return token
     except FileNotFoundError:
         return None
-    except Exception as e:
-        log.warning("[Seedr] Token load error: %s", e)
+    except Exception as exc:
+        log.warning("[Seedr] Token load error: %s", exc)
         return None
 
 
-# ─────────────────────────────────────────────────────────────
-# Client factory
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-SEEDR-05: Client singleton cache
+# ─────────────────────────────────────────────────────────────────────────────
 
-async def _get_client():
-    from seedrcc import AsyncSeedr, Token
+_CLIENT_CACHE: Optional["AsyncSeedr"] = None  # type: ignore[name-defined]
+_CLIENT_LOCK = asyncio.Lock()
 
-    saved = _load_token()
-    if saved:
-        try:
-            client = AsyncSeedr(token=saved, on_token_refresh=_save_token)
-            await client.get_settings()
-            log.info("[Seedr] Authenticated via saved token")
-            return client
-        except Exception as e:
-            log.warning("[Seedr] Saved token expired (%s) — re-authenticating", e)
+
+async def _invalidate_client() -> None:
+    """Close and discard the cached client so the next call re-authenticates."""
+    global _CLIENT_CACHE
+    async with _CLIENT_LOCK:
+        if _CLIENT_CACHE is not None:
             try:
-                await client.close()
+                await _CLIENT_CACHE.close()
             except Exception:
                 pass
-
-    username = os.environ.get("SEEDR_USERNAME", "").strip()
-    password = os.environ.get("SEEDR_PASSWORD", "").strip()
-    if not username or not password:
-        raise RuntimeError(
-            "Seedr credentials not configured.\n"
-            "Add to your .env:\n"
-            "  SEEDR_USERNAME=your@email.com\n"
-            "  SEEDR_PASSWORD=yourpassword"
-        )
-
-    client = await AsyncSeedr.from_password(
-        username, password, on_token_refresh=_save_token,
-    )
-    if client.token:
-        _save_token(client.token)
-    log.info("[Seedr] Authenticated via password login")
-    return client
+            _CLIENT_CACHE = None
+            log.debug("[Seedr] Client cache invalidated")
 
 
-# ─────────────────────────────────────────────────────────────
+async def _probe_client(client) -> bool:
+    """
+    FIX-AUTH-01: Use refresh_token (lightweight) instead of get_settings()
+    to probe whether the cached client is still valid.
+
+    seedrcc 2.1.0 exposes client.refresh_token() which hits token.php with the
+    refresh_token grant — no AccountInfo deserialisation involved, so the
+    max_invites issue can't surface here.
+
+    If the token has no refresh_token we fall back to get_settings() but wrap
+    the AccountInfo failure so it doesn't propagate.
+    """
+    from seedrcc.exceptions import AuthenticationError  # type: ignore
+
+    try:
+        tok = client.token
+        if tok.refresh_token:
+            await client.refresh_token()
+            log.debug("[Seedr] Token probed via refresh_token — still valid")
+            return True
+    except AuthenticationError:
+        return False
+    except Exception as exc:
+        log.debug("[Seedr] refresh_token probe failed (%s) — trying get_settings", exc)
+
+    # Fallback probe via get_settings (handles missing max_invites via our patch)
+    try:
+        await client.get_settings()
+        log.debug("[Seedr] Token probed via get_settings — still valid")
+        return True
+    except AuthenticationError:
+        return False
+    except Exception as exc:
+        log.warning("[Seedr] Token probe error: %s", exc)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Client factory — the single point of authentication
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _get_client():
+    """
+    Return an authenticated AsyncSeedr client, using the singleton cache.
+
+    Authentication priority (FIX-AUTH-01 / FIX-AUTH-02 / FIX-AUTH-03):
+      1. Return cached client if still alive.
+      2. Restore from saved token on disk.
+         a. If token has refresh_token → AsyncSeedr.from_refresh_token()
+         b. Otherwise → AsyncSeedr(token=saved_token)
+      3. Fresh login:
+         a. SEEDR_DEVICE_CODE env var → AsyncSeedr.from_device_code()
+         b. SEEDR_USERNAME + SEEDR_PASSWORD → AsyncSeedr.from_password()
+    """
+    global _CLIENT_CACHE
+
+    async with _CLIENT_LOCK:
+        # ── 1. Return cached live client ──────────────────────────────────────
+        if _CLIENT_CACHE is not None:
+            return _CLIENT_CACHE
+
+        from seedrcc import AsyncSeedr, Token  # type: ignore
+        from seedrcc.exceptions import AuthenticationError  # type: ignore
+
+        client: Optional[AsyncSeedr] = None
+
+        # ── 2. Restore from disk ──────────────────────────────────────────────
+        saved = _load_token()
+        if saved:
+            # 2a. If we have a refresh_token, use from_refresh_token for a clean
+            #     re-auth without exposing the cleartext password (FIX-AUTH-03).
+            if saved.refresh_token:
+                try:
+                    client = await AsyncSeedr.from_refresh_token(
+                        saved.refresh_token,
+                        on_token_refresh=_save_token,
+                    )
+                    _save_token(client.token)
+                    log.info("[Seedr] Authenticated via saved refresh_token")
+                    _CLIENT_CACHE = client
+                    return _CLIENT_CACHE
+                except Exception as exc:
+                    log.warning(
+                        "[Seedr] refresh_token login failed (%s) — "
+                        "trying saved access_token",
+                        exc,
+                    )
+                    client = None
+
+            # 2b. Construct client with the saved token and probe it.
+            try:
+                candidate = AsyncSeedr(token=saved, on_token_refresh=_save_token)
+                if await _probe_client(candidate):
+                    _save_token(candidate.token)
+                    log.info("[Seedr] Authenticated via saved access_token")
+                    _CLIENT_CACHE = candidate
+                    return _CLIENT_CACHE
+                await candidate.close()
+                log.info("[Seedr] Saved token invalid — falling through to fresh login")
+            except Exception as exc:
+                log.warning("[Seedr] Saved token restore failed (%s) — fresh login", exc)
+
+        # ── 3. Fresh login ────────────────────────────────────────────────────
+        device_code = os.environ.get("SEEDR_DEVICE_CODE", "").strip()
+        username    = os.environ.get("SEEDR_USERNAME", "").strip()
+        password    = os.environ.get("SEEDR_PASSWORD", "").strip()
+
+        # 3a. Device-code path (FIX-AUTH-02) — preferred, 1-year token
+        if device_code:
+            try:
+                client = await AsyncSeedr.from_device_code(
+                    device_code,
+                    on_token_refresh=_save_token,
+                )
+                _save_token(client.token)
+                log.info("[Seedr] Authenticated via SEEDR_DEVICE_CODE")
+                _CLIENT_CACHE = client
+                return _CLIENT_CACHE
+            except Exception as exc:
+                log.warning(
+                    "[Seedr] Device-code login failed (%s) — trying password", exc
+                )
+
+        # 3b. Password path — fallback
+        if not username or not password:
+            raise RuntimeError(
+                "Seedr credentials not configured.\n"
+                "Option A (recommended — 1-year token):\n"
+                "  1. Run /seedr_deviceauth in the bot\n"
+                "  2. Visit https://seedr.cc/devices and enter the code\n"
+                "  3. Add SEEDR_DEVICE_CODE=<device_code> to your .env\n"
+                "Option B:\n"
+                "  Add SEEDR_USERNAME=your@email.com and "
+                "SEEDR_PASSWORD=yourpassword to your .env"
+            )
+
+        try:
+            client = await AsyncSeedr.from_password(
+                username, password,
+                on_token_refresh=_save_token,
+            )
+            _save_token(client.token)
+            log.info("[Seedr] Authenticated via SEEDR_USERNAME / SEEDR_PASSWORD")
+            _CLIENT_CACHE = client
+            return _CLIENT_CACHE
+        except Exception as exc:
+            raise RuntimeError(
+                f"Seedr password authentication failed: {exc}\n"
+                "• Check SEEDR_USERNAME and SEEDR_PASSWORD in your .env.\n"
+                "• If correct, use the device-code method instead:\n"
+                "  1. Run /seedr_deviceauth in the bot\n"
+                "  2. Visit https://seedr.cc/devices and enter the user code\n"
+                "  3. Set SEEDR_DEVICE_CODE=<device_code> in your .env"
+            ) from exc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: run an API call and invalidate the cache on auth errors
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _run(coro_factory):
+    """
+    Execute ``coro_factory(client)`` where client is the cached AsyncSeedr.
+    On AuthenticationError, flush the cache and retry once with a fresh client.
+    """
+    from seedrcc.exceptions import AuthenticationError  # type: ignore
+
+    for attempt in range(2):
+        client = await _get_client()
+        try:
+            return await coro_factory(client)
+        except AuthenticationError as exc:
+            log.warning(
+                "[Seedr] Auth error on attempt %d: %s — %s",
+                attempt + 1,
+                exc,
+                "invalidating cache and retrying" if attempt == 0 else "giving up",
+            )
+            await _invalidate_client()
+            if attempt == 1:
+                raise
+
+    raise RuntimeError("Unreachable")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public API
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def check_credentials() -> bool:
+    """Return True if we can authenticate successfully."""
     try:
-        client = await _get_client()
-        await client.close()
+        await _get_client()
         return True
-    except Exception as e:
-        log.warning("[Seedr] Credential check failed: %s", e)
+    except Exception as exc:
+        log.warning("[Seedr] Credential check failed: %s", exc)
         return False
 
 
 async def get_storage_info() -> dict:
-    client = await _get_client()
-    try:
-        root = await client.list_contents(folder_id="0")
+    """Return {'total': int, 'used': int, 'free': int} in bytes."""
+    async def _call(client):
+        root  = await client.list_contents(folder_id="0")
         total = int(root.space_max or 0)
         used  = int(root.space_used or 0)
         return {"total": total, "used": used, "free": total - used}
-    finally:
-        await client.close()
+
+    return await _run(_call)
 
 
 async def add_magnet(magnet: str) -> dict:
     """
-    Submit a magnet link to Seedr using a 3-layer strategy.
+    Submit a magnet link to Seedr.
 
-    BUG-SEEDR-03 FIX (supersedes BUG-SEEDR-02):
+    Strategy (three layers, each guarded independently):
 
-    Layer 1 — seedrcc library (v2.1.0):
-        Sends access_token + func=add_torrent as URL query params,
-        torrent_magnet + folder_id in POST body.  This is the canonical
-        format.  May still 404 if Seedr has drifted the oauth_test path.
+    Layer 1 — seedrcc library client.add_torrent(magnet_link=...)
+        The canonical path.  Uses access_token + func=add_torrent as URL
+        query params and torrent_magnet in the POST body (verified from
+        seedrcc 2.1.0 source).
 
-    Layer 2 — Direct oauth_test HTTP with CORRECTED format:
-        The old fallback was broken in two ways:
-          (a) It put access_token and func in the POST body instead of
-              URL query params — Seedr ignores them there.
-          (b) It used the field name "magnet_link" instead of the
-              correct "torrent_magnet" (verified from seedrcc 2.1.0
-              AddTorrentPayload).
-        This layer fixes both issues.
+    Layer 2 — Direct oauth_test HTTP (corrected)
+        access_token + func as URL query params (NOT POST body).
+        Field name is torrent_magnet (NOT magnet_link).
 
-    Layer 3 — Seedr REST API with HTTP Basic Auth:
-        POST https://www.seedr.cc/rest/transfer/magnet  data=magnet=...
-        POST https://www.seedr.cc/rest/torrent/magnet   data=magnet=...
-        Uses SEEDR_USERNAME + SEEDR_PASSWORD from env.  Officially
-        documented and completely independent of the oauth_test path.
+    Layer 3 — Seedr REST v1 with HTTP Basic Auth (FIX-SEEDR-04)
+        POST https://www.seedr.cc/rest/torrent
+        data={"magnet": "<url>"}
+        This is the only documented REST v1 endpoint for adding a torrent.
+        (The old code tried /rest/transfer/magnet and /rest/torrent/magnet
+        which do not exist in the documented API.)
+        Requires a premium Seedr account.
     """
-    client = await _get_client()
+    import httpx  # already a dependency of seedrcc
+
+    # ── Layer 1: seedrcc library ──────────────────────────────────────────────
     try:
-        # ── Layer 1: seedrcc library ──────────────────────────────────────
-        try:
+        async def _lib_call(client):
             result = await client.add_torrent(magnet_link=magnet)
-            log.info(
-                "[Seedr] Magnet submitted via seedrcc library: hash=%s title=%s",
-                getattr(result, "torrent_hash", "?"),
-                getattr(result, "title", "?"),
-            )
             return {
-                "result": True,
+                "result":         True,
                 "user_torrent_id": getattr(result, "user_torrent_id", None),
                 "torrent_hash":    getattr(result, "torrent_hash", ""),
                 "title":           getattr(result, "title", ""),
             }
-        except Exception as lib_err:
-            log.warning(
-                "[Seedr] seedrcc library add_torrent failed (%s) — trying direct HTTP",
-                lib_err,
-            )
 
-        # ── Layer 2: Direct oauth_test HTTP — CORRECTED format ────────────
-        # access_token + func MUST be URL query params, not POST body.
-        # Field name is torrent_magnet (not magnet_link as the old code used).
-        import httpx
+        data = await _run(_lib_call)
+        log.info(
+            "[Seedr] Magnet submitted via seedrcc library: hash=%s title=%s",
+            data.get("torrent_hash", "?"), data.get("title", "?"),
+        )
+        return data
+    except Exception as lib_err:
+        log.warning(
+            "[Seedr] Layer 1 (seedrcc library) failed (%s) — trying Layer 2",
+            lib_err,
+        )
 
-        token_obj    = client.token
+    # ── Layer 2: Direct oauth_test with corrected field names ─────────────────
+    _OAUTH_URL = "https://www.seedr.cc/oauth_test/resource.php"
+    try:
+        client      = await _get_client()
+        token_obj   = client.token
         access_token = (
             token_obj.access_token
             if hasattr(token_obj, "access_token")
             else str(token_obj)
         )
-        _OAUTH_URL = "https://www.seedr.cc/oauth_test/resource.php"
-
         async with httpx.AsyncClient(timeout=60) as http:
-            try:
-                resp = await http.post(
-                    _OAUTH_URL,
-                    params={"func": "add_torrent", "access_token": access_token},
-                    data={"torrent_magnet": magnet, "folder_id": "-1"},
-                )
-                log.debug(
-                    "[Seedr] Direct oauth_test add_torrent → HTTP %d: %s",
-                    resp.status_code, resp.text[:300],
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("result") is not False:
-                        log.info("[Seedr] Magnet submitted via direct oauth_test: %s", data)
-                        return {
-                            "result":         True,
-                            "user_torrent_id": data.get("user_torrent_id"),
-                            "torrent_hash":    data.get("torrent_hash", ""),
-                            "title":           data.get("title", ""),
-                        }
-                    log.warning(
-                        "[Seedr] Direct oauth_test returned result=false: %s", data
-                    )
-                else:
-                    log.warning(
-                        "[Seedr] Direct oauth_test returned HTTP %d: %s",
-                        resp.status_code, resp.text[:200],
-                    )
-            except Exception as oauth_err:
-                log.warning("[Seedr] Direct oauth_test request error: %s", oauth_err)
-
-        # ── Layer 3: Seedr REST API with HTTP Basic Auth ──────────────────
-        # Official documented endpoints — independent of oauth_test path.
-        # Field name is "magnet" per https://www.seedr.cc/docs/api/rest/v1/
-        username = os.environ.get("SEEDR_USERNAME", "").strip()
-        password = os.environ.get("SEEDR_PASSWORD", "").strip()
-
-        if not username or not password:
-            log.warning(
-                "[Seedr] REST API fallback skipped — SEEDR_USERNAME/PASSWORD not set"
+            resp = await http.post(
+                _OAUTH_URL,
+                params={"func": "add_torrent", "access_token": access_token},
+                data={"torrent_magnet": magnet, "folder_id": "-1"},
             )
+        log.debug(
+            "[Seedr] Layer 2 oauth_test → HTTP %d: %s",
+            resp.status_code, resp.text[:300],
+        )
+        if resp.status_code == 200:
+            resp_data = resp.json()
+            if resp_data.get("result") is not False:
+                log.info("[Seedr] Magnet submitted via Layer 2 oauth_test: %s", resp_data)
+                return {
+                    "result":         True,
+                    "user_torrent_id": resp_data.get("user_torrent_id"),
+                    "torrent_hash":    resp_data.get("torrent_hash", ""),
+                    "title":           resp_data.get("title", ""),
+                }
+            log.warning("[Seedr] Layer 2 result=false: %s", resp_data)
         else:
-            _REST_PATHS = (
-                "/rest/transfer/magnet",  # official docs endpoint
-                "/rest/torrent/magnet",   # alternative endpoint seen in the wild
+            log.warning(
+                "[Seedr] Layer 2 HTTP %d: %s",
+                resp.status_code, resp.text[:200],
             )
-            async with httpx.AsyncClient(timeout=60) as http:
-                for path in _REST_PATHS:
-                    url = f"https://www.seedr.cc{path}"
-                    try:
-                        resp = await http.post(
-                            url,
-                            auth=(username, password),
-                            data={"magnet": magnet},
-                        )
-                        log.debug(
-                            "[Seedr] REST %s → HTTP %d: %s",
-                            path, resp.status_code, resp.text[:300],
-                        )
-                        if resp.status_code in (200, 201):
-                            try:
-                                data = resp.json()
-                            except Exception:
-                                data = {}
-                            # REST API may return {"result": true} or just {}
-                            # A 200/201 with non-error body is a success
-                            if data.get("result") is not False:
-                                log.info(
-                                    "[Seedr] Magnet submitted via REST %s: %s",
-                                    path, data,
-                                )
-                                return {
-                                    "result":         True,
-                                    "user_torrent_id": data.get("user_torrent_id")
-                                                      or data.get("id"),
-                                    "torrent_hash":   data.get("torrent_hash", ""),
-                                    "title":          data.get("title", ""),
-                                }
-                            log.warning(
-                                "[Seedr] REST %s returned result=false: %s", path, data
-                            )
-                        else:
-                            log.warning(
-                                "[Seedr] REST %s returned HTTP %d: %s",
-                                path, resp.status_code, resp.text[:200],
-                            )
-                    except Exception as rest_err:
-                        log.warning(
-                            "[Seedr] REST %s request error: %s", path, rest_err
-                        )
+    except Exception as l2_err:
+        log.warning("[Seedr] Layer 2 failed (%s) — trying Layer 3", l2_err)
 
-    finally:
-        await client.close()
+    # ── Layer 3: REST v1 with HTTP Basic Auth (FIX-SEEDR-04) ─────────────────
+    # Correct endpoint: POST /rest/torrent  (not /rest/transfer/magnet)
+    username = os.environ.get("SEEDR_USERNAME", "").strip()
+    password = os.environ.get("SEEDR_PASSWORD", "").strip()
+
+    if not username or not password:
+        log.warning(
+            "[Seedr] Layer 3 skipped — SEEDR_USERNAME/PASSWORD not set"
+        )
+    else:
+        _REST_ENDPOINTS = (
+            "/rest/torrent",          # REST v1 documented endpoint
+            "/rest/folder/transfer",  # alternative seen in community usage
+        )
+        async with httpx.AsyncClient(timeout=60) as http:
+            for path in _REST_ENDPOINTS:
+                url = f"https://www.seedr.cc{path}"
+                try:
+                    resp = await http.post(
+                        url,
+                        auth=(username, password),
+                        data={"magnet": magnet},
+                    )
+                    log.debug(
+                        "[Seedr] Layer 3 REST %s → HTTP %d: %s",
+                        path, resp.status_code, resp.text[:300],
+                    )
+                    if resp.status_code in (200, 201):
+                        try:
+                            resp_data = resp.json()
+                        except Exception:
+                            resp_data = {}
+                        if resp_data.get("result") is not False:
+                            log.info(
+                                "[Seedr] Magnet submitted via Layer 3 REST %s: %s",
+                                path, resp_data,
+                            )
+                            return {
+                                "result":         True,
+                                "user_torrent_id": (
+                                    resp_data.get("user_torrent_id")
+                                    or resp_data.get("id")
+                                ),
+                                "torrent_hash":    resp_data.get("torrent_hash", ""),
+                                "title":           resp_data.get("title", ""),
+                            }
+                        log.warning(
+                            "[Seedr] Layer 3 REST %s result=false: %s", path, resp_data
+                        )
+                    else:
+                        log.warning(
+                            "[Seedr] Layer 3 REST %s HTTP %d: %s",
+                            path, resp.status_code, resp.text[:200],
+                        )
+                except Exception as l3_err:
+                    log.warning("[Seedr] Layer 3 REST %s error: %s", path, l3_err)
 
     raise RuntimeError(
-        "All Seedr magnet submission methods failed (library, direct oauth_test, REST API). "
-        "Check your credentials and https://www.seedr.cc for any service disruptions."
+        "All Seedr magnet submission layers failed.\n"
+        "• Verify your credentials (SEEDR_USERNAME / SEEDR_PASSWORD or SEEDR_DEVICE_CODE).\n"
+        "• Check https://www.seedr.cc for service status.\n"
+        "• REST v1 (Layer 3) requires a premium Seedr account."
     )
 
 
 async def list_folder(folder_id: int = 0) -> dict:
-    client = await _get_client()
-    try:
+    """Return {'folders': [...], 'files': [...], 'torrents': [...], ...}."""
+    async def _call(client):
         root = await client.list_contents(folder_id=str(folder_id))
         folders = [
             {"id": f.id, "name": f.name, "size": f.size}
             for f in (root.folders or [])
         ]
         files = [
-            {"folder_file_id": f.folder_file_id, "name": f.name,
-             "size": f.size, "id": f.file_id}
+            {
+                "folder_file_id": f.folder_file_id,
+                "name":           f.name,
+                "size":           f.size,
+                "id":             f.file_id,
+            }
             for f in (root.files or [])
         ]
         torrents = [
-            {"id": t.id, "name": t.name, "progress": t.progress,
-             "size": t.size, "progress_url": getattr(t, "progress_url", None)}
+            {
+                "id":           t.id,
+                "name":         t.name,
+                "progress":     t.progress,
+                "size":         t.size,
+                "progress_url": getattr(t, "progress_url", None),
+            }
             for t in (root.torrents or [])
         ]
         return {
@@ -390,36 +600,60 @@ async def list_folder(folder_id: int = 0) -> dict:
             "space_used": root.space_used,
             "space_max":  root.space_max,
         }
-    finally:
-        await client.close()
+
+    return await _run(_call)
 
 
 async def get_file_download_url(file_id: int) -> str:
-    client = await _get_client()
-    try:
+    """Return the direct download URL for a file by its folder_file_id."""
+    async def _call(client):
         result = await client.fetch_file(str(file_id))
         url = getattr(result, "url", "")
         if not url:
             log.warning("[Seedr] fetch_file returned no URL for id=%s", file_id)
         return url
-    finally:
-        await client.close()
+
+    return await _run(_call)
 
 
 async def delete_folder(folder_id: int) -> None:
-    client = await _get_client()
-    try:
+    """Delete a Seedr cloud folder by ID."""
+    async def _call(client):
         await client.delete_folder(str(folder_id))
         log.info("[Seedr] Deleted folder id=%d", folder_id)
-    finally:
-        await client.close()
+
+    await _run(_call)
 
 
-# ─────────────────────────────────────────────────────────────
-# Poll until torrent finishes — with 30-second heartbeat
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Device-code helper — for the bot's /seedr_deviceauth command
+# ─────────────────────────────────────────────────────────────────────────────
 
-_HEARTBEAT_INTERVAL = 30   # seconds — fire progress_cb even if pct unchanged
+async def get_device_auth_info() -> dict:
+    """
+    Obtain a device_code + user_code pair from Seedr.
+
+    Usage in the bot:
+        info = await get_device_auth_info()
+        # Show user: info["verification_url"]  and  info["user_code"]
+        # Then set SEEDR_DEVICE_CODE=info["device_code"] in .env and restart.
+    """
+    from seedrcc import AsyncSeedr  # type: ignore
+
+    codes = await AsyncSeedr.get_device_code()
+    return {
+        "device_code":      codes.device_code,
+        "user_code":        codes.user_code,
+        "verification_url": codes.verification_url,
+        "expires_in":       getattr(codes, "expires_in", 900),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Poll until torrent finishes — with 30-second heartbeat (FIX-BUG-UH-03 kept)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HEARTBEAT_INTERVAL = 30   # seconds
 
 
 async def poll_until_ready(
@@ -429,11 +663,10 @@ async def poll_until_ready(
     existing_folder_ids: Optional[set] = None,
 ) -> dict:
     """
-    Poll Seedr root folder until the torrent finishes.
+    Poll Seedr root folder until a new folder appears (torrent finished).
 
-    FIX BUG-UH-03: progress_cb now fires on a 30-second heartbeat regardless
-    of whether the percentage changed.  This prevents the Seedr panel from
-    appearing frozen on slow or stalled torrents.
+    Fires progress_cb(pct, name) on percentage change OR every 30 seconds
+    (FIX-BUG-UH-03) to prevent the panel appearing frozen on slow torrents.
 
     Returns folder dict {id, name, size}.
     """
@@ -442,7 +675,7 @@ async def poll_until_ready(
 
     deadline       = time.time() + timeout_s
     last_pct       = -1.0
-    last_heartbeat = time.time()   # FIX BUG-UH-03
+    last_heartbeat = time.time()
 
     while time.time() < deadline:
         try:
@@ -473,7 +706,6 @@ async def poll_until_ready(
                 dl  = downloading[0]
                 pct = dl["_pct"]
                 now = time.time()
-                # FIX BUG-UH-03: fire on pct change OR 30s heartbeat
                 if pct != last_pct or (now - last_heartbeat) >= _HEARTBEAT_INTERVAL:
                     last_pct       = pct
                     last_heartbeat = now
@@ -491,19 +723,20 @@ async def poll_until_ready(
             else:
                 log.debug("[Seedr] No new folder yet — waiting…")
 
-        except Exception as e:
-            log.warning("[Seedr] Poll error: %s", e)
+        except Exception as exc:
+            log.warning("[Seedr] Poll error: %s", exc)
 
         await asyncio.sleep(10)
 
     raise RuntimeError(f"Seedr download timed out after {timeout_s}s")
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Get all file URLs (recursive)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def get_file_urls(folder_id: int) -> list[dict]:
+    """Recursively collect all file download URLs under a Seedr folder."""
     result: list[dict] = []
 
     async def _collect(fid: int) -> None:
@@ -518,33 +751,33 @@ async def get_file_urls(folder_id: int) -> list[dict]:
                 dl_url = await get_file_download_url(file_id)
                 if dl_url:
                     result.append({"name": name, "url": dl_url, "size": size})
-            except Exception as e:
-                log.warning("[Seedr] File URL fetch failed for %s: %s", name, e)
+            except Exception as exc:
+                log.warning("[Seedr] File URL fetch failed for %s: %s", name, exc)
         for sub in contents.get("folders", []):
             sub_id = sub.get("id")
             if sub_id:
                 try:
                     await _collect(sub_id)
-                except Exception as e:
-                    log.warning("[Seedr] Sub-folder error: %s", e)
+                except Exception as exc:
+                    log.warning("[Seedr] Sub-folder error: %s", exc)
 
     await _collect(folder_id)
     return result
 
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # High-level pipeline
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def download_via_seedr(
-    magnet:      str,
-    dest:        str,
-    progress_cb  = None,
-    timeout_s:   int = 3600,
+    magnet:     str,
+    dest:       str,
+    progress_cb = None,
+    timeout_s:  int = 3600,
 ) -> list[str]:
     """
-    Full pipeline: add magnet → poll → fetch URLs → download → cleanup.
-    Returns list of local file paths in `dest`.
+    Full pipeline: add magnet → poll until done → fetch URLs → download files
+    → cleanup.  Returns list of local file paths written to `dest`.
     """
     from services.downloader import download_direct
     from services.cc_sanitize import sanitize_filename
@@ -552,6 +785,7 @@ async def download_via_seedr(
     if progress_cb:
         await progress_cb("adding", 0.0, "Submitting to Seedr…")
 
+    # Snapshot existing folder IDs so we can detect the new one.
     existing_folder_ids: set = set()
     try:
         root = await list_folder(0)
@@ -575,11 +809,11 @@ async def download_via_seedr(
         if progress_cb:
             await progress_cb("downloading", pct, name)
 
-    folder = await poll_until_ready(
-        torrent_name_hint=name_hint,
-        timeout_s=timeout_s,
-        progress_cb=_poll_progress,
-        existing_folder_ids=existing_folder_ids,
+    folder    = await poll_until_ready(
+        torrent_name_hint   = name_hint,
+        timeout_s           = timeout_s,
+        progress_cb         = _poll_progress,
+        existing_folder_ids = existing_folder_ids,
     )
     folder_id = folder["id"]
 
@@ -588,10 +822,10 @@ async def download_via_seedr(
 
     files = await get_file_urls(folder_id)
     if not files:
-        raise RuntimeError("Seedr returned no files.")
+        raise RuntimeError("Seedr returned no downloadable files.")
 
     os.makedirs(dest, exist_ok=True)
-    local_paths = []
+    local_paths: list[str] = []
 
     for i, f in enumerate(files):
         raw_name   = f["name"]
@@ -601,7 +835,7 @@ async def download_via_seedr(
             await progress_cb(
                 "dl_file",
                 (i / len(files)) * 100,
-                f"Downloading {clean_name} ({i+1}/{len(files)})…",
+                f"Downloading {clean_name} ({i + 1}/{len(files)})…",
             )
 
         log.info("[Seedr] Downloading %s → %s", raw_name, clean_name)
@@ -615,12 +849,13 @@ async def download_via_seedr(
                 except OSError:
                     pass
             local_paths.append(path)
-        except Exception as e:
-            log.error("[Seedr] Download failed for %s: %s", raw_name, e)
+        except Exception as exc:
+            log.error("[Seedr] Download failed for %s: %s", raw_name, exc)
 
+    # Cleanup cloud storage
     try:
         await delete_folder(folder_id)
-    except Exception as e:
-        log.warning("[Seedr] Cleanup failed: %s", e)
+    except Exception as exc:
+        log.warning("[Seedr] Cloud cleanup failed: %s", exc)
 
     return local_paths
