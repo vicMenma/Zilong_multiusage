@@ -1,18 +1,32 @@
 """
 services/seedr.py
-Seedr.cc cloud torrent client — uses seedrcc v2.0.2 library.
+Seedr.cc cloud torrent client — uses seedrcc v2.1.0 library.
 
 FIX BUG-UH-03: poll_until_ready now fires progress_cb on a 30-second
   heartbeat regardless of percentage change.  Previously the callback
   only fired when pct changed, so a slow/stalled torrent produced no UI
   updates for minutes — making the Seedr panel appear frozen.
 
+FIX BUG-SEEDR-03: add_magnet() now uses a 3-layer submission strategy:
+  Layer 1 — seedrcc library (func=add_torrent, torrent_magnet in body,
+             access_token+func as URL query params).
+  Layer 2 — Direct oauth_test HTTP with CORRECT format: access_token and
+             func as URL query params (not POST body), field name is
+             torrent_magnet (not magnet_link as the old fallback used).
+             The old fallback put everything in the POST body which is
+             wrong and also used the wrong field name.
+  Layer 3 — Seedr REST API with HTTP Basic Auth (SEEDR_USERNAME +
+             SEEDR_PASSWORD).  Tries both /rest/transfer/magnet and
+             /rest/torrent/magnet, which are the officially documented
+             endpoints.  This is independent of the oauth_test path and
+             works even when the OAuth endpoint drifts.
+
 ═══════════════════════════════════════════════════════════════════
-METHOD NAMES VERIFIED FROM ACTUAL seedrcc v2.0.2 SOURCE CODE:
+METHOD NAMES VERIFIED FROM ACTUAL seedrcc v2.1.0 SOURCE CODE:
   AsyncSeedr.from_password(username, password, on_token_refresh=)
-  client.add_torrent(magnet_link='magnet:?...')
-  client.list_contents(folder_id='0')
-  client.fetch_file(file_id: str)
+  client.add_torrent(magnet_link='magnet:?...')   → payload uses torrent_magnet
+  client.list_contents(folder_id='0')             → payload uses content_id
+  client.fetch_file(file_id: str)                 → payload uses folder_file_id
   client.delete_folder(folder_id: str)
   client.get_settings()
   client.close()
@@ -34,7 +48,7 @@ log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
 # BUG-SEEDR-01 FIX: Seedr removed 'max_invites' from the
-# get_settings() response.  seedrcc v2.0.2's AccountInfo still
+# get_settings() response.  seedrcc v2.1.0's AccountInfo still
 # declares it as a required positional arg, so every call to
 # get_settings() raises:
 #   AccountInfo.__init__() missing 1 required positional
@@ -45,6 +59,11 @@ log = logging.getLogger(__name__)
 #
 # Fix: wrap AccountInfo.__init__ so that missing 'max_invites'
 # defaults to 0/None instead of raising TypeError.
+#
+# NOTE: seedrcc 2.1.0 uses dataclasses with from_dict() which
+# filters keys — if 'max_invites' is absent in the API response it
+# won't be passed to __init__ and will still raise TypeError.
+# The patch handles this by intercepting the TypeError.
 # ─────────────────────────────────────────────────────────────
 
 def _patch_seedrcc_account_info() -> None:
@@ -186,89 +205,164 @@ async def get_storage_info() -> dict:
 
 async def add_magnet(magnet: str) -> dict:
     """
-    Submit a magnet link to Seedr.
+    Submit a magnet link to Seedr using a 3-layer strategy.
 
-    BUG-SEEDR-02 FIX: Seedr silently removed/renamed the
-    func=add_torrent endpoint (returns HTTP 404 for magnet_link
-    submissions).  We first attempt the seedrcc library built-in
-    method; if it fails we fall through to a direct httpx POST loop
-    that tries every known Seedr func name for magnet submission.
+    BUG-SEEDR-03 FIX (supersedes BUG-SEEDR-02):
+
+    Layer 1 — seedrcc library (v2.1.0):
+        Sends access_token + func=add_torrent as URL query params,
+        torrent_magnet + folder_id in POST body.  This is the canonical
+        format.  May still 404 if Seedr has drifted the oauth_test path.
+
+    Layer 2 — Direct oauth_test HTTP with CORRECTED format:
+        The old fallback was broken in two ways:
+          (a) It put access_token and func in the POST body instead of
+              URL query params — Seedr ignores them there.
+          (b) It used the field name "magnet_link" instead of the
+              correct "torrent_magnet" (verified from seedrcc 2.1.0
+              AddTorrentPayload).
+        This layer fixes both issues.
+
+    Layer 3 — Seedr REST API with HTTP Basic Auth:
+        POST https://www.seedr.cc/rest/transfer/magnet  data=magnet=...
+        POST https://www.seedr.cc/rest/torrent/magnet   data=magnet=...
+        Uses SEEDR_USERNAME + SEEDR_PASSWORD from env.  Officially
+        documented and completely independent of the oauth_test path.
     """
     client = await _get_client()
     try:
-        # ── Attempt 1: seedrcc library ──────────────────────────────────
+        # ── Layer 1: seedrcc library ──────────────────────────────────────
         try:
             result = await client.add_torrent(magnet_link=magnet)
-            log.info("[Seedr] Magnet submitted via seedrcc: hash=%s title=%s",
-                     getattr(result, "torrent_hash", "?"),
-                     getattr(result, "title", "?"))
+            log.info(
+                "[Seedr] Magnet submitted via seedrcc library: hash=%s title=%s",
+                getattr(result, "torrent_hash", "?"),
+                getattr(result, "title", "?"),
+            )
             return {
                 "result": True,
                 "user_torrent_id": getattr(result, "user_torrent_id", None),
-                "torrent_hash": getattr(result, "torrent_hash", ""),
-                "title": getattr(result, "title", ""),
+                "torrent_hash":    getattr(result, "torrent_hash", ""),
+                "title":           getattr(result, "title", ""),
             }
         except Exception as lib_err:
             log.warning(
-                "[Seedr] seedrcc add_torrent failed (%s) — falling back to direct HTTP",
+                "[Seedr] seedrcc library add_torrent failed (%s) — trying direct HTTP",
                 lib_err,
             )
 
-        # ── Attempt 2: direct HTTP — try every plausible func name ──────
+        # ── Layer 2: Direct oauth_test HTTP — CORRECTED format ────────────
+        # access_token + func MUST be URL query params, not POST body.
+        # Field name is torrent_magnet (not magnet_link as the old code used).
         import httpx
 
-        token_obj = client.token
+        token_obj    = client.token
         access_token = (
             token_obj.access_token
             if hasattr(token_obj, "access_token")
             else str(token_obj)
         )
-        base_url = "https://www.seedr.cc/oauth_test/resource.php"
-        # Most-likely-current names first
-        _MAGNET_FUNCS = ("add_magnet", "add_torrent", "torrent_add", "add_torrent_magnet")
+        _OAUTH_URL = "https://www.seedr.cc/oauth_test/resource.php"
 
         async with httpx.AsyncClient(timeout=60) as http:
-            for func in _MAGNET_FUNCS:
-                try:
-                    resp = await http.post(base_url, data={
-                        "func": func,
-                        "access_token": access_token,
-                        "magnet_link": magnet,
-                    })
-                    log.debug(
-                        "[Seedr] Direct func=%s -> HTTP %d: %s",
-                        func, resp.status_code, resp.text[:300],
+            try:
+                resp = await http.post(
+                    _OAUTH_URL,
+                    params={"func": "add_torrent", "access_token": access_token},
+                    data={"torrent_magnet": magnet, "folder_id": "-1"},
+                )
+                log.debug(
+                    "[Seedr] Direct oauth_test add_torrent → HTTP %d: %s",
+                    resp.status_code, resp.text[:300],
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("result") is not False:
+                        log.info("[Seedr] Magnet submitted via direct oauth_test: %s", data)
+                        return {
+                            "result":         True,
+                            "user_torrent_id": data.get("user_torrent_id"),
+                            "torrent_hash":    data.get("torrent_hash", ""),
+                            "title":           data.get("title", ""),
+                        }
+                    log.warning(
+                        "[Seedr] Direct oauth_test returned result=false: %s", data
                     )
-                    if resp.status_code == 200:
-                        try:
-                            data = resp.json()
+                else:
+                    log.warning(
+                        "[Seedr] Direct oauth_test returned HTTP %d: %s",
+                        resp.status_code, resp.text[:200],
+                    )
+            except Exception as oauth_err:
+                log.warning("[Seedr] Direct oauth_test request error: %s", oauth_err)
+
+        # ── Layer 3: Seedr REST API with HTTP Basic Auth ──────────────────
+        # Official documented endpoints — independent of oauth_test path.
+        # Field name is "magnet" per https://www.seedr.cc/docs/api/rest/v1/
+        username = os.environ.get("SEEDR_USERNAME", "").strip()
+        password = os.environ.get("SEEDR_PASSWORD", "").strip()
+
+        if not username or not password:
+            log.warning(
+                "[Seedr] REST API fallback skipped — SEEDR_USERNAME/PASSWORD not set"
+            )
+        else:
+            _REST_PATHS = (
+                "/rest/transfer/magnet",  # official docs endpoint
+                "/rest/torrent/magnet",   # alternative endpoint seen in the wild
+            )
+            async with httpx.AsyncClient(timeout=60) as http:
+                for path in _REST_PATHS:
+                    url = f"https://www.seedr.cc{path}"
+                    try:
+                        resp = await http.post(
+                            url,
+                            auth=(username, password),
+                            data={"magnet": magnet},
+                        )
+                        log.debug(
+                            "[Seedr] REST %s → HTTP %d: %s",
+                            path, resp.status_code, resp.text[:300],
+                        )
+                        if resp.status_code in (200, 201):
+                            try:
+                                data = resp.json()
+                            except Exception:
+                                data = {}
+                            # REST API may return {"result": true} or just {}
+                            # A 200/201 with non-error body is a success
                             if data.get("result") is not False:
                                 log.info(
-                                    "[Seedr] Magnet submitted via direct func=%s: %s",
-                                    func, data,
+                                    "[Seedr] Magnet submitted via REST %s: %s",
+                                    path, data,
                                 )
                                 return {
-                                    "result": True,
-                                    "user_torrent_id": data.get("user_torrent_id"),
-                                    "torrent_hash": data.get("torrent_hash", ""),
-                                    "title": data.get("title", ""),
+                                    "result":         True,
+                                    "user_torrent_id": data.get("user_torrent_id")
+                                                      or data.get("id"),
+                                    "torrent_hash":   data.get("torrent_hash", ""),
+                                    "title":          data.get("title", ""),
                                 }
-                            log.warning("[Seedr] func=%s returned result=false: %s", func, data)
-                        except Exception as parse_err:
                             log.warning(
-                                "[Seedr] func=%s JSON parse error: %s | body: %s",
-                                func, parse_err, resp.text[:200],
+                                "[Seedr] REST %s returned result=false: %s", path, data
                             )
-                except Exception as http_err:
-                    log.warning("[Seedr] Direct func=%s HTTP error: %s", func, http_err)
+                        else:
+                            log.warning(
+                                "[Seedr] REST %s returned HTTP %d: %s",
+                                path, resp.status_code, resp.text[:200],
+                            )
+                    except Exception as rest_err:
+                        log.warning(
+                            "[Seedr] REST %s request error: %s", path, rest_err
+                        )
 
-        raise RuntimeError(
-            "All Seedr magnet submission methods failed. "
-            "Seedr may have changed their API — check https://www.seedr.cc "
-            "or update the seedrcc library."
-        )
     finally:
         await client.close()
+
+    raise RuntimeError(
+        "All Seedr magnet submission methods failed (library, direct oauth_test, REST API). "
+        "Check your credentials and https://www.seedr.cc for any service disruptions."
+    )
 
 
 async def list_folder(folder_id: int = 0) -> dict:
@@ -290,11 +384,11 @@ async def list_folder(folder_id: int = 0) -> dict:
             for t in (root.torrents or [])
         ]
         return {
-            "folders": folders,
-            "files": files,
-            "torrents": torrents,
+            "folders":    folders,
+            "files":      files,
+            "torrents":   torrents,
             "space_used": root.space_used,
-            "space_max": root.space_max,
+            "space_max":  root.space_max,
         }
     finally:
         await client.close()
@@ -352,7 +446,7 @@ async def poll_until_ready(
 
     while time.time() < deadline:
         try:
-            root = await list_folder(0)
+            root     = await list_folder(0)
             folders  = root.get("folders", [])
             torrents = root.get("torrents", [])
 
@@ -389,8 +483,10 @@ async def poll_until_ready(
                         await progress_cb(pct, name)
             elif new_folders:
                 folder = new_folders[-1]
-                log.info("[Seedr] Ready: %s (id=%s)",
-                         folder.get("name"), folder.get("id"))
+                log.info(
+                    "[Seedr] Ready: %s (id=%s)",
+                    folder.get("name"), folder.get("id"),
+                )
                 return folder
             else:
                 log.debug("[Seedr] No new folder yet — waiting…")
