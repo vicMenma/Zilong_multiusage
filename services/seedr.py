@@ -157,23 +157,90 @@ async def get_storage_info() -> dict:
 
 async def add_magnet(magnet: str) -> dict:
     """
-    Submit a magnet link to Seedr.
-    Uses client.add_torrent(magnet_link=...) — the correct v2 method.
+    Submit a magnet link to Seedr via direct httpx.
+
+    WHY NOT client.add_torrent():
+      seedrcc v2.x renamed the form field from 'magnet_link' to 'torrent_magnet'
+      and also serialises wishlist_id=None as an empty string.  Seedr's server
+      no longer recognises the payload and returns HTTP 404.  We bypass the
+      library entirely and try three strategies in order, logging which wins.
+
+    Strategies (same base URL, same access_token query param):
+      A  func in query,  magnet_link in body, no extra None fields   ← most likely
+      B  func in body,   magnet_link in body, no extra None fields
+      C  new /api endpoint with Bearer auth (future-proofing)
     """
+    import httpx as _httpx
+
     client = await _get_client()
-    try:
-        result = await client.add_torrent(magnet_link=magnet)
-        log.info("[Seedr] Magnet submitted: hash=%s title=%s",
-                 getattr(result, "torrent_hash", "?"),
-                 getattr(result, "title", "?"))
-        return {
-            "result": True,
-            "user_torrent_id": getattr(result, "user_torrent_id", None),
-            "torrent_hash": getattr(result, "torrent_hash", ""),
-            "title": getattr(result, "title", ""),
-        }
-    finally:
-        await client.close()
+    token: str = client.token.access_token
+    await client.close()
+
+    _OAUTH_URL = "https://www.seedr.cc/oauth_test/resource.php"
+    _NEW_API    = "https://www.seedr.cc/api/torrent"
+
+    strategies = [
+        # A: func in query-string, correct field name, no spurious fields
+        dict(
+            method="post",
+            url=_OAUTH_URL,
+            params={"access_token": token, "func": "add_torrent"},
+            data={"magnet_link": magnet, "folder_id": "-1"},
+        ),
+        # B: func moved into POST body (some Seedr versions route on body)
+        dict(
+            method="post",
+            url=_OAUTH_URL,
+            params={"access_token": token},
+            data={"func": "add_torrent", "magnet_link": magnet, "folder_id": "-1"},
+        ),
+        # C: newer /api endpoint with Bearer token
+        dict(
+            method="post",
+            url=_NEW_API,
+            headers={"Authorization": f"Bearer {token}"},
+            data={"torrent_magnet": magnet, "folder_id": "-1"},
+        ),
+    ]
+
+    last_exc: Exception = RuntimeError("No strategies attempted.")
+    async with _httpx.AsyncClient(timeout=60) as http:
+        for idx, kwargs in enumerate(strategies, start=1):
+            label = chr(ord("A") + idx - 1)
+            try:
+                resp = await http.request(**kwargs)
+                log.debug(
+                    "[Seedr] add_magnet strategy %s → HTTP %d  body=%s",
+                    label, resp.status_code, resp.text[:120],
+                )
+                if resp.status_code == 404:
+                    log.warning("[Seedr] Strategy %s: 404 — trying next", label)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, dict) and data.get("result") is False:
+                    err = data.get("error", "unknown")
+                    raise RuntimeError(f"Seedr API error: {err}")
+                log.info(
+                    "[Seedr] Magnet submitted via strategy %s: hash=%s title=%s",
+                    label,
+                    data.get("torrent_hash", "?"),
+                    data.get("title", "?"),
+                )
+                return {
+                    "result": True,
+                    "user_torrent_id": data.get("user_torrent_id"),
+                    "torrent_hash": data.get("torrent_hash", ""),
+                    "title": data.get("title", ""),
+                }
+            except (_httpx.HTTPStatusError, RuntimeError) as exc:
+                log.warning("[Seedr] Strategy %s failed: %s", label, exc)
+                last_exc = exc
+                continue
+
+    raise RuntimeError(
+        f"[Seedr] All add_magnet strategies exhausted. Last error: {last_exc}"
+    )
 
 
 async def list_folder(folder_id: int = 0) -> dict:
