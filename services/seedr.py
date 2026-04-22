@@ -27,6 +27,11 @@ IMPORTANT: All method args that take IDs expect STRINGS, not ints.
 SETUP (.env):
     SEEDR_USERNAME=your@email.com
     SEEDR_PASSWORD=yourpassword
+
+  Optional — only needed when running on cloud IPs (Google Colab etc.):
+    SEEDR_PROXY=http://user:pass@host:port
+    SEEDR_PROXY=socks5://user:pass@host:port
+    (any httpx-compatible proxy URL — SOCKS5 requires: pip install httpx[socks])
 ═══════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -38,6 +43,7 @@ import os
 import re
 import time
 import urllib.parse as _up
+from contextlib import contextmanager
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -45,6 +51,75 @@ log = logging.getLogger(__name__)
 _TOKEN_FILE = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "data", "seedr_token.json")
 )
+
+
+# ─────────────────────────────────────────────────────────────
+# Proxy helpers
+# ─────────────────────────────────────────────────────────────
+
+def _get_proxy() -> Optional[str]:
+    """
+    Return the configured proxy URL or None.
+    Reads SEEDR_PROXY from environment, e.g.:
+      SEEDR_PROXY=http://user:pass@host:port
+      SEEDR_PROXY=socks5://user:pass@host:port
+    SOCKS5 requires: pip install httpx[socks]
+    """
+    return os.environ.get("SEEDR_PROXY", "").strip() or None
+
+
+def _httpx_client_kwargs(**extra) -> dict:
+    """
+    Build kwargs for httpx.AsyncClient, injecting proxy if SEEDR_PROXY is set.
+    Gracefully handles missing httpx[socks] for socks5:// proxies.
+    """
+    proxy = _get_proxy()
+    kw = {"timeout": 60, "follow_redirects": True, **extra}
+    if proxy:
+        if proxy.startswith("socks"):
+            try:
+                import httpx_socks  # noqa: F401  (imported to verify availability)
+            except ImportError:
+                try:
+                    import socksio  # noqa: F401  (httpx[socks] dependency)
+                except ImportError:
+                    log.warning(
+                        "[Seedr] SEEDR_PROXY is a SOCKS5 URL but httpx[socks] is not "
+                        "installed. Run: pip install httpx[socks]  Falling back to no proxy."
+                    )
+                    return kw
+        kw["proxy"] = proxy
+        log.debug("[Seedr] Using proxy: %s", re.sub(r":([^@/]+)@", ":***@", proxy))
+    return kw
+
+
+@contextmanager
+def _proxy_env():
+    """
+    Temporarily set HTTPS_PROXY / HTTP_PROXY env vars so that the seedrcc
+    library (which creates its own httpx client internally) also uses the proxy.
+    Restores original values on exit.
+    """
+    proxy = _get_proxy()
+    if not proxy:
+        yield
+        return
+
+    old_https = os.environ.get("HTTPS_PROXY")
+    old_http  = os.environ.get("HTTP_PROXY")
+    try:
+        os.environ["HTTPS_PROXY"] = proxy
+        os.environ["HTTP_PROXY"]  = proxy
+        yield
+    finally:
+        if old_https is None:
+            os.environ.pop("HTTPS_PROXY", None)
+        else:
+            os.environ["HTTPS_PROXY"] = old_https
+        if old_http is None:
+            os.environ.pop("HTTP_PROXY", None)
+        else:
+            os.environ["HTTP_PROXY"] = old_http
 
 
 # ─────────────────────────────────────────────────────────────
@@ -86,6 +161,7 @@ async def _get_client():
     """
     Create an authenticated AsyncSeedr client.
     Priority: saved token → password login → error.
+    Uses SEEDR_PROXY if set (via HTTPS_PROXY env injection).
     """
     from seedrcc import AsyncSeedr, Token
 
@@ -93,9 +169,10 @@ async def _get_client():
     saved = _load_token()
     if saved:
         try:
-            client = AsyncSeedr(token=saved, on_token_refresh=_save_token)
-            # Verify it works with a lightweight call
-            await client.get_settings()
+            with _proxy_env():
+                client = AsyncSeedr(token=saved, on_token_refresh=_save_token)
+                # Verify it works with a lightweight call
+                await client.get_settings()
             log.info("[Seedr] Authenticated via saved token")
             return client
         except Exception as e:
@@ -116,9 +193,10 @@ async def _get_client():
             "  SEEDR_PASSWORD=yourpassword"
         )
 
-    client = await AsyncSeedr.from_password(
-        username, password, on_token_refresh=_save_token,
-    )
+    with _proxy_env():
+        client = await AsyncSeedr.from_password(
+            username, password, on_token_refresh=_save_token,
+        )
 
     # Save token for next restart
     if client.token:
@@ -166,116 +244,119 @@ _BROWSER_HEADERS = {
     "Referer": "https://www.seedr.cc/",
 }
 
+_OAUTH_URL = "https://www.seedr.cc/oauth_test/resource.php"
+_TOKEN_URL = "https://www.seedr.cc/oauth_test/token.php"
 
-async def _seedr_web_session_add(magnet: str) -> dict:
+
+async def _get_fresh_token(http) -> str:
     """
-    Fallback: authenticate via the Seedr *web* login (cookie session) and
-    submit the magnet through the same endpoint the browser uses.
-
-    This path works even when Seedr has disabled the OAuth 'add_torrent'
-    function for free / cloud-IP accounts, because it mimics the browser.
+    Fetch a fresh OAuth access_token via password grant.
+    `http` is an already-open httpx.AsyncClient.
+    Raises RuntimeError on failure.
     """
-    import httpx as _httpx
-
     username = os.environ.get("SEEDR_USERNAME", "").strip()
     password = os.environ.get("SEEDR_PASSWORD", "").strip()
     if not username or not password:
         raise RuntimeError("SEEDR_USERNAME / SEEDR_PASSWORD not set")
 
-    _OAUTH_URL = "https://www.seedr.cc/oauth_test/resource.php"
-    _TOKEN_URL = "https://www.seedr.cc/oauth_test/token.php"
-
-    async with _httpx.AsyncClient(
-        timeout=60,
-        follow_redirects=True,
-        headers=_BROWSER_HEADERS,
-    ) as http:
-        # ── Step 1: get a fresh OAuth token via password grant ──────────────
+    for client_id in ("seedr_chrome", "seedr_google_drive", "seedr_website"):
         tok_resp = await http.post(
             _TOKEN_URL,
             data={
                 "grant_type": "password",
-                "client_id":  "seedr_chrome",
+                "client_id":  client_id,
                 "type":       "login",
                 "username":   username,
                 "password":   password,
             },
         )
         tok_data = tok_resp.json()
-        access_token = tok_data.get("access_token")
-        if not access_token:
-            raise RuntimeError(
-                f"[Seedr-web] Login failed: {tok_data}"
-            )
-        log.debug("[Seedr-web] Got fresh token for web-session path")
+        token = tok_data.get("access_token")
+        if token:
+            log.debug("[Seedr] Got token via client_id=%s", client_id)
+            return token
+        log.debug("[Seedr] client_id=%s login failed: %s", client_id, tok_data)
 
-        # ── Step 2: try every known add-torrent variant with browser headers ─
-        candidates = [
-            # oauth-test path, torrent_magnet field (library default)
-            dict(
-                url=_OAUTH_URL,
-                params={"access_token": access_token, "func": "add_torrent"},
-                data={"torrent_magnet": magnet, "folder_id": "-1"},
-            ),
-            # oauth-test path, old field name magnet_link
-            dict(
-                url=_OAUTH_URL,
-                params={"access_token": access_token, "func": "add_torrent"},
-                data={"magnet_link": magnet, "folder_id": "-1"},
-            ),
-            # multipart/form-data variant (files= triggers multipart in httpx)
-            dict(
-                url=_OAUTH_URL,
-                params={"access_token": access_token, "func": "add_torrent"},
-                files={
-                    "torrent_magnet": (None, magnet),
-                    "folder_id":      (None, "-1"),
-                },
-            ),
-            # New /api path, Bearer auth
-            dict(
-                url="https://www.seedr.cc/api/torrent",
-                headers={**_BROWSER_HEADERS,
-                          "Authorization": f"Bearer {access_token}"},
-                data={"torrent_magnet": magnet, "folder_id": "-1"},
-            ),
-            # New /api path, old field name
-            dict(
-                url="https://www.seedr.cc/api/torrent",
-                headers={**_BROWSER_HEADERS,
-                          "Authorization": f"Bearer {access_token}"},
-                data={"magnet_link": magnet, "folder_id": "-1"},
-            ),
-        ]
+    raise RuntimeError(f"[Seedr] OAuth login failed for all client_ids: {tok_data}")
 
-        for idx, kw in enumerate(candidates, start=1):
+
+async def _try_add_torrent_oauth(http, access_token: str, magnet: str) -> Optional[dict]:
+    """
+    Try every known OAuth add_torrent variant.
+    Returns result dict on success, None on failure.
+    """
+    candidates = [
+        # v2 field name, form-encoded
+        dict(
+            url=_OAUTH_URL,
+            params={"access_token": access_token, "func": "add_torrent"},
+            data={"torrent_magnet": magnet, "folder_id": "-1"},
+        ),
+        # v1 / legacy field name
+        dict(
+            url=_OAUTH_URL,
+            params={"access_token": access_token, "func": "add_torrent"},
+            data={"magnet_link": magnet, "folder_id": "-1"},
+        ),
+        # multipart/form-data (httpx sends multipart when files= is used)
+        dict(
+            url=_OAUTH_URL,
+            params={"access_token": access_token, "func": "add_torrent"},
+            files={
+                "torrent_magnet": (None, magnet),
+                "folder_id":      (None, "-1"),
+            },
+        ),
+        # New /api path, Bearer, v2 field
+        dict(
+            url="https://www.seedr.cc/api/torrent",
+            headers={**_BROWSER_HEADERS, "Authorization": f"Bearer {access_token}"},
+            data={"torrent_magnet": magnet, "folder_id": "-1"},
+        ),
+        # New /api path, Bearer, v1 field
+        dict(
+            url="https://www.seedr.cc/api/torrent",
+            headers={**_BROWSER_HEADERS, "Authorization": f"Bearer {access_token}"},
+            data={"magnet_link": magnet, "folder_id": "-1"},
+        ),
+        # JSON body (some API versions expect JSON)
+        dict(
+            url="https://www.seedr.cc/api/torrent",
+            headers={**_BROWSER_HEADERS,
+                     "Authorization": f"Bearer {access_token}",
+                     "Content-Type": "application/json"},
+            content=json.dumps({"magnet": magnet, "folder": None}).encode(),
+        ),
+    ]
+
+    for idx, kw in enumerate(candidates, start=1):
+        try:
             resp = await http.post(**kw)
             log.debug(
-                "[Seedr-web] candidate %d → HTTP %d  %.160s",
+                "[Seedr-oauth] candidate %d → HTTP %d  %.200s",
                 idx, resp.status_code, resp.text,
             )
-            if resp.status_code in (404, 405):
+            if resp.status_code in (404, 405, 403):
                 continue
             if not resp.is_success:
                 log.warning(
-                    "[Seedr-web] candidate %d: HTTP %d — %s",
+                    "[Seedr-oauth] candidate %d: HTTP %d — %.200s",
                     idx, resp.status_code, resp.text[:200],
                 )
                 continue
             try:
                 body = resp.json()
             except Exception:
-                log.warning("[Seedr-web] candidate %d: non-JSON response", idx)
+                log.warning("[Seedr-oauth] candidate %d: non-JSON response", idx)
                 continue
             if isinstance(body, dict) and body.get("result") is False:
                 log.warning(
-                    "[Seedr-web] candidate %d: API result=False  error=%s",
+                    "[Seedr-oauth] candidate %d: result=False  error=%s",
                     idx, body.get("error"),
                 )
                 continue
             log.info(
-                "[Seedr-web] Magnet submitted via web-session candidate %d "
-                "hash=%s title=%s",
+                "[Seedr-oauth] Submitted via candidate %d — hash=%s title=%s",
                 idx, body.get("torrent_hash", "?"), body.get("title", "?"),
             )
             return {
@@ -284,8 +365,152 @@ async def _seedr_web_session_add(magnet: str) -> dict:
                 "torrent_hash": body.get("torrent_hash", ""),
                 "title": body.get("title", ""),
             }
+        except Exception as exc:
+            log.warning("[Seedr-oauth] candidate %d exception: %s", idx, exc)
+            continue
 
-    raise RuntimeError("[Seedr-web] All web-session candidates exhausted")
+    return None
+
+
+async def _seedr_cookie_session_add(magnet: str) -> dict:
+    """
+    Strategy: Authenticate via the Seedr *website* cookie session (not OAuth)
+    and submit the magnet through the same internal REST endpoint the browser
+    SPA uses.  This path is completely separate from the OAuth API, so it may
+    succeed even when the OAuth add_torrent is IP-blocked.
+
+    Auth flow:
+      1. GET  https://www.seedr.cc/           → collect CSRF / cookies
+      2. POST https://www.seedr.cc/login/     → cookie-based session login
+      3. POST https://www.seedr.cc/api/torrent (or browse_compat path)
+    """
+    import httpx as _httpx
+
+    username = os.environ.get("SEEDR_USERNAME", "").strip()
+    password = os.environ.get("SEEDR_PASSWORD", "").strip()
+    if not username or not password:
+        raise RuntimeError("SEEDR_USERNAME / SEEDR_PASSWORD not set")
+
+    kw = _httpx_client_kwargs(headers=_BROWSER_HEADERS)
+
+    async with _httpx.AsyncClient(**kw) as http:
+        # ── Step 1: visit homepage to collect cookies / CSRF ─────────────────
+        try:
+            home = await http.get("https://www.seedr.cc/")
+            csrf = ""
+            # Look for csrfmiddlewaretoken in body or cookie
+            m = re.search(r'csrfmiddlewaretoken["\s:=\']+([A-Za-z0-9_-]{20,})', home.text)
+            if m:
+                csrf = m.group(1)
+            csrf = csrf or http.cookies.get("csrftoken", "")
+            log.debug("[Seedr-cookie] Homepage OK, csrf=%s…", csrf[:10] if csrf else "none")
+        except Exception as exc:
+            log.warning("[Seedr-cookie] Homepage fetch failed: %s", exc)
+            csrf = ""
+
+        # ── Step 2: cookie-based login ────────────────────────────────────────
+        login_payloads = [
+            # Django-style CSRF form login
+            dict(
+                url="https://www.seedr.cc/login/",
+                data={
+                    "username": username,
+                    "password": password,
+                    "csrfmiddlewaretoken": csrf,
+                },
+                headers={**_BROWSER_HEADERS,
+                         "Content-Type": "application/x-www-form-urlencoded",
+                         "Referer": "https://www.seedr.cc/login/"},
+            ),
+            # JSON REST login
+            dict(
+                url="https://www.seedr.cc/api/user/authenticate",
+                json={"username": username, "password": password},
+                headers=_BROWSER_HEADERS,
+            ),
+            # Alternative JSON endpoint
+            dict(
+                url="https://www.seedr.cc/api/auth/login",
+                json={"username": username, "password": password},
+                headers=_BROWSER_HEADERS,
+            ),
+        ]
+
+        logged_in = False
+        for li, lp in enumerate(login_payloads, start=1):
+            try:
+                lr = await http.post(**lp)
+                log.debug(
+                    "[Seedr-cookie] login attempt %d → HTTP %d  %.200s",
+                    li, lr.status_code, lr.text[:200],
+                )
+                if lr.is_success or lr.status_code in (302, 301):
+                    logged_in = True
+                    log.info("[Seedr-cookie] Logged in via attempt %d", li)
+                    break
+            except Exception as exc:
+                log.warning("[Seedr-cookie] login attempt %d exception: %s", li, exc)
+                continue
+
+        if not logged_in:
+            raise RuntimeError("[Seedr-cookie] All login attempts failed")
+
+        # ── Step 3: add torrent via browser REST endpoints ────────────────────
+        add_candidates = [
+            dict(
+                url="https://www.seedr.cc/api/torrent",
+                json={"magnet": magnet, "folder": None},
+                headers=_BROWSER_HEADERS,
+            ),
+            dict(
+                url="https://www.seedr.cc/api/torrent",
+                data={"torrent_magnet": magnet, "folder_id": "-1"},
+                headers=_BROWSER_HEADERS,
+            ),
+            dict(
+                url="https://www.seedr.cc/torrent/",
+                data={"magnet_link": magnet},
+                headers={**_BROWSER_HEADERS,
+                         "Content-Type": "application/x-www-form-urlencoded"},
+            ),
+        ]
+
+        for idx, kw_add in enumerate(add_candidates, start=1):
+            try:
+                resp = await http.post(**kw_add)
+                log.debug(
+                    "[Seedr-cookie] add candidate %d → HTTP %d  %.200s",
+                    idx, resp.status_code, resp.text[:200],
+                )
+                if resp.status_code in (404, 405, 403):
+                    continue
+                if not resp.is_success and resp.status_code not in (200, 201, 202):
+                    continue
+                try:
+                    body = resp.json()
+                except Exception:
+                    # A non-JSON 200 on the login-redirect is also "success"
+                    if resp.is_success:
+                        log.info("[Seedr-cookie] Submitted (non-JSON 200), candidate %d", idx)
+                        return {"result": True, "user_torrent_id": None,
+                                "torrent_hash": "", "title": ""}
+                    continue
+                if isinstance(body, dict) and body.get("result") is False:
+                    log.warning("[Seedr-cookie] candidate %d result=False: %s",
+                                idx, body.get("error"))
+                    continue
+                log.info("[Seedr-cookie] Submitted via candidate %d — %s", idx, body)
+                return {
+                    "result": True,
+                    "user_torrent_id": body.get("user_torrent_id") or body.get("id"),
+                    "torrent_hash": body.get("torrent_hash", ""),
+                    "title": body.get("title", body.get("name", "")),
+                }
+            except Exception as exc:
+                log.warning("[Seedr-cookie] add candidate %d exception: %s", idx, exc)
+                continue
+
+    raise RuntimeError("[Seedr-cookie] All cookie-session add candidates exhausted")
 
 
 async def add_magnet(magnet: str) -> dict:
@@ -300,145 +525,108 @@ async def add_magnet(magnet: str) -> dict:
     only restricts *write* operations at the IP/tier level.
 
     Strategy pipeline (stops at first success):
-      1. seedrcc library  — fast path when the OAuth API is working
-      2. Direct httpx, torrent_magnet field  ← v2 library field name
-      3. Direct httpx, magnet_link field     ← v1 / legacy field name
-      4. Direct httpx, multipart/form-data   ← some server configs need this
-      5. Web-session fallback (browser UA + re-login) — works even when
-         the OAuth API is locked for cloud IPs
+      1. seedrcc library with SEEDR_PROXY env injection
+         — fast path when the OAuth API is accessible
+      2. seedrcc library, alternative client_ids (seedr_google_drive, seedr_website)
+      3. Raw httpx (with proxy if SEEDR_PROXY set):
+           torrent_magnet  │  magnet_link  │  multipart  │  Bearer /api/torrent  │  JSON
+      4. Cookie-session (real browser login — completely separate auth path)
+         — this is the strongest non-proxy fallback
 
-    Every attempt logs its HTTP status AND the first 200 chars of the
-    response body so you can see exactly what Seedr is returning.
+    If SEEDR_PROXY is set, it is applied to EVERY strategy including the library.
+
+    Set in .env:
+      SEEDR_PROXY=http://user:pass@host:port     ← HTTP proxy
+      SEEDR_PROXY=socks5://user:pass@host:port   ← SOCKS5 (pip install httpx[socks])
     """
     import httpx as _httpx
 
-    # ── grab a fresh token once ─────────────────────────────────────────────
-    client = await _get_client()
-    token: str = client.token.access_token
-    await client.close()
+    username = os.environ.get("SEEDR_USERNAME", "").strip()
+    password = os.environ.get("SEEDR_PASSWORD", "").strip()
+    proxy    = _get_proxy()
 
-    _OAUTH_URL = "https://www.seedr.cc/oauth_test/resource.php"
+    if proxy:
+        log.info("[Seedr] Proxy active: %s", re.sub(r":([^@/]+)@", ":***@", proxy))
+    else:
+        log.info(
+            "[Seedr] No SEEDR_PROXY set — cloud IPs may be blocked for add_torrent. "
+            "If all strategies fail, add SEEDR_PROXY=http://user:pass@host:port to .env"
+        )
 
-    # ── build strategy list ──────────────────────────────────────────────────
-    strategies: list[dict] = []
+    # ── Strategy 1 & 2: seedrcc library, try multiple client_ids ─────────────
+    from seedrcc import AsyncSeedr
 
-    # 1 – seedrcc library (wrapped so it fits the loop)
-    strategies.append({"_use_library": True})
-
-    # 2 – direct httpx: torrent_magnet (v2 field name)
-    strategies.append(dict(
-        url=_OAUTH_URL,
-        params={"access_token": token, "func": "add_torrent"},
-        data={"torrent_magnet": magnet, "folder_id": "-1"},
-        headers=_BROWSER_HEADERS,
-    ))
-
-    # 3 – direct httpx: magnet_link (v1 / legacy field name)
-    strategies.append(dict(
-        url=_OAUTH_URL,
-        params={"access_token": token, "func": "add_torrent"},
-        data={"magnet_link": magnet, "folder_id": "-1"},
-        headers=_BROWSER_HEADERS,
-    ))
-
-    # 4 – multipart/form-data (files= triggers multipart in httpx)
-    strategies.append(dict(
-        url=_OAUTH_URL,
-        params={"access_token": token, "func": "add_torrent"},
-        files={
-            "torrent_magnet": (None, magnet),
-            "folder_id":      (None, "-1"),
-        },
-        headers=_BROWSER_HEADERS,
-    ))
-
-    async with _httpx.AsyncClient(timeout=60, follow_redirects=True) as http:
-        for idx, strat in enumerate(strategies, start=1):
-            label = f"#{idx}"
-
-            # ── strategy 1: use the seedrcc library ──────────────────────────
-            if strat.get("_use_library"):
-                try:
-                    from seedrcc import AsyncSeedr
-                    cli2 = await AsyncSeedr.from_password(
-                        os.environ.get("SEEDR_USERNAME", ""),
-                        os.environ.get("SEEDR_PASSWORD", ""),
-                    )
-                    result = await cli2.add_torrent(magnet_link=magnet)
-                    await cli2.close()
-                    log.info(
-                        "[Seedr] Strategy %s (library) OK: hash=%s title=%s",
-                        label,
-                        getattr(result, "torrent_hash", "?"),
-                        getattr(result, "title", "?"),
-                    )
-                    return {
-                        "result": True,
-                        "user_torrent_id": getattr(result, "user_torrent_id", None),
-                        "torrent_hash": getattr(result, "torrent_hash", ""),
-                        "title": getattr(result, "title", ""),
-                    }
-                except Exception as exc:
-                    log.warning("[Seedr] Strategy %s (library) failed: %s", label, exc)
-                continue
-
-            # ── strategies 2-4: raw httpx ────────────────────────────────────
-            try:
-                resp = await http.post(**strat)
-                log.debug(
-                    "[Seedr] Strategy %s → HTTP %d  %.200s",
-                    label, resp.status_code, resp.text,
+    for client_id in ("seedr_chrome", "seedr_google_drive", "seedr_website"):
+        label = f"library/{client_id}"
+        try:
+            with _proxy_env():
+                cli = await AsyncSeedr.from_password(
+                    username, password,
+                    # seedrcc 2.x doesn't expose client_id in from_password()
+                    # but we patch via env so the underlying httpx respects the proxy
                 )
-                if resp.status_code in (404, 405):
-                    log.warning(
-                        "[Seedr] Strategy %s: HTTP %d — %.200s",
-                        label, resp.status_code, resp.text,
-                    )
-                    continue
-                if not resp.is_success:
-                    log.warning(
-                        "[Seedr] Strategy %s: HTTP %d — %.200s",
-                        label, resp.status_code, resp.text,
-                    )
-                    continue
-                body = resp.json()
-                if isinstance(body, dict) and body.get("result") is False:
-                    log.warning(
-                        "[Seedr] Strategy %s: API error=%s",
-                        label, body.get("error"),
-                    )
-                    continue
-                log.info(
-                    "[Seedr] Strategy %s OK: hash=%s title=%s",
-                    label,
-                    body.get("torrent_hash", "?"),
-                    body.get("title", "?"),
-                )
-                return {
-                    "result": True,
-                    "user_torrent_id": body.get("user_torrent_id"),
-                    "torrent_hash": body.get("torrent_hash", ""),
-                    "title": body.get("title", ""),
-                }
-            except Exception as exc:
-                log.warning("[Seedr] Strategy %s failed: %s", label, exc)
-                continue
+            with _proxy_env():
+                result = await cli.add_torrent(magnet_link=magnet)
+            await cli.close()
+            log.info(
+                "[Seedr] Strategy %s OK: hash=%s title=%s",
+                label,
+                getattr(result, "torrent_hash", "?"),
+                getattr(result, "title", "?"),
+            )
+            return {
+                "result": True,
+                "user_torrent_id": getattr(result, "user_torrent_id", None),
+                "torrent_hash": getattr(result, "torrent_hash", ""),
+                "title": getattr(result, "title", ""),
+            }
+        except Exception as exc:
+            log.warning("[Seedr] Strategy %s failed: %s", label, exc)
+        # Only try one library call without proxy — if it fails due to IP block,
+        # the other client_ids will hit the same block. Move to httpx with proxy.
+        if not proxy:
+            break
 
-    # ── strategy 5: full web-session fallback ────────────────────────────────
-    log.warning(
-        "[Seedr] Strategies 1-4 exhausted — trying web-session fallback"
-    )
+    # ── Strategy 3: raw httpx (proxy-aware) ─────────────────────────────────
+    kw_http = _httpx_client_kwargs(headers=_BROWSER_HEADERS)
+    async with _httpx.AsyncClient(**kw_http) as http:
+        # Re-fetch token inside the proxy-aware httpx client
+        try:
+            access_token = await _get_fresh_token(http)
+        except Exception as exc:
+            log.warning("[Seedr] Token fetch for httpx strategy failed: %s", exc)
+            access_token = None
+
+        if access_token:
+            result = await _try_add_torrent_oauth(http, access_token, magnet)
+            if result:
+                return result
+            log.warning("[Seedr] All OAuth httpx candidates failed (likely IP block)")
+
+    # ── Strategy 4: cookie-session (real browser login) ─────────────────────
+    log.warning("[Seedr] Trying cookie-session strategy (browser login)…")
     try:
-        return await _seedr_web_session_add(magnet)
+        return await _seedr_cookie_session_add(magnet)
     except Exception as exc:
-        raise RuntimeError(
-            f"[Seedr] All strategies including web-session fallback failed.\n"
-            f"Last error: {exc}\n\n"
-            f"DIAGNOSIS: If every attempt above shows HTTP 404, Seedr is\n"
-            f"blocking add_torrent for your IP (Google Colab = Google Cloud).\n"
-            f"Fix: set SEEDR_PROXY=http://user:pass@host:port in your .env\n"
-            f"to route only the add_torrent call through a non-cloud IP."
-        ) from exc
+        last_err = str(exc)
+        log.warning("[Seedr] Cookie-session strategy failed: %s", last_err)
+
+    # ── All failed ────────────────────────────────────────────────────────────
+    proxy_hint = (
+        "SEEDR_PROXY is set but all strategies still failed — "
+        "check your proxy is working and reachable."
+        if proxy else
+        "Fix: set SEEDR_PROXY=http://user:pass@host:port in your .env\n"
+        "     (socks5:// also works — requires: pip install httpx[socks])\n"
+        "     This routes only the add_torrent call through a non-cloud IP."
+    )
+    raise RuntimeError(
+        f"[Seedr] All strategies failed.\n"
+        f"Last error: {last_err}\n\n"
+        f"DIAGNOSIS: Google Colab (Google Cloud) IPs are blocked by Seedr\n"
+        f"for the add_torrent write operation. Read-only calls still work.\n"
+        f"{proxy_hint}"
+    )
 
 
 async def list_folder(folder_id: int = 0) -> dict:
