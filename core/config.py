@@ -94,6 +94,16 @@ class Config:
     fc_api_key: str = field(default_factory=lambda:
         os.environ.get("FC_API_KEY", ""))
 
+    # Seedr proxy — HTTP or SOCKS5 URL routed only to add_torrent write calls.
+    # Required on cloud IPs (Google Colab, Render, Railway, etc.) because Seedr
+    # blocks add_torrent from those IP ranges while read-only calls still work.
+    # Examples:
+    #   http://user:pass@host:port
+    #   socks5://user:pass@host:port   (needs: pip install httpx[socks])
+    # Leave empty on a VPS or home server with a clean IP.
+    seedr_proxy: str = field(default_factory=lambda:
+        os.environ.get("SEEDR_PROXY", "").strip())
+
     @property
     def file_limit_b(self) -> int:
         return self.file_limit_mb * 1024 * 1024
