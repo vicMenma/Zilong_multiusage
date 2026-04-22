@@ -9,7 +9,15 @@
 # @markdown | `OWNER_ID` | ✅ |
 # @markdown | `CC_API_KEY` | CloudConvert hardsub |
 # @markdown | `FC_API_KEY` | FreeConvert convert/compress (comma-sep for multiple) |
+# @markdown | `SEEDR_USERNAME` | Seedr cloud torrent |
+# @markdown | `SEEDR_PASSWORD` | Seedr cloud torrent |
+# @markdown | `SEEDR_PROXY` | **Required on Colab** — routes Seedr write calls through a non-cloud IP |
 # @markdown | `GITHUB_TOKEN` | private repo |
+# @markdown
+# @markdown **SEEDR_PROXY formats:**
+# @markdown - HTTP:   `http://user:pass@host:port`
+# @markdown - SOCKS5: `socks5://user:pass@host:port`
+# @markdown - Free proxies: [webshare.io](https://webshare.io) (10 free, no CC)
 
 API_ID    = 0      # @param {type:"integer"}
 API_HASH  = ""     # @param {type:"string"}
@@ -25,6 +33,7 @@ CC_API_KEY        = ""  # @param {type:"string"}
 FC_API_KEY        = ""  # @param {type:"string"}  ← supports key1,key2,key3
 SEEDR_USERNAME    = ""  # @param {type:"string"}
 SEEDR_PASSWORD    = ""  # @param {type:"string"}
+SEEDR_PROXY       = ""  # @param {type:"string"}  ← http://user:pass@host:port  OR  socks5://user:pass@host:port
 GITHUB_TOKEN      = ""  # @param {type:"string"}
 WEBHOOK_BASE_URL  = ""  # @param {type:"string"}
 
@@ -76,6 +85,7 @@ CC_API_KEY        = _secret("CC_API_KEY")        or CC_API_KEY
 FC_API_KEY        = _secret("FC_API_KEY")        or FC_API_KEY   # FIX: was missing
 SEEDR_USERNAME    = _secret("SEEDR_USERNAME")    or SEEDR_USERNAME
 SEEDR_PASSWORD    = _secret("SEEDR_PASSWORD")    or SEEDR_PASSWORD
+SEEDR_PROXY       = _secret("SEEDR_PROXY")       or SEEDR_PROXY
 GITHUB_TOKEN      = _secret("GITHUB_TOKEN")      or GITHUB_TOKEN
 WEBHOOK_BASE_URL  = _secret("WEBHOOK_BASE_URL")  or WEBHOOK_BASE_URL
 
@@ -91,6 +101,15 @@ if errors:
 _log("OK", f"API_ID={API_ID}  OWNER_ID={OWNER_ID}")
 if CC_API_KEY: _log("OK", f"CC_API_KEY: {len(CC_API_KEY.split(','))} key(s)")
 if FC_API_KEY: _log("OK", f"FC_API_KEY: {len(FC_API_KEY.split(','))} key(s)")
+if SEEDR_USERNAME: _log("OK", f"SEEDR_USERNAME: {SEEDR_USERNAME[:3]}***")
+if SEEDR_PROXY:
+    import re as _re_proxy
+    _proxy_display = _re_proxy.sub(r":([^@/]+)@", ":***@", SEEDR_PROXY)
+    _log("OK", f"SEEDR_PROXY: {_proxy_display}")
+else:
+    if SEEDR_USERNAME:
+        _log("WARN", "SEEDR_PROXY not set — add_torrent WILL fail on Colab IPs. "
+             "Set SEEDR_PROXY in Secrets or the form above.")
 if WEBHOOK_BASE_URL: _log("OK", f"WEBHOOK_BASE_URL: {WEBHOOK_BASE_URL}")
 
 _log("STEP", "Installing system packages…")
@@ -529,6 +548,515 @@ if os.path.exists(_fc_api_path):
     else:
         _log("INFO", "freeconvert_api.py FC-01/02 already clean")
 
+
+# ── INJECT 4: services/seedr.py — proxy-aware rewrite ─────────────────────
+# Replaces the repo's seedr.py with a version that:
+#   1. Reads SEEDR_PROXY and passes it to every httpx.AsyncClient call
+#   2. Injects HTTPS_PROXY env var so the seedrcc library also routes via proxy
+#   3. Tries multiple OAuth client_ids (seedr_chrome / seedr_google_drive / seedr_website)
+#   4. Adds a cookie-session strategy (genuine browser login, not OAuth)
+#   5. Gives a clear error if add_torrent still fails, explaining the proxy fix
+_write_file("services/seedr.py", '''\
+"""
+services/seedr.py
+Seedr.cc cloud torrent client — uses seedrcc v2.0.2 library.
+
+\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+METHOD NAMES VERIFIED FROM ACTUAL seedrcc v2.0.2 SOURCE CODE:
+  AsyncSeedr.from_password(username, password, on_token_refresh=)
+  AsyncSeedr(token=Token(...), on_token_refresh=)
+  client.add_torrent(magnet_link=\'magnet:?...\')
+  client.list_contents(folder_id=\'0\')
+  client.fetch_file(file_id: str)
+  client.delete_folder(folder_id: str)
+  client.get_settings()
+  client.close()
+
+SETUP (.env):
+    SEEDR_USERNAME=your@email.com
+    SEEDR_PASSWORD=yourpassword
+    SEEDR_PROXY=http://user:pass@host:port        # optional, cloud IPs only
+    SEEDR_PROXY=socks5://user:pass@host:port      # SOCKS5 variant
+\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+"""
+from __future__ import annotations
+import asyncio, json, logging, os, re, time, urllib.parse as _up
+from contextlib import contextmanager
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+_TOKEN_FILE = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "data", "seedr_token.json")
+)
+
+
+# ── Proxy helpers ─────────────────────────────────────────────────────────────
+
+def _get_proxy() -> Optional[str]:
+    return os.environ.get("SEEDR_PROXY", "").strip() or None
+
+
+def _httpx_client_kwargs(**extra) -> dict:
+    proxy = _get_proxy()
+    kw = {"timeout": 60, "follow_redirects": True, **extra}
+    if proxy:
+        if proxy.startswith("socks"):
+            try:
+                import socksio  # noqa: F401
+            except ImportError:
+                log.warning(
+                    "[Seedr] SEEDR_PROXY is socks5 but httpx[socks] not installed. "
+                    "Run: pip install httpx[socks]  Falling back to no proxy."
+                )
+                return kw
+        kw["proxy"] = proxy
+        log.debug("[Seedr] Using proxy: %s", re.sub(r":([^@/]+)@", ":***@", proxy))
+    return kw
+
+
+@contextmanager
+def _proxy_env():
+    """Temporarily set HTTPS_PROXY so seedrcc\'s internal httpx also uses proxy."""
+    proxy = _get_proxy()
+    if not proxy:
+        yield
+        return
+    old_https = os.environ.get("HTTPS_PROXY")
+    old_http  = os.environ.get("HTTP_PROXY")
+    try:
+        os.environ["HTTPS_PROXY"] = proxy
+        os.environ["HTTP_PROXY"]  = proxy
+        yield
+    finally:
+        if old_https is None: os.environ.pop("HTTPS_PROXY", None)
+        else: os.environ["HTTPS_PROXY"] = old_https
+        if old_http is None: os.environ.pop("HTTP_PROXY", None)
+        else: os.environ["HTTP_PROXY"] = old_http
+
+
+# ── Token persistence ─────────────────────────────────────────────────────────
+
+def _save_token(token) -> None:
+    try:
+        os.makedirs(os.path.dirname(_TOKEN_FILE), exist_ok=True)
+        with open(_TOKEN_FILE, "w", encoding="utf-8") as f:
+            f.write(token.to_json())
+    except Exception as e:
+        log.warning("[Seedr] Token save error: %s", e)
+
+
+def _load_token():
+    try:
+        from seedrcc import Token
+        with open(_TOKEN_FILE, encoding="utf-8") as f:
+            raw = f.read().strip()
+        return Token.from_json(raw) if raw else None
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log.warning("[Seedr] Token load error: %s", e)
+        return None
+
+
+# ── Client factory ────────────────────────────────────────────────────────────
+
+async def _get_client():
+    from seedrcc import AsyncSeedr, Token
+    saved = _load_token()
+    if saved:
+        try:
+            with _proxy_env():
+                client = AsyncSeedr(token=saved, on_token_refresh=_save_token)
+                await client.get_settings()
+            log.info("[Seedr] Authenticated via saved token")
+            return client
+        except Exception as e:
+            log.warning("[Seedr] Saved token expired (%s) — re-authenticating", e)
+            try: await client.close()
+            except Exception: pass
+
+    username = os.environ.get("SEEDR_USERNAME", "").strip()
+    password = os.environ.get("SEEDR_PASSWORD", "").strip()
+    if not username or not password:
+        raise RuntimeError(
+            "Seedr credentials not configured.\\n"
+            "Add SEEDR_USERNAME and SEEDR_PASSWORD to your .env"
+        )
+    with _proxy_env():
+        client = await AsyncSeedr.from_password(username, password, on_token_refresh=_save_token)
+    if client.token:
+        _save_token(client.token)
+    log.info("[Seedr] Authenticated via password login")
+    return client
+
+
+# ── Public helpers ────────────────────────────────────────────────────────────
+
+async def check_credentials() -> bool:
+    try:
+        client = await _get_client(); await client.close(); return True
+    except Exception as e:
+        log.warning("[Seedr] Credential check failed: %s", e); return False
+
+
+async def get_storage_info() -> dict:
+    client = await _get_client()
+    try:
+        root = await client.list_contents(folder_id="0")
+        total = int(root.space_max or 0); used = int(root.space_used or 0)
+        return {"total": total, "used": used, "free": total - used}
+    finally:
+        await client.close()
+
+
+# ── Browser-like headers ──────────────────────────────────────────────────────
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Origin":  "https://www.seedr.cc",
+    "Referer": "https://www.seedr.cc/",
+}
+
+_OAUTH_URL = "https://www.seedr.cc/oauth_test/resource.php"
+_TOKEN_URL = "https://www.seedr.cc/oauth_test/token.php"
+
+
+async def _get_fresh_token(http) -> str:
+    username = os.environ.get("SEEDR_USERNAME", "").strip()
+    password = os.environ.get("SEEDR_PASSWORD", "").strip()
+    for client_id in ("seedr_chrome", "seedr_google_drive", "seedr_website"):
+        r = await http.post(_TOKEN_URL, data={
+            "grant_type": "password", "client_id": client_id,
+            "type": "login", "username": username, "password": password,
+        })
+        tok = r.json().get("access_token")
+        if tok:
+            log.debug("[Seedr] Token via client_id=%s", client_id)
+            return tok
+    raise RuntimeError("[Seedr] OAuth login failed for all client_ids")
+
+
+async def _try_add_torrent_oauth(http, access_token: str, magnet: str) -> Optional[dict]:
+    candidates = [
+        dict(url=_OAUTH_URL, params={"access_token": access_token, "func": "add_torrent"},
+             data={"torrent_magnet": magnet, "folder_id": "-1"}),
+        dict(url=_OAUTH_URL, params={"access_token": access_token, "func": "add_torrent"},
+             data={"magnet_link": magnet, "folder_id": "-1"}),
+        dict(url=_OAUTH_URL, params={"access_token": access_token, "func": "add_torrent"},
+             files={"torrent_magnet": (None, magnet), "folder_id": (None, "-1")}),
+        dict(url="https://www.seedr.cc/api/torrent",
+             headers={**_BROWSER_HEADERS, "Authorization": f"Bearer {access_token}"},
+             data={"torrent_magnet": magnet, "folder_id": "-1"}),
+        dict(url="https://www.seedr.cc/api/torrent",
+             headers={**_BROWSER_HEADERS, "Authorization": f"Bearer {access_token}",
+                      "Content-Type": "application/json"},
+             content=json.dumps({"magnet": magnet, "folder": None}).encode()),
+    ]
+    for idx, kw in enumerate(candidates, 1):
+        try:
+            resp = await http.post(**kw)
+            log.debug("[Seedr-oauth] candidate %d → HTTP %d  %.200s", idx, resp.status_code, resp.text)
+            if resp.status_code in (404, 405, 403): continue
+            if not resp.is_success: continue
+            try: body = resp.json()
+            except Exception: continue
+            if isinstance(body, dict) and body.get("result") is False: continue
+            log.info("[Seedr-oauth] OK via candidate %d — hash=%s", idx, body.get("torrent_hash", "?"))
+            return {"result": True, "user_torrent_id": body.get("user_torrent_id"),
+                    "torrent_hash": body.get("torrent_hash", ""), "title": body.get("title", "")}
+        except Exception as exc:
+            log.warning("[Seedr-oauth] candidate %d: %s", idx, exc)
+    return None
+
+
+async def _seedr_cookie_session_add(magnet: str) -> dict:
+    """Genuine browser cookie-session login — completely separate from OAuth."""
+    import httpx as _httpx
+    username = os.environ.get("SEEDR_USERNAME", "").strip()
+    password = os.environ.get("SEEDR_PASSWORD", "").strip()
+    kw = _httpx_client_kwargs(headers=_BROWSER_HEADERS)
+    async with _httpx.AsyncClient(**kw) as http:
+        csrf = ""
+        try:
+            home = await http.get("https://www.seedr.cc/")
+            m = re.search(r\'csrfmiddlewaretoken["\s:=\\\']+([A-Za-z0-9_-]{20,})\', home.text)
+            if m: csrf = m.group(1)
+            csrf = csrf or http.cookies.get("csrftoken", "")
+        except Exception as exc:
+            log.warning("[Seedr-cookie] Homepage: %s", exc)
+
+        login_payloads = [
+            dict(url="https://www.seedr.cc/login/",
+                 data={"username": username, "password": password, "csrfmiddlewaretoken": csrf},
+                 headers={**_BROWSER_HEADERS, "Content-Type": "application/x-www-form-urlencoded",
+                          "Referer": "https://www.seedr.cc/login/"}),
+            dict(url="https://www.seedr.cc/api/user/authenticate",
+                 json={"username": username, "password": password}, headers=_BROWSER_HEADERS),
+            dict(url="https://www.seedr.cc/api/auth/login",
+                 json={"username": username, "password": password}, headers=_BROWSER_HEADERS),
+        ]
+        logged_in = False
+        for li, lp in enumerate(login_payloads, 1):
+            try:
+                lr = await http.post(**lp)
+                log.debug("[Seedr-cookie] login %d → HTTP %d", li, lr.status_code)
+                if lr.is_success or lr.status_code in (301, 302):
+                    logged_in = True; break
+            except Exception as exc:
+                log.warning("[Seedr-cookie] login %d: %s", li, exc)
+        if not logged_in:
+            raise RuntimeError("[Seedr-cookie] All login attempts failed")
+
+        for idx, add_kw in enumerate([
+            dict(url="https://www.seedr.cc/api/torrent",
+                 json={"magnet": magnet, "folder": None}, headers=_BROWSER_HEADERS),
+            dict(url="https://www.seedr.cc/api/torrent",
+                 data={"torrent_magnet": magnet, "folder_id": "-1"}, headers=_BROWSER_HEADERS),
+        ], 1):
+            try:
+                resp = await http.post(**add_kw)
+                log.debug("[Seedr-cookie] add %d → HTTP %d  %.200s", idx, resp.status_code, resp.text[:200])
+                if resp.status_code in (404, 405, 403): continue
+                if not resp.is_success: continue
+                try: body = resp.json()
+                except Exception:
+                    if resp.is_success:
+                        return {"result": True, "user_torrent_id": None, "torrent_hash": "", "title": ""}
+                    continue
+                if isinstance(body, dict) and body.get("result") is False: continue
+                return {"result": True, "user_torrent_id": body.get("user_torrent_id") or body.get("id"),
+                        "torrent_hash": body.get("torrent_hash", ""),
+                        "title": body.get("title", body.get("name", ""))}
+            except Exception as exc:
+                log.warning("[Seedr-cookie] add %d: %s", idx, exc)
+    raise RuntimeError("[Seedr-cookie] All cookie-session candidates exhausted")
+
+
+async def add_magnet(magnet: str) -> dict:
+    """
+    Submit a magnet link to Seedr.
+    Strategy pipeline (stops at first success):
+      1. seedrcc library   — with HTTPS_PROXY injected if SEEDR_PROXY is set
+      2. Raw httpx (proxy-aware): multiple OAuth candidates + /api/torrent
+      3. Cookie-session   — genuine browser login, completely separate from OAuth
+    """
+    import httpx as _httpx
+
+    username = os.environ.get("SEEDR_USERNAME", "").strip()
+    password = os.environ.get("SEEDR_PASSWORD", "").strip()
+    proxy    = _get_proxy()
+
+    if proxy:
+        log.info("[Seedr] Proxy: %s", re.sub(r":([^@/]+)@", ":***@", proxy))
+    else:
+        log.info("[Seedr] No SEEDR_PROXY — add_torrent may fail on cloud IPs")
+
+    # ── 1: seedrcc library ────────────────────────────────────────────────────
+    from seedrcc import AsyncSeedr
+    try:
+        with _proxy_env():
+            cli = await AsyncSeedr.from_password(username, password)
+        with _proxy_env():
+            result = await cli.add_torrent(magnet_link=magnet)
+        await cli.close()
+        log.info("[Seedr] Library OK: hash=%s", getattr(result, "torrent_hash", "?"))
+        return {"result": True,
+                "user_torrent_id": getattr(result, "user_torrent_id", None),
+                "torrent_hash": getattr(result, "torrent_hash", ""),
+                "title": getattr(result, "title", "")}
+    except Exception as exc:
+        log.warning("[Seedr] Library failed: %s", exc)
+
+    # ── 2: raw httpx (proxy-aware) ────────────────────────────────────────────
+    kw_http = _httpx_client_kwargs(headers=_BROWSER_HEADERS)
+    async with _httpx.AsyncClient(**kw_http) as http:
+        try:
+            access_token = await _get_fresh_token(http)
+            result = await _try_add_torrent_oauth(http, access_token, magnet)
+            if result:
+                return result
+        except Exception as exc:
+            log.warning("[Seedr] httpx OAuth failed: %s", exc)
+        log.warning("[Seedr] All OAuth candidates failed (likely IP block)")
+
+    # ── 3: cookie-session ─────────────────────────────────────────────────────
+    log.warning("[Seedr] Trying cookie-session strategy…")
+    try:
+        return await _seedr_cookie_session_add(magnet)
+    except Exception as exc:
+        last_err = str(exc)
+        log.warning("[Seedr] Cookie-session failed: %s", last_err)
+
+    proxy_hint = (
+        "SEEDR_PROXY is set but all strategies failed — check proxy is reachable."
+        if proxy else
+        "Fix: set SEEDR_PROXY=http://user:pass@host:port in .env or Colab Secrets.\\n"
+        "     Free proxies: webshare.io (10 free, no CC required)\\n"
+        "     SOCKS5 also works: SEEDR_PROXY=socks5://user:pass@host:port"
+    )
+    raise RuntimeError(
+        f"[Seedr] All strategies failed.\\nLast error: {last_err}\\n\\n"
+        f"DIAGNOSIS: Seedr blocks add_torrent from Google Cloud / Colab IPs.\\n"
+        f"{proxy_hint}"
+    )
+
+
+async def list_folder(folder_id: int = 0) -> dict:
+    client = await _get_client()
+    try:
+        root = await client.list_contents(folder_id=str(folder_id))
+        return {
+            "folders":  [{"id": f.id, "name": f.name, "size": f.size}
+                         for f in (root.folders or [])],
+            "files":    [{"folder_file_id": f.folder_file_id, "name": f.name,
+                          "size": f.size, "id": f.file_id}
+                         for f in (root.files or [])],
+            "torrents": [{"id": t.id, "name": t.name, "progress": t.progress,
+                          "size": t.size, "progress_url": getattr(t, "progress_url", None)}
+                         for t in (root.torrents or [])],
+            "space_used": root.space_used,
+            "space_max":  root.space_max,
+        }
+    finally:
+        await client.close()
+
+
+async def get_file_download_url(file_id: int) -> str:
+    client = await _get_client()
+    try:
+        result = await client.fetch_file(str(file_id))
+        url = getattr(result, "url", "")
+        if not url:
+            log.warning("[Seedr] fetch_file returned no URL for id=%s", file_id)
+        return url
+    finally:
+        await client.close()
+
+
+async def delete_folder(folder_id: int) -> None:
+    client = await _get_client()
+    try:
+        await client.delete_folder(str(folder_id))
+        log.info("[Seedr] Deleted folder id=%d", folder_id)
+    finally:
+        await client.close()
+
+
+async def poll_until_ready(
+    torrent_name_hint: str = "",
+    timeout_s: int = 3600,
+    progress_cb=None,
+    existing_folder_ids: Optional[set] = None,
+) -> dict:
+    if existing_folder_ids is None:
+        existing_folder_ids = set()
+    deadline = time.time() + timeout_s
+    last_pct = -1.0
+    while time.time() < deadline:
+        try:
+            root = await list_folder(0)
+            folders  = root.get("folders", [])
+            torrents = root.get("torrents", [])
+            downloading = []
+            for t in torrents:
+                try: pct = float(t.get("progress", "100"))
+                except (ValueError, TypeError): pct = 100.0
+                if pct < 100: downloading.append({**t, "_pct": pct})
+            new_folders = [
+                f for f in folders
+                if f.get("id") not in existing_folder_ids
+                and (not torrent_name_hint
+                     or torrent_name_hint.lower()[:20] in f.get("name", "").lower())
+            ]
+            if downloading:
+                dl = downloading[0]; pct = dl["_pct"]
+                if pct != last_pct:
+                    last_pct = pct
+                    if progress_cb: await progress_cb(pct, dl.get("name", ""))
+            elif new_folders:
+                folder = new_folders[-1]
+                log.info("[Seedr] Ready: %s (id=%s)", folder.get("name"), folder.get("id"))
+                return folder
+        except Exception as e:
+            log.warning("[Seedr] Poll error: %s", e)
+        await asyncio.sleep(10)
+    raise RuntimeError(f"Seedr download timed out after {timeout_s}s")
+
+
+async def get_file_urls(folder_id: int) -> list[dict]:
+    result: list[dict] = []
+    async def _collect(fid: int) -> None:
+        contents = await list_folder(fid)
+        for f in contents.get("files", []):
+            file_id = f.get("folder_file_id") or f.get("id")
+            if not file_id: continue
+            try:
+                dl_url = await get_file_download_url(file_id)
+                if dl_url:
+                    result.append({"name": f.get("name", "file"), "url": dl_url,
+                                   "size": int(f.get("size", 0))})
+            except Exception as e:
+                log.warning("[Seedr] File URL fetch failed for %s: %s", f.get("name"), e)
+        for sub in contents.get("folders", []):
+            if sub.get("id"):
+                try: await _collect(sub["id"])
+                except Exception as e: log.warning("[Seedr] Sub-folder error: %s", e)
+    await _collect(folder_id)
+    return result
+
+
+async def download_via_seedr(
+    magnet: str, dest: str, progress_cb=None, timeout_s: int = 3600,
+) -> list[str]:
+    from services.downloader import download_direct
+    from services.cc_sanitize import sanitize_filename
+    if progress_cb: await progress_cb("adding", 0.0, "Submitting to Seedr\u2026")
+    existing_folder_ids: set = set()
+    try:
+        root = await list_folder(0)
+        existing_folder_ids = {f.get("id") for f in root.get("folders", []) if f.get("id") is not None}
+        log.info("[Seedr] Baseline: %d existing folder(s)", len(existing_folder_ids))
+    except Exception as exc:
+        log.warning("[Seedr] Snapshot failed: %s", exc)
+    await add_magnet(magnet)
+    if progress_cb: await progress_cb("waiting", 0.0, "Seedr is downloading\u2026")
+    dn_match  = re.search(r"[&?]dn=([^&]+)", magnet)
+    name_hint = _up.unquote_plus(dn_match.group(1))[:50] if dn_match else ""
+    async def _poll_cb(pct, name):
+        if progress_cb: await progress_cb("downloading", pct, name)
+    folder    = await poll_until_ready(torrent_name_hint=name_hint, timeout_s=timeout_s,
+                                       progress_cb=_poll_cb, existing_folder_ids=existing_folder_ids)
+    folder_id = folder["id"]
+    if progress_cb: await progress_cb("fetching", 100.0, "Getting download links\u2026")
+    files = await get_file_urls(folder_id)
+    if not files: raise RuntimeError("Seedr returned no files.")
+    os.makedirs(dest, exist_ok=True)
+    local_paths = []
+    for i, f in enumerate(files):
+        raw_name   = f["name"]
+        clean_name = sanitize_filename(raw_name)
+        if progress_cb:
+            await progress_cb("dl_file", (i / len(files)) * 100,
+                              f"Downloading {clean_name} ({i+1}/{len(files)})\u2026")
+        try:
+            path = await download_direct(f["url"], dest)
+            if os.path.basename(path) != clean_name:
+                new_path = os.path.join(os.path.dirname(path), clean_name)
+                try: os.rename(path, new_path); path = new_path
+                except OSError: pass
+            local_paths.append(path)
+        except Exception as e:
+            log.error("[Seedr] Download failed for %s: %s", raw_name, e)
+    try: await delete_folder(folder_id)
+    except Exception as e: log.warning("[Seedr] Cleanup failed: %s", e)
+    return local_paths
+''', "services/seedr.py (proxy-aware rewrite)")
+
 _log("OK", "All injections and patches complete ✅")
 
 
@@ -555,6 +1083,7 @@ env_lines = [
     f"CC_API_KEY={CC_API_KEY}",
     f"FC_API_KEY={FC_API_KEY}",   # FIX: was missing — FC features silently disabled without this
     f"SEEDR_USERNAME={SEEDR_USERNAME}", f"SEEDR_PASSWORD={SEEDR_PASSWORD}",
+    f"SEEDR_PROXY={SEEDR_PROXY}",  # Routes add_torrent through non-cloud IP (required on Colab)
     f"WEBHOOK_BASE_URL={WEBHOOK_BASE_URL}",
 ]
 for opt in ("ADMINS", "GDRIVE_SA_JSON"):
@@ -563,7 +1092,7 @@ for opt in ("ADMINS", "GDRIVE_SA_JSON"):
 
 with open(f"{BASE_DIR}/.env", "w") as f:
     f.write("\n".join(env_lines))
-_log("OK", f".env written (CC_API_KEY={'set' if CC_API_KEY else 'empty'}, FC_API_KEY={'set' if FC_API_KEY else 'empty'})")
+_log("OK", f".env written (CC_API_KEY={'set' if CC_API_KEY else 'empty'}, FC_API_KEY={'set' if FC_API_KEY else 'empty'}, SEEDR_PROXY={'set' if SEEDR_PROXY else 'empty ⚠️'})")
 
 for sf in glob.glob(os.path.join(BASE_DIR, "*.session*")):
     try: os.remove(sf)

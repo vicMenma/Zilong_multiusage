@@ -18,3 +18,6 @@ Pillow
 # REST API v1 (Basic Auth) returns 401 for free accounts — seedrcc is required.
 seedrcc>=2.0.2
 # pyngrok removed — keep-alive uses Serveo (SSH tunnel, no token needed) on EC2/VPS.
+# httpx: HTTP client used by services/seedr.py for all Seedr API strategies.
+# httpx[socks]: adds SOCKS5 proxy support — needed when SEEDR_PROXY=socks5://...
+httpx[socks]>=0.27.0
