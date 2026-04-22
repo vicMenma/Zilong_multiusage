@@ -1,25 +1,68 @@
 """
 services/seedr.py
-Seedr.cc cloud torrent client — uses the official REST API v1.
+Seedr.cc cloud torrent client.
 
 ═══════════════════════════════════════════════════════════════════
-OFFICIAL SEEDR REST API v1 (from https://www.seedr.cc/docs/api/rest/v1/)
-  Authentication: HTTP Basic Auth (email:password) — NO OAuth tokens needed
+ROOT CAUSE OF PREVIOUS ERRORS
+─────────────────────────────────────────────────────────────────
+  OLD CODE used REST API v1 with HTTP Basic Auth:
+    POST https://www.seedr.cc/rest/transfer/magnet   ← 404 for free users
+    GET  https://www.seedr.cc/rest/folder            ← 401 for free users
 
-  POST /rest/transfer/magnet   data: magnet={magnet_link}  ← add magnet
-  POST /rest/transfer/url      data: url={url}             ← add URL
-  GET  /rest/folder            → list root folder
-  GET  /rest/folder/{id}       → list subfolder
-  GET  /rest/file/{id}         → download file (follow redirects)
-  GET  /rest/user              → account info / storage
-  DELETE /rest/folder/{id}     → delete folder
+  WHY IT FAILED:
+    • REST API v1 is PREMIUM-ONLY. Free accounts always get 401/404.
+    • The endpoint /rest/transfer/magnet no longer works for non-premium.
+
+  CORRECT APPROACH (this file):
+    Use the same OAuth2 API as the official Chrome & Kodi extensions.
+    This API works for ALL users (free and premium alike).
+
+═══════════════════════════════════════════════════════════════════
+SEEDR CHROME/KODI EXTENSION API  (works for ALL account types)
+─────────────────────────────────────────────────────────────────
+  Auth:  OAuth2 password grant
+    POST https://www.seedr.cc/oauth_test/token
+         client_id=seedr_xbmc  (public client — no secret needed)
+         grant_type=password
+         username=<email>
+         password=<password>
+    → { access_token, refresh_token, token_type, expires_in }
+
+  Token Refresh:
+    POST https://www.seedr.cc/oauth_test/token
+         grant_type=refresh_token
+         refresh_token=<token>
+         client_id=seedr_xbmc
+
+  Add magnet / torrent URL:
+    POST https://www.seedr.cc/api/folder
+         access_token=<token>  (in body, NOT Authorization header)
+         func=add_torrent
+         torrent_magnet=<magnet_link>
+
+  List root folder:
+    GET https://www.seedr.cc/api/folder?access_token=<token>
+
+  Get file download URL:
+    GET https://www.seedr.cc/api/file?access_token=<token>&folder_file_id=<id>
+    → { url: "https://cdn..." }
+
+  Delete folder:
+    POST https://www.seedr.cc/api/folder
+         access_token=<token>
+         func=delete
+         delete_arr[]=folder_<folder_id>
+
+  Delete torrent (active transfer):
+    POST https://www.seedr.cc/api/folder
+         access_token=<token>
+         func=delete
+         delete_arr[]=torrent_<torrent_id>
 
 SETUP (.env):
     SEEDR_USERNAME=your@email.com
     SEEDR_PASSWORD=yourpassword
-
-  Optional proxy (for cloud IPs like Google Colab):
-    SEEDR_PROXY=http://user:pass@host:port
+    SEEDR_PROXY=http://user:pass@host:port   (optional, for cloud IPs)
 ═══════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -36,7 +79,14 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-_BASE = "https://www.seedr.cc/rest"
+# ─────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────
+
+_OAUTH_URL  = "https://www.seedr.cc/oauth_test/token"
+_API_URL    = "https://www.seedr.cc/api/folder"
+_FILE_URL   = "https://www.seedr.cc/api/file"
+_CLIENT_ID  = "seedr_xbmc"   # public OAuth client (Chrome/Kodi extension)
 
 _BROWSER_HEADERS = {
     "User-Agent": (
@@ -46,9 +96,12 @@ _BROWSER_HEADERS = {
     ),
 }
 
+# In-process token cache: { username → {access_token, refresh_token, expires_at} }
+_TOKEN_CACHE: dict[str, dict] = {}
+
 
 # ─────────────────────────────────────────────────────────────
-# Helpers
+# Credentials & proxy helpers
 # ─────────────────────────────────────────────────────────────
 
 def _creds() -> tuple[str, str]:
@@ -68,14 +121,11 @@ def _get_proxy() -> Optional[str]:
     return os.environ.get("SEEDR_PROXY", "").strip() or None
 
 
-def _client() -> httpx.AsyncClient:
-    """Return an httpx client pre-configured with auth + optional proxy."""
-    username, password = _creds()
+def _make_client() -> httpx.AsyncClient:
     proxy = _get_proxy()
     if proxy:
         log.info("[Seedr] Using proxy: %s", re.sub(r":([^@/]+)@", ":***@", proxy))
     return httpx.AsyncClient(
-        auth=(username, password),
         proxy=proxy,
         headers=_BROWSER_HEADERS,
         timeout=60,
@@ -83,28 +133,118 @@ def _client() -> httpx.AsyncClient:
     )
 
 
-async def _get(path: str) -> dict:
-    async with _client() as http:
-        r = await http.get(f"{_BASE}{path}")
+# ─────────────────────────────────────────────────────────────
+# OAuth2 token management
+# ─────────────────────────────────────────────────────────────
+
+async def _fetch_token_password(username: str, password: str) -> dict:
+    """Get a new token via password grant."""
+    async with _make_client() as http:
+        r = await http.post(_OAUTH_URL, data={
+            "grant_type": "password",
+            "client_id":   _CLIENT_ID,
+            "username":    username,
+            "password":    password,
+        })
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"[Seedr] OAuth login failed ({r.status_code}): {r.text[:300]}"
+            )
+        data = r.json()
+        if "error" in data:
+            raise RuntimeError(
+                f"[Seedr] OAuth error: {data.get('error')} — "
+                f"{data.get('error_description', '')}"
+            )
+        return data
+
+
+async def _refresh_token(refresh_tok: str) -> dict:
+    """Refresh an expired access token."""
+    async with _make_client() as http:
+        r = await http.post(_OAUTH_URL, data={
+            "grant_type":    "refresh_token",
+            "refresh_token": refresh_tok,
+            "client_id":     _CLIENT_ID,
+        })
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"[Seedr] Token refresh failed ({r.status_code}): {r.text[:300]}"
+            )
+        return r.json()
+
+
+async def _get_access_token() -> str:
+    """
+    Return a valid access token, fetching or refreshing as needed.
+    Tokens are cached in memory for the process lifetime.
+    """
+    username, password = _creds()
+    cache = _TOKEN_CACHE.get(username)
+
+    # Token still valid (with 60s buffer)
+    if cache and cache.get("expires_at", 0) > time.time() + 60:
+        return cache["access_token"]
+
+    # Try to refresh if we have a refresh token
+    if cache and cache.get("refresh_token"):
+        try:
+            log.info("[Seedr] Refreshing access token…")
+            data = await _refresh_token(cache["refresh_token"])
+            _store_token(username, data)
+            return data["access_token"]
+        except Exception as e:
+            log.warning("[Seedr] Refresh failed (%s) — re-authenticating…", e)
+
+    # Full login
+    log.info("[Seedr] Authenticating with username/password…")
+    data = await _fetch_token_password(username, password)
+    _store_token(username, data)
+    log.info("[Seedr] Authenticated successfully.")
+    return data["access_token"]
+
+
+def _store_token(username: str, data: dict) -> None:
+    expires_in = int(data.get("expires_in", 3600))
+    _TOKEN_CACHE[username] = {
+        "access_token":  data["access_token"],
+        "refresh_token": data.get("refresh_token", ""),
+        "expires_at":    time.time() + expires_in,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# Core API helpers
+# ─────────────────────────────────────────────────────────────
+
+async def _api_get(params: dict) -> dict:
+    """GET /api/folder with access_token injected."""
+    token = await _get_access_token()
+    async with _make_client() as http:
+        r = await http.get(_API_URL, params={"access_token": token, **params})
         r.raise_for_status()
         return r.json()
 
 
-async def _post(path: str, data: dict) -> dict:
-    async with _client() as http:
-        r = await http.post(f"{_BASE}{path}", data=data)
-        r.raise_for_status()
-        return r.json()
-
-
-async def _delete(path: str) -> dict:
-    async with _client() as http:
-        r = await http.delete(f"{_BASE}{path}")
+async def _api_post(data: dict) -> dict:
+    """POST /api/folder with access_token injected."""
+    token = await _get_access_token()
+    async with _make_client() as http:
+        r = await http.post(_API_URL, data={"access_token": token, **data})
         r.raise_for_status()
         try:
             return r.json()
         except Exception:
-            return {"result": True}
+            return {"result": True, "raw": r.text}
+
+
+async def _api_file_get(params: dict) -> dict:
+    """GET /api/file with access_token injected."""
+    token = await _get_access_token()
+    async with _make_client() as http:
+        r = await http.get(_FILE_URL, params={"access_token": token, **params})
+        r.raise_for_status()
+        return r.json()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -112,9 +252,9 @@ async def _delete(path: str) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 async def check_credentials() -> bool:
-    """Return True if credentials are valid."""
+    """Return True if credentials are valid (attempts token fetch)."""
     try:
-        await _get("/user")
+        await _get_access_token()
         return True
     except Exception as e:
         log.warning("[Seedr] Credential check failed: %s", e)
@@ -123,37 +263,35 @@ async def check_credentials() -> bool:
 
 async def get_storage_info() -> dict:
     """Return {used, total, free} in bytes."""
-    data = await _get("/user")
-    # REST v1 user endpoint returns storage info
-    total = int(data.get("space_max", data.get("storage_total", 0)))
-    used  = int(data.get("space_used", data.get("storage_used", 0)))
+    data = await _api_get({})
+    total = int(data.get("space_max",  data.get("storage_total", 0)))
+    used  = int(data.get("space_used", data.get("storage_used",  0)))
     return {"total": total, "used": used, "free": total - used}
 
 
 async def add_magnet(magnet: str) -> dict:
     """
-    Submit a magnet link to Seedr via the official REST API.
-    POST /rest/transfer/magnet  with Basic Auth.
-    """
-    proxy = _get_proxy()
-    if proxy:
-        log.info("[Seedr] Proxy active: %s", re.sub(r":([^@/]+)@", ":***@", proxy))
+    Submit a magnet link via the Chrome/Kodi extension API.
+    POST /api/folder  func=add_torrent  torrent_magnet=<magnet>
 
-    log.info("[Seedr] Submitting magnet via REST API...")
-    result = await _post("/transfer/magnet", {"magnet": magnet})
+    This works for ALL account types (free and premium).
+    """
+    log.info("[Seedr] Submitting magnet via extension API…")
+    result = await _api_post({
+        "func":           "add_torrent",
+        "torrent_magnet": magnet,
+    })
     log.info("[Seedr] Transfer submitted: %s", result)
     return result
 
 
 async def list_folder(folder_id: int = 0) -> dict:
     """
-    List folder contents. Returns a plain dict with:
-      folders: [{id, name, size}, ...]
-      files:   [{id, name, size}, ...]
-      torrents: [{id, name, progress}, ...]
+    List folder contents.
+    Returns dict with: folders, files, torrents (active transfers), space_used, space_max
     """
-    path = "/folder" if folder_id == 0 else f"/folder/{folder_id}"
-    data = await _get(path)
+    params = {} if folder_id == 0 else {"content_id": folder_id}
+    data   = await _api_get(params)
 
     folders = [
         {"id": f.get("id"), "name": f.get("name"), "size": f.get("size", 0)}
@@ -162,21 +300,21 @@ async def list_folder(folder_id: int = 0) -> dict:
     files = [
         {
             "folder_file_id": f.get("id"),
-            "id": f.get("id"),
-            "name": f.get("name"),
-            "size": f.get("size", 0),
+            "id":             f.get("id"),
+            "name":           f.get("name"),
+            "size":           f.get("size", 0),
         }
         for f in data.get("files", [])
     ]
-    # REST v1 shows active transfers inside the folder response
+    # Active transfers appear as "torrents" in the extension API
     torrents = [
         {
-            "id": t.get("id"),
-            "name": t.get("name", ""),
+            "id":       t.get("id"),
+            "name":     t.get("name", ""),
             "progress": str(t.get("progress", "0")),
-            "size": t.get("size", 0),
+            "size":     t.get("size", 0),
         }
-        for t in data.get("transfers", data.get("torrents", []))
+        for t in data.get("torrents", [])
     ]
 
     return {
@@ -188,33 +326,37 @@ async def list_folder(folder_id: int = 0) -> dict:
     }
 
 
-async def get_file_download_url(file_id: int) -> str:
+async def get_file_download_url(folder_file_id: int) -> str:
     """
-    Get direct download URL for a file.
-    GET /rest/file/{id} with follow_redirects gives the final CDN URL.
+    Get direct CDN download URL for a file.
+    GET /api/file?folder_file_id=<id>  → { url: "https://cdn..." }
     """
-    username, password = _creds()
-    proxy = _get_proxy()
-    async with httpx.AsyncClient(
-        auth=(username, password),
-        proxy=proxy,
-        headers=_BROWSER_HEADERS,
-        timeout=60,
-        follow_redirects=False,   # we want the redirect Location, not the file
-    ) as http:
-        r = await http.get(f"{_BASE}/file/{file_id}")
-        if r.status_code in (301, 302, 303, 307, 308):
-            url = r.headers.get("location", "")
-            log.info("[Seedr] File %s redirect → %s", file_id, url[:80])
-            return url
-        # If no redirect, the response body IS the file — return the URL directly
-        return f"{_BASE}/file/{file_id}"
+    data = await _api_file_get({"folder_file_id": folder_file_id})
+    url  = data.get("url", "")
+    if not url:
+        raise RuntimeError(
+            f"[Seedr] No URL returned for file {folder_file_id}: {data}"
+        )
+    log.info("[Seedr] File %s CDN URL: %s…", folder_file_id, url[:80])
+    return url
 
 
 async def delete_folder(folder_id: int) -> None:
-    """Delete a folder from Seedr to reclaim quota."""
-    await _delete(f"/folder/{folder_id}")
-    log.info("[Seedr] Deleted folder id=%d", folder_id)
+    """Delete a completed folder from Seedr to reclaim quota."""
+    result = await _api_post({
+        "func":       "delete",
+        "delete_arr[]": f"folder_{folder_id}",
+    })
+    log.info("[Seedr] Deleted folder id=%d → %s", folder_id, result)
+
+
+async def delete_torrent(torrent_id: int) -> None:
+    """Delete an active/stuck torrent transfer."""
+    result = await _api_post({
+        "func":       "delete",
+        "delete_arr[]": f"torrent_{torrent_id}",
+    })
+    log.info("[Seedr] Deleted torrent id=%d → %s", torrent_id, result)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -223,27 +365,27 @@ async def delete_folder(folder_id: int) -> None:
 
 async def poll_until_ready(
     torrent_name_hint: str = "",
-    timeout_s: int = 3600,
-    progress_cb=None,
+    timeout_s:         int = 3600,
+    progress_cb        = None,
     existing_folder_ids: Optional[set] = None,
 ) -> dict:
     """
-    Poll Seedr root folder until the torrent finishes.
-    Returns folder dict {id, name, size}.
+    Poll Seedr root folder until the torrent download completes.
+    Returns the new folder dict: {id, name, size}.
     """
     if existing_folder_ids is None:
         existing_folder_ids = set()
 
-    deadline   = time.time() + timeout_s
-    last_pct   = -1.0
+    deadline = time.time() + timeout_s
+    last_pct = -1.0
 
     while time.time() < deadline:
         try:
             root     = await list_folder(0)
-            folders  = root.get("folders", [])
+            folders  = root.get("folders",  [])
             torrents = root.get("torrents", [])
 
-            # Active downloads
+            # Check active downloads
             downloading = []
             for t in torrents:
                 try:
@@ -327,17 +469,17 @@ async def get_file_urls(folder_id: int) -> list[dict]:
 # ─────────────────────────────────────────────────────────────
 
 async def download_via_seedr(
-    magnet:      str,
-    dest:        str,
-    progress_cb  = None,
-    timeout_s:   int = 3600,
+    magnet:    str,
+    dest:      str,
+    progress_cb = None,
+    timeout_s: int = 3600,
 ) -> list[str]:
     """
-    Full pipeline: add magnet → poll → fetch URLs → download → cleanup.
-    Returns list of local file paths in `dest`.
+    Full pipeline: add magnet → poll → fetch file URLs → download → cleanup.
+    Returns list of local file paths under `dest`.
     """
-    from services.downloader import download_direct
-    from services.cc_sanitize import sanitize_filename
+    from services.downloader   import download_direct
+    from services.cc_sanitize  import sanitize_filename
 
     if progress_cb:
         await progress_cb("adding", 0.0, "Submitting to Seedr…")
@@ -352,7 +494,7 @@ async def download_via_seedr(
         }
         log.info("[Seedr] Baseline: %d existing folder(s)", len(existing_folder_ids))
     except Exception as exc:
-        log.warning("[Seedr] Snapshot failed: %s", exc)
+        log.warning("[Seedr] Snapshot failed (non-fatal): %s", exc)
 
     await add_magnet(magnet)
 
@@ -412,6 +554,6 @@ async def download_via_seedr(
     try:
         await delete_folder(folder_id)
     except Exception as e:
-        log.warning("[Seedr] Cleanup failed: %s", e)
+        log.warning("[Seedr] Cleanup failed (non-fatal): %s", e)
 
     return local_paths
