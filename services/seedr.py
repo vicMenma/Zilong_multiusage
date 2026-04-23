@@ -695,6 +695,98 @@ async def download_via_seedr(
     return local_paths
 
 
+async def fetch_urls_via_seedr(
+    magnet:      str,
+    progress_cb: Optional[Callable] = None,
+    timeout_s:   int = 7200,
+) -> list[dict]:
+    """
+    Steps 1-5 of the full pipeline WITHOUT local download:
+      1. Pick account with most free space
+      2. Snapshot existing folders
+      3. Submit magnet
+      4. Poll until torrent completes on Seedr
+      5. Collect CDN download URLs
+
+    Returns list of {name, url, size} dicts.
+    The Seedr folder is NOT deleted so that CloudConvert/FreeConvert
+    can pull the file directly. Caller is responsible for cleanup
+    via delete_folder(folder_id) once the conversion job is done.
+    Returns (files, folder_id, user, pwd) so caller can clean up.
+    """
+    from services.cc_sanitize import sanitize_filename  # noqa: keep lazy
+
+    # ── Step 1: account selection ─────────────────────────────
+    if progress_cb:
+        await progress_cb("selecting", 0.0, "Selecting Seedr account…")
+
+    user, pwd, _ = await _pick_account()
+
+    # ── Step 2: snapshot ─────────────────────────────────────
+    if progress_cb:
+        await progress_cb("submitting", 3.0, "Snapshotting account state…")
+
+    root_before = await _root(user, pwd)
+    pre_ids = {f["id"] for f in root_before["folders"]}
+
+    # ── Step 3: submit magnet ─────────────────────────────────
+    if progress_cb:
+        await progress_cb("submitting", 5.0, "Submitting magnet to Seedr…")
+
+    torrent_id = await _submit_magnet(user, pwd, magnet)
+    log.info("[Seedr] Submitted. torrent_id=%s", torrent_id)
+
+    # ── Step 4: poll ──────────────────────────────────────────
+    if progress_cb:
+        await progress_cb("waiting", 5.0, "Seedr is fetching torrent…")
+
+    async def _pcb(pct: float, name: str) -> None:
+        if progress_cb:
+            stage = "downloading" if pct > 0.5 else "waiting"
+            await progress_cb(stage, min(pct, 99.0), name or "Downloading…")
+
+    folder = await _poll(
+        user, pwd,
+        torrent_id              = torrent_id,
+        pre_existing_folder_ids = pre_ids,
+        timeout_s               = timeout_s,
+        progress_cb             = _pcb,
+    )
+    folder_id = folder["id"]
+
+    # ── Step 5: collect file URLs ─────────────────────────────
+    if progress_cb:
+        await progress_cb("fetching", 99.0, "Getting CDN links…")
+
+    files = await _collect_files(user, pwd, folder_id)
+
+    # Edge case: single-file torrent lands as a root file
+    if not files:
+        log.warning("[Seedr] Folder empty — checking for root file…")
+        fresh = await _root(user, pwd)
+        for f in fresh["files"]:
+            fid2 = f.get("id")
+            if fid2 and fid2 not in pre_ids:
+                try:
+                    url = await _file_url(user, pwd, fid2)
+                    files.append({"name": f["name"], "url": url, "size": f["size"]})
+                except Exception:
+                    pass
+
+    if not files:
+        raise SeedrError(
+            "Seedr produced no downloadable files. "
+            "The torrent may be empty or all files are unsupported."
+        )
+
+    # Sanitise filenames in metadata (URL stays raw)
+    for f in files:
+        f["clean_name"] = sanitize_filename(f["name"])
+
+    # Return files + context needed for deferred cleanup
+    return files, folder_id, user, pwd
+
+
 # ══════════════════════════════════════════════════════
 # Convenience / legacy-compat public helpers
 # ══════════════════════════════════════════════════════
