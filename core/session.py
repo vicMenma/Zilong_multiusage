@@ -213,6 +213,12 @@ _DEFAULTS: dict[str, Any] = {
     "auto_forward":     False,    # copy to all channels automatically after upload
     "forward_channels": [],       # list of {"id": int, "name": str}
     "progress_style":   "B",      # "B" (cards) | "C" (minimal)
+    # Custom name for downloads:
+    #   "off" — keep original filename
+    #   "mid" — ask user for a name before each download
+    #   "on"  — silently apply custom_name to every download
+    "custom_name_mode": "off",
+    "custom_name":      "",       # used only when custom_name_mode == "on"
 }
 
 
