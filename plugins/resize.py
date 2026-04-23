@@ -21,6 +21,7 @@ FIX H-05 (audit v3): _interactive_mode now stores (mode_str, timestamp) tuples
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -659,12 +660,7 @@ async def czp_cb(client: Client, cb: CallbackQuery):
         fname     = pending["fname"]
         st        = cb.message
         _cz_pending.pop(tok, None)
-        try:
-            await _do_compress(client, st, path, fname, tmp, target_mb, uid, platform=platform)
-        except Exception as exc:
-            cleanup(tmp)
-            await safe_edit(st, f"❌ <b>Compress failed</b>\n<code>{exc}</code>",
-                            parse_mode=enums.ParseMode.HTML)
+        asyncio.create_task(_czp_compress_work(client, st, path, fname, tmp, target_mb, uid, platform))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -690,6 +686,19 @@ async def rsz_cb(client: Client, cb: CallbackQuery):
         return await safe_edit(cb.message, "❌ Session expired. Try again.",
                                parse_mode=enums.ParseMode.HTML)
 
+    asyncio.create_task(_rsz_work(client, cb.message, entry, height_s, tok, uid))
+
+
+async def _czp_compress_work(client, st, path, fname, tmp, target_mb, uid, platform):
+    try:
+        await _do_compress(client, st, path, fname, tmp, target_mb, uid, platform=platform)
+    except Exception as exc:
+        cleanup(tmp)
+        await safe_edit(st, f"❌ <b>Compress failed</b>\n<code>{exc}</code>",
+                        parse_mode=enums.ParseMode.HTML)
+
+
+async def _rsz_work(client, msg, entry, height_s, tok, uid):
     height = int(height_s)
     tmp    = make_tmp(cfg.download_dir, uid)
 
@@ -697,7 +706,7 @@ async def rsz_cb(client: Client, cb: CallbackQuery):
         if entry["kind"] == "url":
             url   = entry["url"]
             fname = entry["fname"]
-            await safe_edit(cb.message,
+            await safe_edit(msg,
                 f"📐 <b>Resize → {height}p</b>\n"
                 f"<code>{fname[:40]}</code>\n⬇️ Downloading…",
                 parse_mode=enums.ParseMode.HTML)
@@ -707,14 +716,14 @@ async def rsz_cb(client: Client, cb: CallbackQuery):
 
         elif entry["kind"] == "tg_file":
             fname = entry["fname"]
-            await safe_edit(cb.message,
+            await safe_edit(msg,
                 f"📐 <b>Resize → {height}p</b>\n"
                 f"<code>{fname[:40]}</code>\n⬇️ Downloading…",
                 parse_mode=enums.ParseMode.HTML)
             from services.tg_download import tg_download
             path = await tg_download(
                 client, entry["file_id"],
-                os.path.join(tmp, fname), cb.message,
+                os.path.join(tmp, fname), msg,
                 fname=fname, fsize=entry.get("fsize", 0), user_id=uid,
             )
 
@@ -723,27 +732,27 @@ async def rsz_cb(client: Client, cb: CallbackQuery):
             from plugins.video import _ensure
             session = sessions.get(entry["key"])
             if not session:
-                await safe_edit(cb.message, "❌ Session expired. Send the video again.")
+                await safe_edit(msg, "❌ Session expired. Send the video again.")
                 cleanup(tmp)
                 return
             fname = session.fname
-            await safe_edit(cb.message,
+            await safe_edit(msg,
                 f"📐 <b>Resize → {height}p</b>\n"
                 f"<code>{fname[:40]}</code>\n⬇️ Downloading…",
                 parse_mode=enums.ParseMode.HTML)
             async with session.lock:
-                path = await _ensure(client, session, cb.message)
+                path = await _ensure(client, session, msg)
             if not path:
                 cleanup(tmp)
                 return
 
         platform = entry.get("platform", _default_platform())
-        await _do_resize(client, cb.message, path, fname, tmp, height, uid, platform=platform)
+        await _do_resize(client, msg, path, fname, tmp, height, uid, platform=platform)
 
     except Exception as exc:
         log.error("[Resize] %s", exc, exc_info=True)
         cleanup(tmp)
-        await safe_edit(cb.message,
+        await safe_edit(msg,
                         f"❌ <b>Resize failed</b>\n<code>{exc}</code>",
                         parse_mode=enums.ParseMode.HTML)
 

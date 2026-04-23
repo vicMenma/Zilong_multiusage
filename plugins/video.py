@@ -212,8 +212,19 @@ async def video_cb(client: Client, cb: CallbackQuery):
         await _prompt(client, cb, action, key, session, user_id)
         return
 
+    # ── FIX: wrap long work in create_task so the Pyrogram dispatcher
+    #    is released immediately. Without this, the callback handler blocks
+    #    the entire event loop for the full duration of the download + ffmpeg
+    #    + upload, preventing FloodWait recovery and freezing all other updates.
+    asyncio.create_task(
+        _video_work(client, cb.message, action, key, session, user_id)
+    )
+
+
+async def _video_work(client, msg, action, key, session, user_id):
+    """Background worker — runs download + ffmpeg + upload without blocking dispatcher."""
     async with session.lock:
-        st   = await cb.message.edit("⬇️ Downloading…")
+        st   = await msg.edit("⬇️ Downloading…")
         path = await _ensure(client, session, st)
         if not path:
             return
@@ -223,7 +234,7 @@ async def video_cb(client: Client, cb: CallbackQuery):
         base = os.path.splitext(os.path.basename(path))[0]
 
         try:
-            await _execute(client, cb, action, key, session,
+            await _execute(client, None, action, key, session,
                            user_id, st, path, tmp, ext, base)
         except Exception as exc:
             log.error("video_cb action=%s: %s", action, exc, exc_info=True)
@@ -447,9 +458,14 @@ async def stream_cb(client: Client, cb: CallbackQuery):
     if not session:
         return await cb.answer("Session expired.", show_alert=True)
     await cb.answer()
+    asyncio.create_task(
+        _stream_work(client, cb.message, action_raw, idx_str, key, session, user_id)
+    )
 
+
+async def _stream_work(client, msg, action_raw, idx_str, key, session, user_id):
     async with session.lock:
-        st   = await cb.message.edit("⬇️ Downloading…")
+        st   = await msg.edit("⬇️ Downloading…")
         path = await _ensure(client, session, st)
         if not path:
             return
@@ -521,9 +537,12 @@ async def audio_fmt_cb(client: Client, cb: CallbackQuery):
     if not session:
         return await cb.answer("Session expired.", show_alert=True)
     await cb.answer()
+    asyncio.create_task(_audio_work(client, cb.message, fmt, key, session, user_id))
 
+
+async def _audio_work(client, msg, fmt, key, session, user_id):
     async with session.lock:
-        st   = await cb.message.edit("⬇️ Downloading…")
+        st   = await msg.edit("⬇️ Downloading…")
         path = await _ensure(client, session, st)
         if not path:
             return
@@ -559,9 +578,12 @@ async def video_conv_cb(client: Client, cb: CallbackQuery):
     if not session:
         return await cb.answer("Session expired.", show_alert=True)
     await cb.answer()
+    asyncio.create_task(_vconv_work(client, cb.message, fmt, key, session, user_id))
 
+
+async def _vconv_work(client, msg, fmt, key, session, user_id):
     async with session.lock:
-        st   = await cb.message.edit("⬇️ Downloading…")
+        st   = await msg.edit("⬇️ Downloading…")
         path = await _ensure(client, session, st)
         if not path:
             return
@@ -642,9 +664,12 @@ async def opt_cb(client: Client, cb: CallbackQuery):
     if not session:
         return await cb.answer("Session expired.", show_alert=True)
     await cb.answer()
+    asyncio.create_task(_opt_work(client, cb.message, crf, key, session, user_id))
 
+
+async def _opt_work(client, msg, crf, key, session, user_id):
     async with session.lock:
-        st   = await cb.message.edit("⬇️ Downloading…")
+        st   = await msg.edit("⬇️ Downloading…")
         path = await _ensure(client, session, st)
         if not path:
             return
@@ -677,6 +702,13 @@ async def text_reply_handler(client: Client, msg: Message):
     session = sessions.waiting_session(user_id)
     if not session:
         return
+    # Fire-and-forget: release dispatcher immediately
+    asyncio.create_task(_text_reply_work(client, msg, session, user_id))
+    msg.stop_propagation()
+
+
+async def _text_reply_work(client: Client, msg: Message, session, user_id: int):
+    """Background worker for text-reply operations (trim, split, rename, etc.)"""
 
     action = session.waiting
     tmp    = session.tmp_dir
