@@ -88,6 +88,11 @@ _URL_COMPRESS_TTL = 600  # 10 min
 # uid → {"token": str, "height": int, "ts": float}
 _url_lconvert_pending: dict[int, dict] = {}
 
+# ── State for custom-name mid-mode prompts ───────────────────
+# uid → asyncio.Future[str | None]
+# Set when _launch_download is waiting for the user to type a filename.
+_CN_MID_WAITING: dict[int, "asyncio.Future[str | None]"] = {}
+
 
 # ─────────────────────────────────────────────────────────────
 # FloodWait-safe send helper
@@ -285,6 +290,25 @@ async def url_handler(client: Client, msg: Message):
         parse_mode=enums.ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Custom-name mid-mode reply collector (group=6)
+# Resolves the Future set by _launch_download when mode == "mid".
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_message(filters.private & filters.text, group=6)
+async def cn_mid_collector(client: Client, msg: Message) -> None:
+    uid = msg.from_user.id
+    fut = _CN_MID_WAITING.get(uid)
+    if fut is None or fut.done():
+        return
+    text = msg.text.strip()
+    if text.startswith("/"):
+        return
+    # Resolve the future — _launch_download is awaiting this
+    fut.set_result(None if text == "-" else text)
+    msg.stop_propagation()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1714,8 +1738,13 @@ async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
 
     from core.session import settings as _settings
     s = await _settings.get(uid)
-    prefix = s.get("prefix", "").strip()
-    suffix = s.get("suffix", "").strip()
+    prefix   = s.get("prefix", "").strip()
+    suffix   = s.get("suffix", "").strip()
+    _cn_mode = s.get("custom_name_mode", "off")
+    _ucac_custom: str | None = (
+        s.get("custom_name", "").strip() or None
+        if _cn_mode == "on" else None
+    )
 
     try:
         for i, fpath in enumerate(all_files, 1):
@@ -1736,7 +1765,11 @@ async def _upload_and_cleanup(client, uid: int, path: str, tmp: str) -> None:
             fname   = os.path.basename(fpath)
             cleaned = smart_clean_filename(fname)
             name, ext = os.path.splitext(cleaned)
-            final_name = f"{prefix}{name}{suffix}{ext}"
+            if _ucac_custom:
+                base_c = f"{_ucac_custom}_{i:02d}" if total_files > 1 else _ucac_custom
+                final_name = f"{prefix}{base_c}{suffix}{ext}"
+            else:
+                final_name = f"{prefix}{name}{suffix}{ext}"
             if final_name != fname:
                 new_path = os.path.join(os.path.dirname(fpath), final_name)
                 try:
@@ -1811,6 +1844,45 @@ async def _launch_download(
         await panel_msg.delete()
     except Exception:
         pass
+
+    # ── Custom download name resolution ──────────────────────────────────
+    # Reads the user's custom_name_mode setting:
+    #   "off" → keep original label (no change)
+    #   "on"  → silently apply the stored custom_name as the base filename
+    #   "mid" → prompt the user once; wait up to 60 s for a reply
+    from core.session import settings as _dl_settings
+    _dl_s       = await _dl_settings.get(uid)
+    _cn_mode    = _dl_s.get("custom_name_mode", "off")
+    _custom_name: str | None = None
+
+    if _cn_mode == "on":
+        _stored = _dl_s.get("custom_name", "").strip()
+        if _stored:
+            _custom_name = _stored
+
+    elif _cn_mode == "mid":
+        _loop    = asyncio.get_event_loop()
+        _cn_fut: asyncio.Future = _loop.create_future()
+        _CN_MID_WAITING[uid]    = _cn_fut
+        _ask_msg = await _floodwait_send(
+            client, uid,
+            "📝 <b>Custom Download Name</b>\n\n"
+            "Send the <b>base filename</b> (without extension) for this download.\n"
+            "Send <code>-</code> to keep the original name.\n\n"
+            "<i>Waiting 60 s…</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        try:
+            _custom_name = await asyncio.wait_for(_cn_fut, timeout=60.0)
+        except asyncio.TimeoutError:
+            _custom_name = None
+        finally:
+            _CN_MID_WAITING.pop(uid, None)
+        try:
+            await _ask_msg.delete()
+        except Exception:
+            pass
+    # ─────────────────────────────────────────────────────────────────────
 
     # BUG-UH-01: use _floodwait_send for the initial panel message
     st = await _floodwait_send(
@@ -1911,7 +1983,17 @@ async def _launch_download(
             fname   = os.path.basename(fpath)
             cleaned = smart_clean_filename(fname)
             name, ext = os.path.splitext(cleaned)
-            final_name = f"{prefix}{name}{suffix}{ext}"
+            # ── Apply custom name if set (from "on" or "mid" mode) ────────
+            if _custom_name:
+                # For multi-file downloads, append index to avoid collisions
+                if total_files > 1:
+                    base_custom = f"{_custom_name}_{i:02d}"
+                else:
+                    base_custom = _custom_name
+                final_name = f"{prefix}{base_custom}{suffix}{ext}"
+            else:
+                final_name = f"{prefix}{name}{suffix}{ext}"
+            # ──────────────────────────────────────────────────────────────
             if final_name != fname:
                 new_path = os.path.join(os.path.dirname(fpath), final_name)
                 try:

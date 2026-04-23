@@ -86,10 +86,13 @@ def _settings_header(s: dict, bot_name: str) -> str:
     ps       = s.get("progress_style", "B")
     caption  = s.get("caption_style", "Monospace")
     thumb    = s.get("thumb_id")
+    cn_mode  = s.get("custom_name_mode", "off")
+    cn_name  = s.get("custom_name", "").strip()
 
     af_s  = f"✅ ON ({len(chs)} ch)" if af and chs else ("✅ ON (no channels)" if af else "❌ OFF")
     ps_s  = "Cards" if ps == "B" else "Minimal"
     th_s  = "✅ Set" if thumb else "❌ None"
+    cn_s  = {"off": "❌ OFF", "mid": "❓ Ask each time", "on": f"✅ ON: {cn_name or '(not set)'}"}[cn_mode]
 
     SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     lines = [
@@ -103,6 +106,7 @@ def _settings_header(s: dict, bot_name: str) -> str:
         f"📡  Auto-Fwd     <code>{af_s}</code>",
         f"✏️  Caption      <code>{caption}</code>",
         f"🎨  Progress     <code>{ps_s}</code>",
+        f"📝  DL Name      <code>{cn_s}</code>",
         SEP,
         "<i>Tap a button below to change a setting.</i>",
     ]
@@ -118,6 +122,9 @@ def _settings_kb(s: dict) -> InlineKeyboardMarkup:
     af_lbl   = f"📡 Auto-Fwd ✅ ({len(chs)})" if af else "📡 Auto-Fwd ❌"
     ps       = s.get("progress_style", "B")
     ps_lbl   = "🎨 Progress: Cards" if ps == "B" else "🎨 Progress: Minimal"
+    cn_mode  = s.get("custom_name_mode", "off")
+    cn_icons = {"off": "📝 DL Name: OFF ❌", "mid": "📝 DL Name: Ask ❓", "on": "📝 DL Name: Fixed ✅"}
+    cn_lbl   = cn_icons.get(cn_mode, "📝 DL Name: OFF ❌")
 
     prefix_lbl = f"🔡 Prefix: {prefix[:16]}" if prefix else "🔡 Prefix: none"
     suffix_lbl = f"🔤 Suffix: {suffix[:16]}" if suffix else "🔤 Suffix: none"
@@ -134,6 +141,8 @@ def _settings_kb(s: dict) -> InlineKeyboardMarkup:
          InlineKeyboardButton("⚙️ Channels",              callback_data="st_af_manage")],
         [InlineKeyboardButton(f"✏️ Caption: {s.get('caption_style', 'Monospace')[:12]}", callback_data="st_caption"),
          InlineKeyboardButton(ps_lbl,                    callback_data="st_progress_style")],
+        [InlineKeyboardButton(cn_lbl,                    callback_data="st_cn_cycle"),
+         InlineKeyboardButton("✏️ Set Name",              callback_data="st_cn_setname")],
         [InlineKeyboardButton("❌ Close",                 callback_data="st_close")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -400,6 +409,97 @@ async def cq_st_cap_pick(client: Client, cb: CallbackQuery):
 async def cq_st_close(client: Client, cb: CallbackQuery):
     await cb.message.delete()
     await cb.answer()
+
+
+# ── Custom Download Name handlers ─────────────────────────────
+_CN_NAME_WAITING: set[int] = set()
+
+_CN_CYCLE = {"off": "mid", "mid": "on", "on": "off"}
+_CN_LABELS = {
+    "off": "❌ OFF — original filename kept",
+    "mid": "❓ Ask — you'll be prompted each time",
+    "on":  "✅ Fixed — custom name applied automatically",
+}
+
+
+@Client.on_callback_query(filters.regex("^st_cn_cycle$"))
+async def cq_cn_cycle(client: Client, cb: CallbackQuery):
+    uid = cb.from_user.id
+    s   = await settings.get(uid)
+    new = _CN_CYCLE.get(s.get("custom_name_mode", "off"), "mid")
+    await settings.update(uid, {"custom_name_mode": new})
+    s["custom_name_mode"] = new
+    bot_name = get_bot_name().upper()
+    await cb.message.edit(
+        _settings_header(s, bot_name),
+        reply_markup=_settings_kb(s),
+        parse_mode=enums.ParseMode.HTML,
+    )
+    await cb.answer(f"Download Name mode: {_CN_LABELS[new]}", show_alert=True)
+
+
+@Client.on_callback_query(filters.regex("^st_cn_setname$"))
+async def cq_cn_setname(client: Client, cb: CallbackQuery):
+    uid = cb.from_user.id
+    s   = await settings.get(uid)
+    cur = s.get("custom_name", "").strip()
+    _CN_NAME_WAITING.add(uid)
+    await cb.answer()
+    await cb.message.edit(
+        "📝 <b>Set Fixed Download Name</b>\n\n"
+        f"Current: <code>{cur or '(none)'}</code>\n\n"
+        "Send the <b>base name</b> (without extension) to apply to every download "
+        "when mode is <b>Fixed ✅</b>.\n\n"
+        "Example: <code>My Anime S01E01</code>\n\n"
+        "<i>Send /cancel to abort.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+
+@Client.on_message(
+    filters.private & filters.text & ~filters.command(
+        ["start","help","settings","info","status","log","restart","broadcast",
+         "admin","ban_user","unban_user","banned_list","cancel",
+         "show_thumb","del_thumb","json_formatter","bulk_url",
+         "hardsub","botname","ccstatus","convert",
+         "resize","compress","captiontemplate","usage","allow","deny","allowed",
+         "nyaa_add","nyaa_list","nyaa_remove","nyaa_check",
+         "nyaa_search","nyaa_dump","nyaa_toggle","nyaa_edit"]
+    ),
+    group=11,
+)
+async def cn_name_collector(client: Client, msg: Message):
+    uid = msg.from_user.id
+    if uid not in _CN_NAME_WAITING:
+        return
+    text = msg.text.strip()
+    if text.lower() in ("/cancel", "cancel"):
+        _CN_NAME_WAITING.discard(uid)
+        await msg.reply("❌ Cancelled.")
+        msg.stop_propagation()
+        return
+    if text.startswith("/"):
+        return
+    _CN_NAME_WAITING.discard(uid)
+    # Sanitise: strip extension if user accidentally included it
+    import os as _os
+    base, _ext = _os.path.splitext(text)
+    name_to_save = base.strip() if _ext else text
+    await settings.update(uid, {"custom_name": name_to_save})
+    s_new = await settings.get(uid)
+    bot_name = get_bot_name().upper()
+    await msg.reply(
+        f"✅ <b>Fixed download name saved!</b>\n\n"
+        f"Name: <code>{name_to_save}</code>\n\n"
+        f"<i>Switch mode to <b>Fixed ✅</b> in settings for it to apply.</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+    await msg.reply(
+        _settings_header(s_new, bot_name),
+        reply_markup=_settings_kb(s_new),
+        parse_mode=enums.ParseMode.HTML,
+    )
+    msg.stop_propagation()
 
 
 # ── Prefix / Suffix handlers ──────────────────────────────────
