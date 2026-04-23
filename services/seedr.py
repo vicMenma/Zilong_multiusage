@@ -61,10 +61,11 @@ class SeedrQuotaError(SeedrError):
 # Constants
 # ══════════════════════════════════════════════════════
 
-_OAUTH_URL = "https://www.seedr.cc/oauth_test/token"
-_API_ROOT  = "https://www.seedr.cc/api/folder"
-_API_FILE  = "https://www.seedr.cc/api/file"
-_CLIENT_ID = "seedr_xbmc"
+_OAUTH_URL   = "https://www.seedr.cc/oauth_test/token"
+_API_ROOT    = "https://www.seedr.cc/api/folder"
+_API_FILE    = "https://www.seedr.cc/api/file"
+_API_TORRENT = "https://www.seedr.cc/api/torrent"   # FIX: dedicated torrent submission endpoint
+_CLIENT_ID   = "seedr_xbmc"
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -286,8 +287,33 @@ async def _list_folder(user: str, pwd: str, folder_id: int) -> dict:
 
 
 async def _submit_magnet(user: str, pwd: str, magnet: str) -> Optional[int]:
-    """Submit a magnet and return torrent_id (or None if API doesn't give one)."""
-    body = await _post(user, pwd, {"func": "add_torrent", "torrent_magnet": magnet})
+    """
+    Submit a magnet link to Seedr's dedicated torrent endpoint.
+    Returns torrent_id (or None if the API doesn't provide one).
+
+    FIX: Seedr split their API — torrent submission must go to
+    /api/torrent (POST) with field 'magnet', NOT to /api/folder
+    which only accepts GET for folder listing. Posting to /api/folder
+    returns 405 Method Not Allowed.
+    """
+    tok = await _token(user, pwd)
+    async with _http() as c:
+        r = await c.post(
+            _API_TORRENT,
+            data={"access_token": tok, "magnet": magnet},
+        )
+    r.raise_for_status()
+
+    try:
+        body = r.json()
+    except Exception:
+        return None
+
+    result = body.get("result")
+    if result is False or str(result).lower() == "false":
+        msg = body.get("error") or body.get("message") or repr(body)
+        raise SeedrError(f"Seedr torrent submit: {msg}")
+
     tid = body.get("torrent_id") or body.get("id")
     return int(tid) if tid else None
 
