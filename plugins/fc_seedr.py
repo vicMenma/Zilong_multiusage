@@ -230,12 +230,25 @@ async def sfc_cb(client: Client, cb: CallbackQuery):
 
 
 # ─────────────────────────────────────────────────────────────
-# Shared: Seedr download helper
+# Shared: Seedr CDN URL fetcher (no local download)
 # ─────────────────────────────────────────────────────────────
 
-async def _seedr_dl_for_fc(st, magnet: str, uid: int, tmp: str, label: str) -> str | None:
-    """Download via Seedr, return largest video path (or None on failure)."""
-    from services.seedr import download_via_seedr
+async def _seedr_fetch_urls_for_fc(
+    st, magnet: str, uid: int, label: str
+) -> tuple[dict | None, int | None, str | None, str | None]:
+    """
+    Submit magnet to Seedr and wait for it to finish, then return the
+    CDN URL of the largest video file WITHOUT downloading it locally.
+
+    Returns (file_dict, folder_id, seedr_user, seedr_pwd) on success,
+    or (None, None, None, None) on failure.
+    file_dict = {name, url, size, clean_name}
+
+    The Seedr folder is kept alive so CloudConvert/FreeConvert can pull
+    the file via URL. Caller must call _seedr_cleanup(folder_id, user, pwd)
+    after the conversion job completes.
+    """
+    from services.seedr import fetch_urls_via_seedr
     from services.utils import human_dur
 
     start = time.time()
@@ -243,7 +256,8 @@ async def _seedr_dl_for_fc(st, magnet: str, uid: int, tmp: str, label: str) -> s
     async def _progress(stage: str, pct: float, detail: str) -> None:
         now     = time.time()
         elapsed = human_dur(int(now - start))
-        icons   = {"adding":"⬆️","waiting":"⏳","downloading":"☁️","fetching":"🔗","dl_file":"⬇️"}
+        icons   = {"selecting": "🔍", "adding": "⬆️", "waiting": "⏳",
+                   "downloading": "☁️", "fetching": "🔗", "submitting": "⬆️"}
         icon    = icons.get(stage, "⏳")
         bar     = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
         await safe_edit(
@@ -251,35 +265,47 @@ async def _seedr_dl_for_fc(st, magnet: str, uid: int, tmp: str, label: str) -> s
             f"☁️ <b>{label}</b>\n"
             "──────────────────────\n\n"
             f"{icon} <i>{detail}</i>\n\n"
-            f"<code>[{bar}]</code>  <b>{pct:.0f}%</b>  ·  ⏱ <i>{elapsed}</i>",
+            f"<code>[{bar}]</code>  <b>{pct:.0f}%</b>  ·  ⏱ <i>{elapsed}</i>\n\n"
+            "<i>Seedr fetches at datacenter speed.\n"
+            "Link will be sent directly to the converter.</i>",
             parse_mode=enums.ParseMode.HTML,
         )
 
     try:
-        local_paths = await download_via_seedr(
-            magnet, tmp, progress_cb=_progress, timeout_s=7200,
+        files, folder_id, seedr_user, seedr_pwd = await fetch_urls_via_seedr(
+            magnet, progress_cb=_progress, timeout_s=7200,
         )
     except Exception as exc:
-        cleanup(tmp)
         await safe_edit(
             st,
-            f"❌ <b>Seedr download failed</b>\n\n<code>{str(exc)[:300]}</code>",
+            f"❌ <b>Seedr failed</b>\n\n<code>{str(exc)[:300]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
-        return None
+        return None, None, None, None
 
-    if not local_paths:
-        cleanup(tmp)
-        await safe_edit(st, "❌ <b>Seedr: no files downloaded.</b>",
+    if not files:
+        await safe_edit(st, "❌ <b>Seedr: no files found.</b>",
                         parse_mode=enums.ParseMode.HTML)
-        return None
+        return None, None, None, None
 
-    video_paths = [p for p in local_paths
-                   if os.path.splitext(p)[1].lower() in _VIDEO_EXTS]
-    if not video_paths:
-        video_paths = local_paths
+    # Pick the largest video file
+    video_files = [f for f in files
+                   if os.path.splitext(f["name"])[1].lower() in _VIDEO_EXTS]
+    if not video_files:
+        video_files = files
 
-    return max(video_paths, key=lambda p: os.path.getsize(p))
+    best = max(video_files, key=lambda f: f.get("size", 0))
+    return best, folder_id, seedr_user, seedr_pwd
+
+
+async def _seedr_cleanup(folder_id: int, user: str, pwd: str) -> None:
+    """Delete the Seedr folder after conversion is done (reclaim quota)."""
+    try:
+        from services.seedr import _del_folder  # noqa: internal use
+        await _del_folder(user, pwd, folder_id)
+        log.info("[SFC] Seedr folder %d cleaned up.", folder_id)
+    except Exception as exc:
+        log.warning("[SFC] Seedr cleanup (non-fatal): %s", exc)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -290,30 +316,32 @@ async def _sfc_convert_pipeline(
     client: Client, st, magnet: str, uid: int, scale_height: int,
 ) -> None:
     """
-    1. Seedr download → local video
-    2. Upload to FC → convert/resize job
-    3. Poll → download result → upload to TG
+    1. Seedr fetches torrent → CDN URL (no local download)
+    2. Pass CDN URL directly to FreeConvert → convert/resize job
+    3. Poll → download result → upload to Telegram
     """
     from services.freeconvert_api import (
-        parse_fc_keys, pick_best_fc_key, submit_convert,
+        pick_best_fc_key, submit_convert,
         run_fc_job,
     )
     from services.uploader import upload_file
     from services.utils import make_tmp, human_size
 
-    keys = _get_fc_keys()
-    tmp  = make_tmp(cfg.download_dir, uid)
+    keys      = _get_fc_keys()
+    tmp       = make_tmp(cfg.download_dir, uid)
     res_label = f"{scale_height}p" if scale_height else "Original"
 
-    # Step 1: Seedr download
-    video_path = await _seedr_dl_for_fc(
-        st, magnet, uid, tmp, f"Seedr+FC Convert → {res_label}"
+    # Step 1: Seedr → CDN URL (no local download)
+    file_info, folder_id, seedr_user, seedr_pwd = await _seedr_fetch_urls_for_fc(
+        st, magnet, uid, f"Seedr+FC Convert → {res_label}"
     )
-    if not video_path:
+    if not file_info:
+        cleanup(tmp)
         return
 
-    fname = os.path.basename(video_path)
-    fsize = os.path.getsize(video_path)
+    fname     = file_info["clean_name"]
+    fsize     = file_info.get("size", 0)
+    video_url = file_info["url"]
     name_base = os.path.splitext(fname)[0]
     out_name  = f"{name_base}_{res_label}.mp4"
 
@@ -321,13 +349,13 @@ async def _sfc_convert_pipeline(
         st,
         f"🔄 <b>Seedr+FC Convert → {res_label}</b>\n"
         "──────────────────────\n\n"
-        f"✅ Downloaded via Seedr\n"
+        f"✅ Seedr ready — sending link to FreeConvert\n"
         f"📁 <code>{fname[:40]}</code>  <code>{human_size(fsize)}</code>\n\n"
         "☁️ <i>Selecting best FC key…</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
-    # Step 2: FC job
+    # Step 2: Submit CDN URL directly to FreeConvert (no upload needed!)
     try:
         key, mins = await pick_best_fc_key(keys)
 
@@ -337,13 +365,14 @@ async def _sfc_convert_pipeline(
             "──────────────────────\n\n"
             f"📁 <code>{fname[:40]}</code>\n"
             f"📐 → <b>{res_label}</b>\n\n"
-            f"☁️ <i>Uploading to FreeConvert…\n(~{human_size(fsize)} upload)</i>",
+            "🔗 <i>Submitting Seedr CDN link to FreeConvert…\n"
+            "(no upload — FreeConvert pulls directly!)</i>",
             parse_mode=enums.ParseMode.HTML,
         )
 
         job_id = await submit_convert(
             key,
-            video_path=video_path,
+            video_url=video_url,       # ← CDN URL, not a local file
             scale_height=scale_height,
             crf=23,
             output_name=out_name,
@@ -378,15 +407,20 @@ async def _sfc_convert_pipeline(
         )
 
     except Exception as exc:
-        cleanup(tmp)
         log.error("[SFC-Convert] FC failed: %s", exc, exc_info=True)
+        cleanup(tmp)
+        # Clean up Seedr folder since conversion failed
+        await _seedr_cleanup(folder_id, seedr_user, seedr_pwd)
         return await safe_edit(
             st,
             f"❌ <b>FreeConvert conversion failed</b>\n\n<code>{str(exc)[:300]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
+    finally:
+        # Always clean up Seedr folder once FC has the file
+        await _seedr_cleanup(folder_id, seedr_user, seedr_pwd)
 
-    # Step 3: Upload to TG
+    # Step 3: Download result → Upload to Telegram
     result_size = os.path.getsize(result_path)
     try:
         await st.delete()
@@ -414,36 +448,72 @@ async def _sfc_hardsub_pipeline(
     client: Client, st, magnet: str, uid: int,
 ) -> None:
     """
-    1. Seedr download → local video
-    2. Auto-detect French subtitle OR ask user
-    3. FC hardsub job → poll → download → upload to TG
+    1. Seedr fetches torrent → CDN URL (no local download)
+    2. Pass CDN URL directly to FreeConvert for hardsub
+       (subtitle must be provided by user since ffprobe needs local file)
+    NOTE: If the MKV contains embedded French subs, we must download it
+    locally only for ffprobe + sub extraction, then pass the video URL
+    and the extracted sub to FC. We avoid re-downloading the full video.
     """
     from services import ffmpeg as FF
+    from services.utils import make_tmp, human_size
+    from services.downloader import download_direct
 
     tmp = make_tmp(cfg.download_dir, uid)
 
-    # Step 1: Seedr
-    video_path = await _seedr_dl_for_fc(st, magnet, uid, tmp, "Seedr+FC Hardsub")
-    if not video_path:
+    # Step 1: Seedr → CDN URL (no local video download yet)
+    file_info, folder_id, seedr_user, seedr_pwd = await _seedr_fetch_urls_for_fc(
+        st, magnet, uid, "Seedr+FC Hardsub"
+    )
+    if not file_info:
+        cleanup(tmp)
         return
 
-    fname = os.path.basename(video_path)
-    fsize = os.path.getsize(video_path)
+    fname     = file_info["clean_name"]
+    fsize     = file_info.get("size", 0)
+    video_url = file_info["url"]
 
     await safe_edit(
         st,
         f"🔥 <b>Seedr+FC Hardsub</b>\n"
         "──────────────────────\n\n"
-        f"✅ Downloaded via Seedr\n"
+        f"✅ Seedr ready\n"
         f"📁 <code>{fname[:45]}</code>  <code>{human_size(fsize)}</code>\n\n"
-        "🔍 <i>Probing streams for French subtitle…</i>",
+        "🔍 <i>Probing streams for French subtitle…\n"
+        "(downloading just enough to read the header)</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
+    # Download only what's needed for ffprobe (first ~10 MB is enough for headers)
+    # We use a partial download trick — download the file but only keep the header portion
+    # Download only what's needed for ffprobe (first 50 MB covers MKV headers + subtitle tracks)
+    probe_path = os.path.join(tmp, fname)
     try:
-        sd = await FF.probe_streams(video_path)
+        _probe_fpath = os.path.join(tmp, fname)
+        _timeout     = aiohttp.ClientTimeout(total=300)
+        _MAX         = 50 * 1024 * 1024  # 50 MB cap
+        async with aiohttp.ClientSession(timeout=_timeout) as _sess:
+            async with _sess.get(video_url, headers={"User-Agent": "Mozilla/5.0"},
+                                  allow_redirects=True) as _resp:
+                _resp.raise_for_status()
+                _done = 0
+                with open(_probe_fpath, "wb") as _fh:
+                    async for _chunk in _resp.content.iter_chunked(1024 * 1024):
+                        _fh.write(_chunk)
+                        _done += len(_chunk)
+                        if _done >= _MAX:
+                            break
+        probe_path = _probe_fpath
+        log.info("[SFC-Hardsub] Partial probe: %s bytes -> %s", _done, _probe_fpath)
+    except Exception as exc:
+        log.warning("[SFC-Hardsub] Partial probe failed: %s — probing URL directly", exc)
+        probe_path = video_url
+
+    try:
+        sd = await FF.probe_streams(probe_path)
     except Exception as exc:
         cleanup(tmp)
+        await _seedr_cleanup(folder_id, seedr_user, seedr_pwd)
         return await safe_edit(
             st,
             f"❌ <b>Stream probe failed</b>\n\n<code>{exc}</code>",
@@ -463,10 +533,16 @@ async def _sfc_hardsub_pipeline(
     ]
 
     if french_text:
-        await _sfc_auto_hardsub(client, st, video_path, fname, french_text[0], tmp, uid)
+        # We have the probe file locally — extract the sub from it
+        # Then submit video_url + extracted sub to FC (video is NOT re-uploaded)
+        await _sfc_auto_hardsub_url(
+            client, st, probe_path, video_url, fname, fsize,
+            french_text[0], tmp, uid, folder_id, seedr_user, seedr_pwd
+        )
         return
 
-    # No text sub — ask user
+    # No text sub found — ask user to provide one
+    # Store video_url for later use (no local video needed)
     sub_info_lines = []
     for s in all_subs:
         tags  = s.get("tags", {}) or {}
@@ -490,11 +566,16 @@ async def _sfc_hardsub_pipeline(
 
     _evict_sfc()
     _SFC_STATE[uid] = {
-        "video_path": video_path,
-        "fname":      fname,
-        "tmp":        tmp,
-        "mode":       "hardsub",
-        "_created":   time.time(),
+        "video_url":   video_url,       # ← CDN URL, not local path
+        "video_path":  probe_path if os.path.isfile(probe_path) else None,
+        "fname":       fname,
+        "fsize":       fsize,
+        "tmp":         tmp,
+        "mode":        "hardsub",
+        "folder_id":   folder_id,
+        "seedr_user":  seedr_user,
+        "seedr_pwd":   seedr_pwd,
+        "_created":    time.time(),
     }
 
     await safe_edit(
@@ -508,25 +589,27 @@ async def _sfc_hardsub_pipeline(
         "Send me a <b>subtitle</b>:\n"
         "• A <b>.ass / .srt / .vtt file</b>\n"
         "• A <b>URL</b> to a subtitle file\n\n"
-        "<i>Video is cached — no re-download needed.\n"
+        "<i>Video is on Seedr — no re-download needed.\n"
         "Send /cancel to abort.</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
 
-async def _sfc_auto_hardsub(
+async def _sfc_auto_hardsub_url(
     client: Client, st,
-    video_path: str, fname: str, sub_stream: dict, tmp: str, uid: int,
+    probe_path: str,        # local partial file (for sub extraction only)
+    video_url: str,         # full Seedr CDN URL (sent directly to FC)
+    fname: str,
+    fsize: int,
+    sub_stream: dict,
+    tmp: str,
+    uid: int,
+    folder_id: int,
+    seedr_user: str,
+    seedr_pwd: str,
 ) -> None:
-    """Extract French sub and submit FC hardsub job."""
+    """Extract French sub from local probe file, then submit video_url + sub to FC."""
     from services import ffmpeg as FF
-    from services.freeconvert_api import (
-        parse_fc_keys, pick_best_fc_key, submit_hardsub, run_fc_job,
-    )
-    from services.uploader import upload_file
-    from services.utils import human_size
-    from services.fc_job_store import fc_job_store, FCJob
-    from services.cc_sanitize import build_cc_output_name
 
     idx   = sub_stream.get("index", 0)
     codec = (sub_stream.get("codec_name") or "ass").lower()
@@ -551,28 +634,125 @@ async def _sfc_auto_hardsub(
     )
 
     try:
-        await FF.stream_op(video_path, sub_path, ["-map", f"0:{idx}", "-c", "copy"])
+        await FF.stream_op(probe_path, sub_path, ["-map", f"0:{idx}", "-c", "copy"])
     except Exception as exc:
         cleanup(tmp)
+        await _seedr_cleanup(folder_id, seedr_user, seedr_pwd)
         return await safe_edit(
             st,
             f"❌ <b>Subtitle extraction failed</b>\n\n<code>{exc}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
 
-    await _submit_fc_hardsub(client, st, video_path, fname, sub_path, sub_fname,
-                              detail_s, tmp, uid)
+    await _submit_fc_hardsub_url(
+        client, st,
+        video_url, fname, fsize,
+        sub_path, sub_fname, detail_s, tmp, uid,
+        folder_id, seedr_user, seedr_pwd,
+    )
 
 
+async def _submit_fc_hardsub_url(
+    client, st,
+    video_url: str,         # ← Seedr CDN URL sent directly to FC
+    video_fname: str,
+    fsize: int,
+    sub_path: str,
+    sub_fname: str,
+    sub_detail: str,
+    tmp: str,
+    uid: int,
+    folder_id: int,
+    seedr_user: str,
+    seedr_pwd: str,
+) -> None:
+    """Submit video CDN URL + local subtitle file to FreeConvert for hardsub."""
+    from services.freeconvert_api import (
+        pick_best_fc_key, submit_hardsub, run_fc_job,
+    )
+    from services.uploader import upload_file
+    from services.utils import human_size
+    from services.fc_job_store import fc_job_store, FCJob
+    from services.cc_sanitize import build_cc_output_name
+
+    keys        = _get_fc_keys()
+    output_name = build_cc_output_name(video_fname, "VOSTFR")
+
+    await safe_edit(
+        st,
+        f"🔥 <b>Seedr+FC Hardsub</b>\n"
+        "──────────────────────\n\n"
+        f"📁 <code>{video_fname[:38]}</code>\n"
+        f"💬 <code>{sub_detail[:38]}</code>\n"
+        f"📦 → <code>{output_name[:38]}</code>\n\n"
+        "☁️ <i>Submitting to FreeConvert…\n"
+        "Video URL sent directly — only subtitle uploaded!</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    try:
+        key, mins = await pick_best_fc_key(keys)
+
+        # video_url goes as import/url (no upload); subtitle is uploaded as a small file
+        job_id = await submit_hardsub(
+            key,
+            video_url=video_url,        # ← CDN URL, FreeConvert pulls directly
+            subtitle_path=sub_path,     # ← small subtitle file uploaded
+            output_name=output_name,
+            crf=20,
+            preset="medium",
+        )
+
+        await fc_job_store.add(FCJob(
+            job_id=job_id,
+            uid=uid,
+            fname=video_fname,
+            sub_fname=sub_fname,
+            output_name=output_name,
+            status="processing",
+            job_type="hardsub",
+            api_key=key,
+        ))
+
+        await safe_edit(
+            st,
+            f"✅ <b>Seedr+FC Hardsub — Submitted!</b>\n"
+            "──────────────────────\n\n"
+            f"🆔 <code>{job_id}</code>\n"
+            f"📁 <code>{video_fname[:36]}</code>\n"
+            f"💬 <code>{sub_detail[:36]}</code>\n"
+            f"📦 → <code>{output_name[:36]}</code>\n\n"
+            "⏳ <i>FreeConvert is processing…\n"
+            "The hardsubbed MP4 will auto-upload\n"
+            "when ready (~3-5 min).</i>\n\n"
+            "📋 Use /ccstatus to track progress.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    except Exception as exc:
+        log.error("[SFC-Hardsub] FC submit failed: %s", exc, exc_info=True)
+        await safe_edit(
+            st,
+            f"❌ <b>FreeConvert submission failed</b>\n\n<code>{str(exc)[:250]}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    finally:
+        # Clean up Seedr folder — FC has the URL, no longer needed
+        await _seedr_cleanup(folder_id, seedr_user, seedr_pwd)
+        cleanup(tmp)
+
+
+# Keep old name as alias for manual sub flow (file/URL handlers below)
 async def _submit_fc_hardsub(
     client, st,
     video_path: str, video_fname: str,
     sub_path: str, sub_fname: str,
     sub_detail: str, tmp: str, uid: int,
 ) -> None:
-    """Upload video + sub to FreeConvert and start hardsub job."""
+    """Legacy path: video downloaded locally (used only when video_url is unavailable)."""
     from services.freeconvert_api import (
-        parse_fc_keys, pick_best_fc_key, submit_hardsub, run_fc_job,
+        pick_best_fc_key, submit_hardsub, run_fc_job,
     )
     from services.uploader import upload_file
     from services.utils import human_size
@@ -664,8 +844,12 @@ async def sfc_manual_sub_file(client: Client, msg: Message):
         return
 
     tmp         = state["tmp"]
-    video_path  = state["video_path"]
+    video_path  = state.get("video_path")
+    video_url   = state.get("video_url")
     video_fname = state["fname"]
+    folder_id   = state.get("folder_id")
+    seedr_user  = state.get("seedr_user")
+    seedr_pwd   = state.get("seedr_pwd")
 
     st = await msg.reply("⬇️ Downloading subtitle…")
     try:
@@ -681,8 +865,19 @@ async def sfc_manual_sub_file(client: Client, msg: Message):
 
     _SFC_STATE.pop(uid, None)
     sub_fname = os.path.basename(sub_path)
-    await _submit_fc_hardsub(client, st, video_path, video_fname,
-                              sub_path, sub_fname, sub_fname, tmp, uid)
+
+    if video_url and folder_id and seedr_user and seedr_pwd:
+        # Preferred path: send Seedr CDN URL to FC directly (no video upload)
+        await _submit_fc_hardsub_url(
+            client, st,
+            video_url, video_fname, state.get("fsize", 0),
+            sub_path, sub_fname, sub_fname, tmp, uid,
+            folder_id, seedr_user, seedr_pwd,
+        )
+    else:
+        # Fallback: video was downloaded locally
+        await _submit_fc_hardsub(client, st, video_path, video_fname,
+                                  sub_path, sub_fname, sub_fname, tmp, uid)
     msg.stop_propagation()
 
 
@@ -705,8 +900,12 @@ async def sfc_manual_sub_url(client: Client, msg: Message):
         return
 
     tmp         = state["tmp"]
-    video_path  = state["video_path"]
+    video_path  = state.get("video_path")
+    video_url   = state.get("video_url")
     video_fname = state["fname"]
+    folder_id   = state.get("folder_id")
+    seedr_user  = state.get("seedr_user")
+    seedr_pwd   = state.get("seedr_pwd")
 
     st = await msg.reply(f"⬇️ Downloading subtitle…\n<code>{text[:60]}</code>",
                          parse_mode=enums.ParseMode.HTML)
@@ -739,8 +938,19 @@ async def sfc_manual_sub_url(client: Client, msg: Message):
 
     _SFC_STATE.pop(uid, None)
     sub_fname = os.path.basename(sub_path)
-    await _submit_fc_hardsub(client, st, video_path, video_fname,
-                              sub_path, sub_fname, sub_fname, tmp, uid)
+
+    if video_url and folder_id and seedr_user and seedr_pwd:
+        # Preferred path: send Seedr CDN URL to FC directly (no video upload)
+        await _submit_fc_hardsub_url(
+            client, st,
+            video_url, video_fname, state.get("fsize", 0),
+            sub_path, sub_fname, sub_fname, tmp, uid,
+            folder_id, seedr_user, seedr_pwd,
+        )
+    else:
+        # Fallback: video was downloaded locally
+        await _submit_fc_hardsub(client, st, video_path, video_fname,
+                                  sub_path, sub_fname, sub_fname, tmp, uid)
     msg.stop_propagation()
 
 
