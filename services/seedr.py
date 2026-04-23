@@ -64,7 +64,7 @@ class SeedrQuotaError(SeedrError):
 _OAUTH_URL   = "https://www.seedr.cc/oauth_test/token"
 _API_ROOT    = "https://www.seedr.cc/api/folder"
 _API_FILE    = "https://www.seedr.cc/api/file"
-_API_TORRENT = "https://www.seedr.cc/api/torrent"   # FIX: dedicated torrent submission endpoint
+_API_RESOURCE = "https://www.seedr.cc/oauth_test/resource.php"  # OAuth resource endpoint (works on free accounts)
 _CLIENT_ID   = "seedr_xbmc"
 
 _UA = (
@@ -288,19 +288,21 @@ async def _list_folder(user: str, pwd: str, folder_id: int) -> dict:
 
 async def _submit_magnet(user: str, pwd: str, magnet: str) -> Optional[int]:
     """
-    Submit a magnet link to Seedr's dedicated torrent endpoint.
-    Returns torrent_id (or None if the API doesn't provide one).
+    Submit a magnet link via the Seedr OAuth resource endpoint.
+    Works on free accounts — uses the access token, not Basic Auth.
 
-    FIX: Seedr split their API — torrent submission must go to
-    /api/torrent (POST) with field 'magnet', NOT to /api/folder
-    which only accepts GET for folder listing. Posting to /api/folder
-    returns 405 Method Not Allowed.
+    Endpoint: POST https://www.seedr.cc/oauth_test/resource.php
+    Form fields: access_token, func=add_torrent, torrent_magnet=<magnet>
     """
     tok = await _token(user, pwd)
     async with _http() as c:
         r = await c.post(
-            _API_TORRENT,
-            data={"access_token": tok, "magnet": magnet},
+            _API_RESOURCE,
+            data={
+                "access_token":  tok,
+                "func":          "add_torrent",
+                "torrent_magnet": magnet,
+            },
         )
     r.raise_for_status()
 
