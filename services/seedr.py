@@ -304,7 +304,13 @@ async def _root(user: str, pwd: str) -> dict:
 
 
 async def _list_folder(user: str, pwd: str, folder_id: int) -> dict:
+    """List folder contents — tries /api/folder, falls back to resource.php.
+
+    Free accounts often return empty file lists from /api/folder.
+    The resource.php endpoint works universally.
+    """
     d = await _get(user, pwd, {"content_id": folder_id})
+
     folders = [
         {"id": int(f["id"]), "name": f.get("name", ""), "size": int(f.get("size", 0) or 0)}
         for f in d.get("folders", []) if f.get("id") is not None
@@ -313,6 +319,53 @@ async def _list_folder(user: str, pwd: str, folder_id: int) -> dict:
         {"id": int(f["id"]), "name": f.get("name", "file"), "size": int(f.get("size", 0) or 0)}
         for f in d.get("files", []) if f.get("id") is not None
     ]
+
+    # Fallback: if /api/folder returned no files, try resource.php
+    if not files:
+        log.debug("[Seedr] /api/folder returned 0 files for folder %d — trying resource.php", folder_id)
+        try:
+            tok = await _token(user, pwd)
+            async with _http(timeout=20) as c:
+                r = await c.post(
+                    _API_RESOURCE,
+                    data={
+                        "access_token": tok,
+                        "func": "folder",
+                        "content_id": folder_id,
+                    },
+                )
+            r.raise_for_status()
+            d2 = r.json()
+            log.debug("[Seedr] resource.php folder %d response keys: %s", folder_id, list(d2.keys()))
+
+            # Parse files from resource.php response
+            files_raw = d2.get("files", [])
+            for f in files_raw:
+                fid = f.get("id") or f.get("folder_file_id")
+                if fid is not None:
+                    files.append({
+                        "id": int(fid),
+                        "name": f.get("name", "file"),
+                        "size": int(f.get("size", 0) or 0),
+                    })
+
+            # Also parse folders from resource.php
+            folders_raw = d2.get("folders", [])
+            if folders_raw and not folders:
+                for f in folders_raw:
+                    fid = f.get("id")
+                    if fid is not None:
+                        folders.append({
+                            "id": int(fid),
+                            "name": f.get("name", ""),
+                            "size": int(f.get("size", 0) or 0),
+                        })
+
+            log.info("[Seedr] resource.php fallback: %d files, %d folders for folder %d",
+                     len(files), len(folders), folder_id)
+        except Exception as e:
+            log.warning("[Seedr] resource.php folder listing failed for %d: %s", folder_id, e)
+
     return {"folders": folders, "files": files}
 
 
@@ -622,6 +675,9 @@ async def _collect_files(user: str, pwd: str, folder_id: int) -> list[dict]:
                 raise SeedrError(f"Cannot list Seedr folder {fid}: {e}")
             log.warning("[Seedr] Cannot list subfolder %d: %s", fid, e)
             return
+
+        log.info("[Seedr] Folder %d (depth=%d): %d files, %d subfolders",
+                 fid, depth, len(contents["files"]), len(contents["folders"]))
 
         for f in contents["files"]:
             fid2 = f.get("id")
