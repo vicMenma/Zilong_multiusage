@@ -196,10 +196,33 @@ async def _get(user: str, pwd: str, params: dict = None) -> dict:
 
 
 async def _get_file(user: str, pwd: str, params: dict) -> dict:
-    """GET /api/file with auth."""
+    """Get file info — tries /api/file, falls back to resource.php.
+
+    Free accounts often fail on /api/file — the resource.php endpoint
+    (used by seedr_xbmc) works universally.
+    """
     tok = await _token(user, pwd)
-    async with _http() as c:
-        r = await c.get(_API_FILE, params={"access_token": tok, **params})
+    # Try the standard API first (fast path for premium)
+    try:
+        async with _http(timeout=15) as c:
+            r = await c.get(_API_FILE, params={"access_token": tok, **params})
+        r.raise_for_status()
+        data = r.json()
+        if data.get("url"):
+            return data
+    except Exception:
+        pass
+    # Fallback: OAuth resource endpoint (works on free accounts)
+    log.debug("[Seedr] /api/file failed, trying resource.php fallback")
+    async with _http(timeout=20) as c:
+        r = await c.post(
+            _API_RESOURCE,
+            data={
+                "access_token": tok,
+                "func": "fetch_file",
+                **params,
+            },
+        )
     r.raise_for_status()
     return r.json()
 
@@ -262,8 +285,15 @@ async def _root(user: str, pwd: str) -> dict:
             pct = float(str(t.get("progress", 0)).replace("%", "").strip())
         except (ValueError, TypeError):
             pct = 0.0
+        # FIX: cast torrent ID to int — _submit_magnet returns int,
+        # so the poll comparison t["id"] == torrent_id must use same type
+        _tid = t.get("id")
+        try:
+            _tid = int(_tid) if _tid is not None else None
+        except (ValueError, TypeError):
+            _tid = None
         torrents.append({
-            "id":       t.get("id"),
+            "id":       _tid,
             "name":     t.get("name", ""),
             "progress": pct,
             "size":     int(t.get("size", 0) or 0),
@@ -475,6 +505,21 @@ async def _poll(
                 pct  = active["progress"]
                 name = active.get("name", "…")
 
+                # FIX: If torrent shows 100% but is still in active list,
+                # Seedr is finalising — check if folder appeared already
+                if pct >= 100.0:
+                    new_folders = [
+                        f for f in folders
+                        if f["id"] not in pre_existing_folder_ids
+                    ]
+                    if new_folders:
+                        folder = max(new_folders, key=lambda f: f["id"])
+                        log.info("[Seedr] ✅ Done (100%% + folder): '%s' (id=%d)",
+                                 folder["name"], folder["id"])
+                        if progress_cb:
+                            await progress_cb(100.0, folder["name"])
+                        return folder
+
                 # Report only on meaningful change or heartbeat
                 if abs(pct - last_pct) >= 1.0 or (now - last_hb) >= 20.0:
                     last_pct = pct
@@ -539,14 +584,22 @@ async def _collect_files(user: str, pwd: str, folder_id: int) -> list[dict]:
     """
     Walk a folder tree and return all files as:
       [{name, url, size}, ...]
+
+    Raises SeedrError if the folder itself cannot be listed.
+    Individual file URL errors are logged and skipped.
     """
     result: list[dict] = []
 
-    async def _walk(fid: int) -> None:
+    async def _walk(fid: int, depth: int = 0) -> None:
+        if depth > 5:  # safety: prevent infinite recursion
+            return
         try:
             contents = await _list_folder(user, pwd, fid)
         except Exception as e:
-            log.warning("[Seedr] Cannot list folder %d: %s", fid, e)
+            if depth == 0:
+                # Top-level folder listing failed — this IS fatal
+                raise SeedrError(f"Cannot list Seedr folder {fid}: {e}")
+            log.warning("[Seedr] Cannot list subfolder %d: %s", fid, e)
             return
 
         for f in contents["files"]:
@@ -555,14 +608,16 @@ async def _collect_files(user: str, pwd: str, folder_id: int) -> list[dict]:
                 continue
             try:
                 url = await _file_url(user, pwd, fid2)
-                result.append({"name": f["name"], "url": url, "size": f["size"]})
+                result.append({"name": f["name"], "url": url, "size": f.get("size", 0)})
+                log.info("[Seedr] Got URL for '%s' (%s)",
+                         f["name"], f.get("size", 0))
             except Exception as e:
                 log.warning("[Seedr] URL error '%s': %s", f.get("name"), e)
 
         for sub in contents["folders"]:
             sid = sub.get("id")
             if sid:
-                await _walk(sid)
+                await _walk(sid, depth + 1)
 
     await _walk(folder_id)
     return result
