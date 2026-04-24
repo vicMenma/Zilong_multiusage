@@ -102,8 +102,28 @@ _WAITING_SUB_TTL = 1800  # 30 min — auto-cleanup cached video files
 
 def _clear_waiting(uid: int) -> None:
     state = _WAITING_SUB.pop(uid, None)
-    if state and state.get("tmp"):
+    if not state:
+        return
+    if state.get("tmp"):
         cleanup(state["tmp"])
+    # FIX MED-01: also clean up the Seedr folder to reclaim quota.
+    # Without this, /cancel and TTL eviction would leak Seedr folders.
+    folder_id  = state.get("folder_id", 0)
+    seedr_user = state.get("seedr_user", "")
+    seedr_pwd  = state.get("seedr_pwd", "")
+    if folder_id and seedr_user:
+        import asyncio
+        async def _deferred_del():
+            try:
+                from services.seedr import _del_folder
+                await _del_folder(seedr_user, seedr_pwd, folder_id)
+                log.info("[SeedrHS] Seedr folder %d cleaned on cancel/evict", folder_id)
+            except Exception as e:
+                log.warning("[SeedrHS] Seedr cleanup on cancel (non-fatal): %s", e)
+        try:
+            asyncio.get_event_loop().create_task(_deferred_del())
+        except RuntimeError:
+            pass  # no event loop — skip async cleanup
 
 
 def _evict_waiting_subs() -> None:
@@ -455,12 +475,17 @@ async def _auto_hardsub_url(
         "──────────────────────\n\n"
         f"📁 <code>{fname[:40]}</code>\n"
         f"✅ French sub: <code>{detail_s}</code>\n\n"
-        "📤 <i>Extracting subtitle from probe file…</i>",
+        "📤 <i>Extracting subtitle from Seedr CDN…</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
+    # FIX CRIT-04: Extract subtitle from the FULL file via Seedr CDN URL
+    # instead of the 50 MB partial probe file.  FFmpeg supports HTTP input
+    # natively.  The partial file only contains the first ~2-3 min of
+    # interleaved subtitle cues — the rest is silently truncated.
+    extract_source = video_url  # HTTP URL — FFmpeg streams only what it needs
     try:
-        await FF.stream_op(probe_path, sub_path, [
+        await FF.stream_op(extract_source, sub_path, [
             "-map", f"0:{idx}", "-c", "copy",
         ])
     except Exception as exc:
@@ -570,8 +595,12 @@ async def _submit_to_cc_url(
         selected, credits = await pick_best_key(keys)
         key_info = f"🔑 Key {keys.index(selected)+1}/{len(keys)} ({credits} credits)"
 
+        # FIX CRIT-02: pass the selected key, not the raw comma-separated
+        # string.  submit_hardsub() calls pick_best_key() internally — by
+        # passing just the chosen key we skip the redundant credit check
+        # and guarantee key_info matches the actually used key.
         job_id = await submit_hardsub(
-            api_key,
+            selected,
             video_url=video_url,        # ← CDN URL, CloudConvert pulls directly
             subtitle_path=sub_path,     # ← small subtitle file uploaded
             output_name=output_name,
@@ -580,6 +609,8 @@ async def _submit_to_cc_url(
 
         await tracker.finish(ul_tid, success=True)
 
+        # FIX CRIT-01: store Seedr cleanup info so the folder is deleted
+        # AFTER CloudConvert finishes pulling the video, not at submit time.
         await cc_job_store.add(CCJob(
             job_id=job_id,
             uid=uid,
@@ -587,6 +618,9 @@ async def _submit_to_cc_url(
             sub_fname=sub_fname,
             output_name=output_name,
             status="processing",
+            seedr_folder_id=folder_id,
+            seedr_user=seedr_user,
+            seedr_pwd=seedr_pwd,
         ))
 
         try:
@@ -630,13 +664,10 @@ async def _submit_to_cc_url(
             parse_mode=enums.ParseMode.HTML,
         )
     finally:
-        # Clean up Seedr folder — CloudConvert has the URL
-        try:
-            from services.seedr import _del_folder
-            await _del_folder(seedr_user, seedr_pwd, folder_id)
-            log.info("[SeedrHS] Seedr folder %d cleaned up.", folder_id)
-        except Exception as e:
-            log.warning("[SeedrHS] Seedr cleanup (non-fatal): %s", e)
+        # FIX CRIT-01: Do NOT delete the Seedr folder here!
+        # CloudConvert's import/url task has NOT finished downloading yet.
+        # The Seedr CDN URL will 404 if we delete now.  Cleanup is deferred
+        # to ccstatus._deliver_job() which runs after CC finishes.
         cleanup(tmp)
 
 
@@ -718,8 +749,9 @@ async def _submit_to_cc(
             selected, credits = await pick_best_key(keys)
             key_info = f"🔑 {credits} credits remaining"
 
+        # FIX MED-01 / CRIT-02: pass the selected key, not the raw string
         job_id = await submit_hardsub(
-            api_key,
+            selected,
             video_path=video_path,
             subtitle_path=sub_path,
             output_name=output_name,
@@ -888,6 +920,12 @@ async def shs_manual_sub_url(client: Client, msg: Message):
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.get(text, headers=headers, allow_redirects=True) as resp:
                 resp.raise_for_status()
+
+                # FIX MED-02: check Content-Length BEFORE downloading
+                cl = int(resp.headers.get("Content-Length", 0) or 0)
+                if cl > 10_000_000:
+                    return await safe_edit(st, "❌ File too large — not a subtitle.")
+
                 content = await resp.read()
 
                 cd = resp.headers.get("Content-Disposition", "")
@@ -911,6 +949,7 @@ async def shs_manual_sub_url(client: Client, msg: Message):
         with open(sub_path, "wb") as f:
             f.write(content)
 
+        # Double-check actual size (Content-Length may be absent or wrong)
         if len(content) > 10_000_000:
             return await safe_edit(st, "❌ File too large — not a subtitle.")
 

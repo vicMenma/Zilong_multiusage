@@ -786,7 +786,10 @@ async def _do_resize(
                 parse_api_keys, pick_best_key, submit_convert, run_cc_job,
             )
             cc_keys = parse_api_keys(os.environ.get("CC_API_KEY", "").strip())
-            cc_key, _credits = await pick_best_key(cc_keys) if len(cc_keys) > 1 else (cc_keys[0], 0)
+            # FIX HIGH-06: always call pick_best_key() even for single key
+            # so credits are verified. Old code skipped the check with
+            # (cc_keys[0], 0), silently submitting to exhausted keys.
+            cc_key, _credits = await pick_best_key(cc_keys)
 
             tid    = tracker.new_tid()
             record = TaskRecord(
@@ -965,7 +968,8 @@ async def _do_compress(
                 parse_api_keys, pick_best_key, submit_compress, run_cc_job,
             )
             cc_keys = parse_api_keys(os.environ.get("CC_API_KEY", "").strip())
-            cc_key, _credits = await pick_best_key(cc_keys) if len(cc_keys) > 1 else (cc_keys[0], 0)
+            # FIX HIGH-06: always call pick_best_key() for credit check
+            cc_key, _credits = await pick_best_key(cc_keys)
 
             record.update(state="☁️ Uploading to CC…")
             await safe_edit(msg,

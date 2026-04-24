@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 import urllib.parse as _urlparse
 
 import aiohttp
@@ -49,10 +50,23 @@ log = logging.getLogger(__name__)
 _SUB_EXTS = {".ass", ".srt", ".vtt", ".ssa", ".sub", ".txt"}
 
 # ── Per-user state ────────────────────────────────────────────
+# FIX HIGH-03: TTL eviction added to prevent disk/memory leak
+# when users abandon the /hardsub flow without /cancel.
 _STATE: dict[int, dict] = {}
+_STATE_TTL = 1800  # 30 min
+
+
+def _evict_hardsub_states() -> None:
+    """FIX HIGH-03 + LOW-04: evict stale entries holding multi-GB video files."""
+    now = time.time()
+    dead = [uid for uid, s in _STATE.items()
+            if now - s.get("_created", 0) > _STATE_TTL]
+    for uid in dead:
+        _clear(uid)
 
 
 def _user_state(uid: int) -> dict | None:
+    _evict_hardsub_states()
     return _STATE.get(uid)
 
 
@@ -110,6 +124,7 @@ async def start_hardsub_for_url(
         "crf":       23,
         "preset":    "medium",
         "platform":  _default_platform(),
+        "_created":  time.time(),  # FIX HIGH-03: TTL tracking
     }
 
     await _show_subtitle_prompt(st, uid, fname, fsize)
@@ -635,6 +650,7 @@ async def cmd_hardsub(client: Client, msg: Message):
         "step": "waiting_video", "tmp": tmp, "videos": [],
         "sub_path": None, "sub_fname": None,
         "crf": 23, "preset": "medium", "platform": _default_platform(),
+        "_created": time.time(),  # FIX HIGH-03: TTL tracking
     }
     await msg.reply(
         "🔥 <b>Hardsub</b>\n"
@@ -820,7 +836,13 @@ async def _handle_subtitle_url(msg: Message, state: dict, url: str, uid: int) ->
                         if cd_ext in _SUB_EXTS:
                             fname    = re.sub(r'[\\/:*?"<>|]', "_", cd_fname)
                             sub_path = os.path.join(tmp, fname)
+                # FIX MED-02: check Content-Length BEFORE downloading
+                cl = int(resp.headers.get("Content-Length", 0) or 0)
+                if cl > 10_000_000:
+                    await safe_edit(st, "❌ File too large — not a subtitle.")
+                    _clear(uid); return
                 content = await resp.read()
+        # Double-check actual size (Content-Length may be absent or wrong)
         if len(content) > 10_000_000:
             await safe_edit(st, "❌ File too large — not a subtitle.")
             _clear(uid); return

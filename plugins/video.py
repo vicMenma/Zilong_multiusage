@@ -148,8 +148,13 @@ async def _tracked_ffmpeg(user_id: int, label: str, fname: str, coro) -> None:
     try:
         await coro
         record.update(state="✅ Done")
+        # FIX HIGH-01: properly finish the task so it's removed from the
+        # tracker's active list. Without this, ghost tasks accumulate in
+        # /status and semaphore slots are never released.
+        await tracker.finish(tid, success=True)
     except Exception:
         record.update(state="❌ Failed")
+        await tracker.finish(tid, success=False, msg=f"{label} failed")
         raise
 
 
@@ -162,8 +167,10 @@ async def _ensure(client: Client, session: FileSession, st) -> str | None:
         return session.local_path
     dest = os.path.join(session.tmp_dir, session.fname)
     try:
+        # FIX MED-03: pass user_id so TaskRecords are properly attributed
         path = await tg_download(client, session.file_id, dest, st,
-                                 fname=session.fname, fsize=session.fsize)
+                                 fname=session.fname, fsize=session.fsize,
+                                 user_id=session.user_id)
         session.local_path = path
         return path
     except Exception as exc:

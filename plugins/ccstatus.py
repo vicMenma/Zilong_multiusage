@@ -350,6 +350,19 @@ async def _deliver_job(job: CCJob) -> None:
         # Unregister from in-flight tracking regardless of outcome
         _in_flight_delivery_tids.discard(job.job_id)
         cleanup(tmp)
+        # FIX CRIT-01: Deferred Seedr folder cleanup.
+        # The Seedr folder was kept alive while CC pulled the video via
+        # import/url.  Now that delivery is complete (or permanently failed),
+        # we can safely reclaim the Seedr quota.
+        if getattr(job, "seedr_folder_id", 0) and getattr(job, "seedr_user", ""):
+            try:
+                from services.seedr import _del_folder
+                await _del_folder(job.seedr_user, job.seedr_pwd, job.seedr_folder_id)
+                log.info("[CCStatus] Seedr folder %d cleaned after delivery of %s",
+                         job.seedr_folder_id, job.job_id)
+            except Exception as _se:
+                log.warning("[CCStatus] Seedr cleanup (non-fatal) for %s: %s",
+                            job.job_id, _se)
 
 
 # ─────────────────────────────────────────────────────────────
