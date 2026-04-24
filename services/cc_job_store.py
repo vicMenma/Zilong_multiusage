@@ -53,6 +53,11 @@ class CCJob:
     task_message:     str   = ""
     progress_at:      float = field(default_factory=time.time)
     created_at:       float = field(default_factory=time.time)
+    # FIX CRIT-01: Seedr deferred cleanup — folder must stay alive until CC
+    # finishes pulling the video via import/url.  Cleaned after delivery.
+    seedr_folder_id:  int   = 0
+    seedr_user:       str   = ""
+    seedr_pwd:        str   = ""
 
 
 class CCJobStore:

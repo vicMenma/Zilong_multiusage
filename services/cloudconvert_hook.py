@@ -266,6 +266,17 @@ async def handle_cloudconvert(request: web.Request) -> web.Response:
                             await cc_job_store.mark_notified(job_id)
                         except Exception as exc:
                             log.warning("[CC-Hook] notify fail for %s: %s", job_id, exc)
+                        # FIX CRIT-01: Seedr cleanup on failure — no delivery
+                        # will happen, so clean the folder to reclaim quota.
+                        if getattr(job_rec, "seedr_folder_id", 0) and getattr(job_rec, "seedr_user", ""):
+                            try:
+                                from services.seedr import _del_folder
+                                await _del_folder(job_rec.seedr_user, job_rec.seedr_pwd,
+                                                  job_rec.seedr_folder_id)
+                                log.info("[CC-Hook] Seedr folder %d cleaned (job failed)",
+                                         job_rec.seedr_folder_id)
+                            except Exception as _se:
+                                log.warning("[CC-Hook] Seedr cleanup (non-fatal): %s", _se)
                 except Exception as exc:
                     log.warning("[CC-Hook] store update (failed) %s: %s", job_id, exc)
             return web.json_response({"status": "failure_acknowledged"})

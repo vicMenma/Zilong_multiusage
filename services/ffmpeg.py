@@ -644,12 +644,18 @@ async def mux_subtitle(video: str, sub: str, out: str) -> None:
     await _run(["ffmpeg","-y","-i",video,"-i",sub,"-c","copy","-map","0","-map","1",out], "MuxSub")
 
 async def burn_subtitle(video: str, sub: str, out: str) -> None:
+    # FIX HIGH-05: Re-encode audio to AAC 128k instead of stream-copying.
+    # MKV sources often carry AC3/DTS/FLAC tracks that Telegram won't play —
+    # a stream-copy would leave the user with a silent or broken file.
+    # This now matches hardsub_video() behavior.
     abs_sub  = os.path.abspath(sub)
     safe_sub = abs_sub.replace("\\", "/").replace("'", "\\'").replace(":", "\\:")
     await _run([
         "ffmpeg","-y","-i",video,
         "-vf",f"subtitles='{safe_sub}'",
-        "-c:a","copy",out,
+        "-c:a","aac","-b:a","128k",
+        "-movflags","+faststart",
+        out,
     ], "BurnSub")
 
 
@@ -936,10 +942,11 @@ async def compress_to_size(inp: str, out: str, target_mb: float) -> None:
              target_mb, dur, video_kbps)
 
     # Pass 1 — analysis only, no output file
+    # FIX CRIT-05: use os.devnull instead of "/dev/null" for Windows compat
     await _run([
         "ffmpeg", "-y", "-i", inp,
         "-c:v", "libx264", "-b:v", f"{video_kbps}k", "-preset", "medium",
-        "-pass", "1", "-an", "-f", "null", "/dev/null",
+        "-pass", "1", "-an", "-f", "null", os.devnull,
     ], "Compress(pass1)")
 
     # Pass 2 — actual encode
