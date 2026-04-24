@@ -501,7 +501,10 @@ async def _poll(
 
                 if ever_seen:
                     log.info("[Seedr] Torrent gone, waiting for folder (attempt %d)…", gone_polls)
-                    if gone_polls >= 6:
+                    # FIX: increased from 6 to 15 polls (150s at 10s interval).
+                    # Large torrents may take 30-60s to produce a folder on Seedr
+                    # after the torrent vanishes from the active list.
+                    if gone_polls >= 15:
                         raise SeedrError(
                             "Torrent vanished from Seedr without producing a folder. "
                             "It may have been rejected (private tracker, bad magnet, "
@@ -662,17 +665,38 @@ async def download_via_seedr(
         )
 
     # ── Step 6: download locally ──────────────────────────────
+    # FIX: Added progress reporting during local CDN download.
+    # Previously, after Seedr reached 100%, the bot went silent during
+    # what could be a multi-minute file download — users thought it froze.
     os.makedirs(dest, exist_ok=True)
     local_paths: list[str] = []
 
     for i, f in enumerate(files):
         clean = sanitize_filename(f["name"])
+        fsize_f = f.get("size", 0)
+
+        # Per-file progress callback that reports through the pipeline cb
+        async def _file_progress(done: int, total: int, speed: float, eta: int,
+                                 _i=i, _clean=clean, _fsize=fsize_f) -> None:
+            if progress_cb:
+                pct = (done / total * 100) if total else 0
+                speed_s = f"{speed / 1e6:.1f} MB/s" if speed else ""
+                await progress_cb(
+                    "dl_file", pct,
+                    f"⬇️ {_clean[:35]} ({_i+1}/{len(files)})",
+                    done_bytes=done, total_bytes=total,
+                    speed=speed, eta=eta,
+                )
+
         if progress_cb:
-            await progress_cb("saving", i / len(files) * 100,
-                              f"⬇️ {clean} ({i+1}/{len(files)})")
+            await progress_cb("dl_file", 0,
+                              f"⬇️ {clean[:40]} ({i+1}/{len(files)})",
+                              done_bytes=0, total_bytes=fsize_f,
+                              speed=0.0, eta=0)
+
         log.info("[Seedr] Downloading %d/%d: %s", i + 1, len(files), f["name"])
         try:
-            path = await download_direct(f["url"], dest)
+            path = await download_direct(f["url"], dest, progress=_file_progress)
             # Rename to the sanitised filename if needed
             target = os.path.join(dest, clean)
             if path != target:
