@@ -545,13 +545,17 @@ async def _show_ytdlp_quality_picker(
 
 async def _seedr_download(client, st, magnet: str, uid: int) -> None:
     from services.seedr import download_via_seedr
-    from services.utils import make_tmp, cleanup, human_size, human_dur
+    from services.utils import (
+        make_tmp, cleanup, human_size, human_dur,
+        PanelUpdater, progress_panel,
+    )
     from core.session import settings as _settings
     from services.task_runner import tracker, runner, TaskRecord
 
     import re as _re
+    import urllib.parse as _up
     _dn  = _re.search(r"[&?]dn=([^&]+)", magnet)
-    _lbl = _dn.group(1)[:40] if _dn else "Seedr Download"
+    _lbl = _up.unquote_plus(_dn.group(1))[:40] if _dn else "Seedr Download"
     _tid = tracker.new_tid()
     _rec = TaskRecord(tid=_tid, user_id=uid, label=_lbl, mode="seedr", engine="seedr")
     await tracker.register(_rec)
@@ -560,35 +564,104 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
     tmp        = make_tmp(cfg.download_dir, uid)
     start_time = time.time()
 
-    # BUG-UH-03 FIX: heartbeat every 30s so progress never looks truly stuck
-    _last_pct: list[float] = [-1.0]
-    _last_hb:  list[float] = [time.time()]
+    # Get user's preferred panel style
+    _us = await _settings.get(uid)
+    _style = _us.get("progress_style", "B")
+
+    # ── Build function for PanelUpdater ──────────────────────
+    def _build_panel(state: dict) -> str:
+        return progress_panel(
+            mode    = state.get("mode", "dl"),
+            fname   = state.get("fname", _lbl),
+            done    = state.get("done", 0),
+            total   = state.get("total", 0),
+            speed   = state.get("speed", 0.0),
+            eta     = state.get("eta", 0),
+            elapsed = time.time() - start_time,
+            engine  = "seedr",
+            state   = state.get("state_label", ""),
+            style   = _style,
+        )
+
+    # ── Progress callback from download_via_seedr ────────────
+    # PanelUpdater.tick() is non-blocking — safe at any frequency.
+    _pu: list = [None]  # will be set once PanelUpdater starts
 
     async def _progress(stage: str, pct: float, detail: str) -> None:
-        now = time.time()
-        elapsed = human_dur(int(now - start_time))
-        icons   = {"adding":"⬆️","waiting":"⏳","downloading":"☁️",
-                   "fetching":"🔗","dl_file":"⬇️"}
-        icon = icons.get(stage, "⏳")
-        bar  = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
-        changed = (pct != _last_pct[0])
-        heartbeat = (now - _last_hb[0]) >= 30.0
-        if changed or heartbeat:
-            _last_pct[0] = pct
-            _last_hb[0]  = now
-            await safe_edit(
-                st,
-                f"☁️ <b>Seedr Cloud Download</b>\n"
-                "──────────────────────\n\n"
-                f"{icon} <i>{detail}</i>\n\n"
-                f"<code>[{bar}]</code>  <b>{pct:.0f}%</b>  ·  ⏱ <i>{elapsed}</i>",
-                parse_mode=enums.ParseMode.HTML,
-            )
+        pu = _pu[0]
+        if not pu:
+            return
+
+        # Map seedr stages to panel modes
+        mode_map = {
+            "selecting": "queue", "submitting": "queue",
+            "waiting": "dl",     "downloading": "dl",
+            "fetching": "dl",    "dl_file": "dl",
+            "saving": "dl",
+        }
+        panel_mode = mode_map.get(stage, "dl")
+
+        # For dl_file stage, we get real bytes from download_direct
+        # The detail string contains progress info
+        pu.tick(
+            mode=panel_mode,
+            fname=_lbl,
+            state_label=detail,
+        )
+
+        # Update tracker for /status
+        await tracker.update(
+            _tid,
+            state=f"☁️ {detail[:50]}",
+        )
 
     try:
-        local_paths = await download_via_seedr(
-            magnet, tmp, progress_cb=_progress, timeout_s=7200,
-        )
+        async with PanelUpdater(st, _build_panel, interval=2.0) as pu:
+            _pu[0] = pu
+
+            # Wrap download_via_seedr's progress_cb to feed PanelUpdater
+            async def _seedr_progress(stage: str, pct: float, detail: str, **kw) -> None:
+                # Map Seedr stages to done/total for the panel bar
+                mode_map = {
+                    "selecting": "queue", "submitting": "queue",
+                    "waiting": "dl",     "downloading": "dl",
+                    "fetching": "dl",    "dl_file": "dl",
+                }
+                panel_mode = mode_map.get(stage, "dl")
+
+                # For non-download stages, synthesise bar from stage pct
+                if stage in ("selecting", "submitting", "waiting",
+                             "downloading", "fetching"):
+                    # pct is 0-100 for torrent progress
+                    pu.tick(
+                        mode=panel_mode,
+                        fname=_lbl,
+                        done=int(pct),
+                        total=100,
+                        speed=0.0,
+                        eta=0,
+                        state_label=detail,
+                    )
+                elif stage == "dl_file":
+                    # Real CDN download — use byte-level data from kwargs
+                    pu.tick(
+                        mode="dl",
+                        fname=_lbl,
+                        done=kw.get("done_bytes", 0),
+                        total=kw.get("total_bytes", 0),
+                        speed=kw.get("speed", 0.0),
+                        eta=kw.get("eta", 0),
+                        state_label=detail,
+                    )
+                else:
+                    pu.tick(mode=panel_mode, fname=_lbl, state_label=detail)
+
+                await tracker.update(_tid, state=f"☁️ {detail[:50]}")
+
+            local_paths = await download_via_seedr(
+                magnet, tmp, progress_cb=_seedr_progress, timeout_s=7200,
+            )
+
     except asyncio.CancelledError:
         await tracker.finish(_tid, success=False, msg="Cancelled")
         cleanup(tmp)
