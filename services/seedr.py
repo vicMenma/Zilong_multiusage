@@ -546,9 +546,21 @@ async def _poll(
 
                 if ever_seen:
                     log.info("[Seedr] Torrent gone, waiting for folder (attempt %d)…", gone_polls)
-                    # FIX: increased from 6 to 15 polls (150s at 10s interval).
-                    # Large torrents may take 30-60s to produce a folder on Seedr
-                    # after the torrent vanishes from the active list.
+
+                    # FIX: After 3 failed attempts, fall back to ANY existing folder.
+                    # This handles cached/duplicate magnets: Seedr returns torrent_id=None,
+                    # the torrent completes instantly, and the folder was already in
+                    # pre_existing_folder_ids from the snapshot. The folder IS there,
+                    # we just filtered it out.
+                    if gone_polls >= 3 and folders:
+                        # Pick the largest folder (most likely to be our video)
+                        folder = max(folders, key=lambda f: f.get("size", 0))
+                        log.info("[Seedr] ✅ Fallback: using existing folder '%s' (id=%d, %d bytes)",
+                                 folder["name"], folder["id"], folder.get("size", 0))
+                        if progress_cb:
+                            await progress_cb(100.0, folder["name"])
+                        return folder
+
                     if gone_polls >= 15:
                         raise SeedrError(
                             "Torrent vanished from Seedr without producing a folder. "
@@ -557,6 +569,15 @@ async def _poll(
                         )
                 else:
                     # Not yet visible — might be in Seedr's queue / metadata fetch phase
+                    # FIX: Also check for cached torrent (torrent_id=None, instant complete)
+                    if gone_polls >= 3 and torrent_id is None and folders:
+                        folder = max(folders, key=lambda f: f.get("size", 0))
+                        log.info("[Seedr] ✅ Cached torrent fallback: '%s' (id=%d)",
+                                 folder["name"], folder["id"])
+                        if progress_cb:
+                            await progress_cb(100.0, folder["name"])
+                        return folder
+
                     if (now - last_hb) >= 20.0:
                         last_hb = now
                         log.debug("[Seedr] Waiting for torrent to appear…")
