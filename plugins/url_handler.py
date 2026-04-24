@@ -583,41 +583,8 @@ async def _seedr_download(client, st, magnet: str, uid: int) -> None:
             style   = _style,
         )
 
-    # ── Progress callback from download_via_seedr ────────────
-    # PanelUpdater.tick() is non-blocking — safe at any frequency.
-    _pu: list = [None]  # will be set once PanelUpdater starts
-
-    async def _progress(stage: str, pct: float, detail: str) -> None:
-        pu = _pu[0]
-        if not pu:
-            return
-
-        # Map seedr stages to panel modes
-        mode_map = {
-            "selecting": "queue", "submitting": "queue",
-            "waiting": "dl",     "downloading": "dl",
-            "fetching": "dl",    "dl_file": "dl",
-            "saving": "dl",
-        }
-        panel_mode = mode_map.get(stage, "dl")
-
-        # For dl_file stage, we get real bytes from download_direct
-        # The detail string contains progress info
-        pu.tick(
-            mode=panel_mode,
-            fname=_lbl,
-            state_label=detail,
-        )
-
-        # Update tracker for /status
-        await tracker.update(
-            _tid,
-            state=f"☁️ {detail[:50]}",
-        )
-
     try:
         async with PanelUpdater(st, _build_panel, interval=2.0) as pu:
-            _pu[0] = pu
 
             # Wrap download_via_seedr's progress_cb to feed PanelUpdater
             async def _seedr_progress(stage: str, pct: float, detail: str, **kw) -> None:
