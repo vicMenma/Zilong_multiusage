@@ -501,73 +501,6 @@ async def _auto_hardsub_url(
 
 
 # ─────────────────────────────────────────────────────────────
-# Auto-hardsub: extract French sub + submit to CC
-# ─────────────────────────────────────────────────────────────
-
-async def _auto_hardsub(
-    client: Client, st, video_path: str, fname: str,
-    sub_stream: dict, tmp: str, uid: int,
-) -> None:
-    from services import ffmpeg as FF
-    from services.cloudconvert_api import submit_hardsub, parse_api_keys, pick_best_key
-    from services.cc_job_store import cc_job_store, CCJob
-    from services.cc_sanitize import build_cc_output_name
-
-    idx    = sub_stream.get("index", 0)
-    codec  = (sub_stream.get("codec_name") or "ass").lower()
-    ext    = FF.subtitle_ext(codec)
-    tags   = sub_stream.get("tags", {}) or {}
-    title  = tags.get("title", "")
-    forced = sub_stream.get("_is_forced", False)
-
-    sub_path  = os.path.join(tmp, f"french_sub{ext}")
-    sub_fname = os.path.basename(sub_path)
-
-    forced_s = " (Forced)" if forced else ""
-    detail_s = f"#{idx} {codec.upper()}{forced_s}"
-    if title:
-        detail_s += f" — {title}"
-
-    await safe_edit(
-        st,
-        f"🔥 <b>Seedr → Hardsub</b>\n"
-        "──────────────────────\n\n"
-        f"📁 <code>{fname[:40]}</code>\n"
-        f"✅ French sub: <code>{detail_s}</code>\n\n"
-        "📤 <i>Extracting subtitle…</i>",
-        parse_mode=enums.ParseMode.HTML,
-    )
-
-    try:
-        await FF.stream_op(video_path, sub_path, [
-            "-map", f"0:{idx}", "-c", "copy",
-        ])
-    except Exception as exc:
-        cleanup(tmp)
-        log.error("[SeedrHS] Sub extraction failed: %s", exc)
-        return await safe_edit(
-            st,
-            f"❌ <b>Subtitle extraction failed</b>\n\n<code>{exc}</code>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-
-    if not os.path.isfile(sub_path) or os.path.getsize(sub_path) < 10:
-        cleanup(tmp)
-        return await safe_edit(
-            st,
-            "❌ <b>Extracted subtitle is empty.</b>\n\n"
-            "Try sending a subtitle file manually with /hardsub.",
-            parse_mode=enums.ParseMode.HTML,
-        )
-
-    sub_size = os.path.getsize(sub_path)
-    log.info("[SeedrHS] Extracted: %s (%s)", sub_fname, human_size(sub_size))
-
-    await _submit_to_cc_url(client, st, video_url, fname, sub_path, sub_fname,
-                             detail_s, tmp, uid, folder_id, seedr_user, seedr_pwd)
-
-
-# ─────────────────────────────────────────────────────────────
 # Submit CDN URL + subtitle to CloudConvert (URL-based, no video upload)
 # ─────────────────────────────────────────────────────────────
 
@@ -606,33 +539,33 @@ async def _submit_to_cc_url(
         parse_mode=enums.ParseMode.HTML,
     )
 
-    # Only the subtitle needs uploading (small file)
-    ul_tid = tracker.new_tid()
-    ul_rec = TaskRecord(
-        tid=ul_tid, user_id=uid,
-        label=f"CC↑ {video_fname} (sub only)",
-        fname=video_fname,
-        mode="ul", engine="http",
-        state="☁️ Uploading subtitle to CC",
-        total=os.path.getsize(sub_path),
-    )
-    await tracker.register(ul_rec)
-
-    sub_size  = os.path.getsize(sub_path)
-    _ul_start = _time.time()
-
-    async def _upload_progress(phase: str, done: int, total: int) -> None:
-        elapsed = _time.time() - _ul_start
-        speed   = done / elapsed if elapsed else 0.0
-        eta     = int((sub_size - done) / speed) if (speed and sub_size > done) else 0
-        await tracker.update(
-            ul_tid,
-            state=f"☁️ Sub {human_size(done)}/{human_size(sub_size)}",
-            done=done, total=sub_size,
-            speed=speed, eta=eta, elapsed=elapsed,
-        )
-
+    ul_tid = None
     try:
+        ul_tid = tracker.new_tid()
+        ul_rec = TaskRecord(
+            tid=ul_tid, user_id=uid,
+            label=f"CC↑ {video_fname} (sub only)",
+            fname=video_fname,
+            mode="ul", engine="http",
+            state="☁️ Uploading subtitle to CC",
+            total=os.path.getsize(sub_path),
+        )
+        await tracker.register(ul_rec)
+
+        sub_size  = os.path.getsize(sub_path)
+        _ul_start = _time.time()
+
+        async def _upload_progress(phase: str, done: int, total: int) -> None:
+            elapsed = _time.time() - _ul_start
+            speed   = done / elapsed if elapsed else 0.0
+            eta     = int((sub_size - done) / speed) if (speed and sub_size > done) else 0
+            await tracker.update(
+                ul_tid,
+                state=f"☁️ Sub {human_size(done)}/{human_size(sub_size)}",
+                done=done, total=sub_size,
+                speed=speed, eta=eta, elapsed=elapsed,
+            )
+
         keys = parse_api_keys(api_key)
         selected, credits = await pick_best_key(keys)
         key_info = f"🔑 Key {keys.index(selected)+1}/{len(keys)} ({credits} credits)"
@@ -684,7 +617,11 @@ async def _submit_to_cc_url(
         )
 
     except Exception as exc:
-        await tracker.finish(ul_tid, success=False, msg=str(exc)[:60])
+        if ul_tid is not None:
+            try:
+                await tracker.finish(ul_tid, success=False, msg=str(exc)[:60])
+            except Exception:
+                pass
         log.error("[SeedrHS] CC submit failed: %s", exc, exc_info=True)
         await safe_edit(
             st,
@@ -737,41 +674,42 @@ async def _submit_to_cc(
         parse_mode=enums.ParseMode.HTML,
     )
 
-    ul_tid = tracker.new_tid()
-    ul_rec = TaskRecord(
-        tid=ul_tid, user_id=uid,
-        label=f"CC↑ {video_fname}",
-        fname=video_fname,
-        mode="ul", engine="http",
-        state="☁️ Uploading to CC",
-        total=os.path.getsize(video_path) + os.path.getsize(sub_path),
-    )
-    await tracker.register(ul_rec)
-
-    sub_size   = os.path.getsize(sub_path)
-    vid_size   = os.path.getsize(video_path)
-    _ul_start  = _time.time()
-
-    async def _upload_progress(phase: str, done: int, total: int) -> None:
-        if phase == "sub":
-            pct_label = f"📄 Sub {human_size(done)}/{human_size(sub_size)}"
-            ul_done = done
-            ul_total = sub_size + vid_size
-        else:
-            pct_label = f"🎬 Video {human_size(done)}/{human_size(vid_size)}"
-            ul_done = sub_size + done
-            ul_total = sub_size + vid_size
-        elapsed = _time.time() - _ul_start
-        speed   = ul_done / elapsed if elapsed else 0.0
-        eta     = int((ul_total - ul_done) / speed) if (speed and ul_total > ul_done) else 0
-        await tracker.update(
-            ul_tid,
-            state=f"☁️ {pct_label}",
-            done=ul_done, total=ul_total,
-            speed=speed, eta=eta, elapsed=elapsed,
-        )
-
+    ul_tid = None
     try:
+        ul_tid = tracker.new_tid()
+        ul_rec = TaskRecord(
+            tid=ul_tid, user_id=uid,
+            label=f"CC↑ {video_fname}",
+            fname=video_fname,
+            mode="ul", engine="http",
+            state="☁️ Uploading to CC",
+            total=os.path.getsize(video_path) + os.path.getsize(sub_path),
+        )
+        await tracker.register(ul_rec)
+
+        sub_size   = os.path.getsize(sub_path)
+        vid_size   = os.path.getsize(video_path)
+        _ul_start  = _time.time()
+
+        async def _upload_progress(phase: str, done: int, total: int) -> None:
+            if phase == "sub":
+                pct_label = f"📄 Sub {human_size(done)}/{human_size(sub_size)}"
+                ul_done = done
+                ul_total = sub_size + vid_size
+            else:
+                pct_label = f"🎬 Video {human_size(done)}/{human_size(vid_size)}"
+                ul_done = sub_size + done
+                ul_total = sub_size + vid_size
+            elapsed = _time.time() - _ul_start
+            speed   = ul_done / elapsed if elapsed else 0.0
+            eta     = int((ul_total - ul_done) / speed) if (speed and ul_total > ul_done) else 0
+            await tracker.update(
+                ul_tid,
+                state=f"☁️ {pct_label}",
+                done=ul_done, total=ul_total,
+                speed=speed, eta=eta, elapsed=elapsed,
+            )
+
         keys = parse_api_keys(api_key)
         if len(keys) > 1:
             selected, credits = await pick_best_key(keys)
@@ -827,7 +765,11 @@ async def _submit_to_cc(
         )
 
     except Exception as exc:
-        await tracker.finish(ul_tid, success=False, msg=str(exc)[:60])
+        if ul_tid is not None:
+            try:
+                await tracker.finish(ul_tid, success=False, msg=str(exc)[:60])
+            except Exception:
+                pass
         log.error("[SeedrHS] CC submit failed: %s", exc, exc_info=True)
         await safe_edit(
             st,
