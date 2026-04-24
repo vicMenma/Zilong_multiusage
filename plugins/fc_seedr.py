@@ -409,15 +409,13 @@ async def _sfc_convert_pipeline(
     except Exception as exc:
         log.error("[SFC-Convert] FC failed: %s", exc, exc_info=True)
         cleanup(tmp)
-        # Clean up Seedr folder since conversion failed
-        await _seedr_cleanup(folder_id, seedr_user, seedr_pwd)
         return await safe_edit(
             st,
             f"❌ <b>FreeConvert conversion failed</b>\n\n<code>{str(exc)[:300]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
     finally:
-        # Always clean up Seedr folder once FC has the file
+        # Always clean up Seedr folder once FC has the file (or on failure)
         await _seedr_cleanup(folder_id, seedr_user, seedr_pwd)
 
     # Step 3: Download result → Upload to Telegram
@@ -427,15 +425,28 @@ async def _sfc_convert_pipeline(
     except Exception:
         pass
 
-    upload_st = await client.send_message(
-        uid,
-        f"🔄 <b>Convert done!</b>  {res_label}\n"
-        f"<code>{out_name}</code>  <code>{human_size(result_size)}</code>\n"
-        "⬆️ Uploading…",
-        parse_mode=enums.ParseMode.HTML,
-    )
+    try:
+        upload_st = await client.send_message(
+            uid,
+            f"🔄 <b>Convert done!</b>  {res_label}\n"
+            f"<code>{out_name}</code>  <code>{human_size(result_size)}</code>\n"
+            "⬆️ Uploading…",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception as exc:
+        log.error("[SFC-Convert] send_message failed: %s", exc)
+        cleanup(tmp)
+        return
+
     try:
         await upload_file(client, upload_st, result_path, user_id=uid)
+    except Exception as exc:
+        log.error("[SFC-Convert] upload_file failed: %s", exc, exc_info=True)
+        await safe_edit(
+            upload_st,
+            f"❌ <b>Upload failed</b>\n\n<code>{str(exc)[:200]}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
     finally:
         cleanup(tmp)
 
