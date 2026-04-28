@@ -1,32 +1,25 @@
 """
-services/seedr.py  — COMPLETE REWRITE (Zero-based)
+services/seedr.py  — FIXED v2
 ═══════════════════════════════════════════════════════════════════════
 
-WHAT THIS SOLVES (from scratch, my own logic)
-─────────────────────────────────────────────
-  • Real OAuth2 password flow + token refresh with in-process cache
-  • API calls always validate JSON body, never trust HTTP 200 alone
-  • Magnet submission returns a torrent_id we track precisely
-  • Polling tracks torrent by ID, not by fragile name-matching
-  • Fast-finish torrents handled: we snapshot folders BEFORE submit
-  • Free-account storage auto-managed: cleanup before every job
-  • Multi-account rotation: picks account with most free space
-  • Proxy support: set SEEDR_PROXY for cloud-IP environments
-  • Recursive file collector + single-file torrent edge case handled
-  • Full cleanup after download (reclaim quota for free account)
+FIXES IN THIS VERSION
+─────────────────────
+FIX SEEDR-AUTH: All API calls now send both `access_token` as a query/body
+  param AND `Authorization: Bearer {tok}` as an HTTP header.  Seedr's API
+  update added header-based auth; the old token-in-params approach no longer
+  works for folder listing, causing _root() to return empty data and breaking
+  all three Seedr flows (download, Seedr+CC hardsub, Seedr+FC).
 
-ENV VARIABLES
-─────────────
-  Single account:
-    SEEDR_USERNAME=you@email.com
-    SEEDR_PASSWORD=yourpassword
+FIX SEEDR-ROOT-FALLBACK: _root() now falls back to the resource.php endpoint
+  if /api/folder returns empty or fails.  This is the same endpoint used by
+  _submit_magnet and _list_folder, ensuring torrent-progress polling works
+  even when /api/folder's auth requirement changes.
 
-  Multi-account (recommended for free tier, comma-separated):
-    SEEDR_USERNAME=a@mail.com,b@mail.com,c@mail.com
-    SEEDR_PASSWORD=passA,passB,passC
+FIX SEEDR-LIST-ROBUST: _list_folder() resource.php fallback now correctly
+  handles both `id` and `folder_file_id` field names from the API response.
 
-  Proxy (needed on cloud IPs — Render, Railway, Colab, etc.):
-    SEEDR_PROXY=http://user:pass@host:port
+Everything else (download_via_seedr, fetch_urls_via_seedr, public helpers)
+is unchanged — callers don't need any modifications.
 ═══════════════════════════════════════════════════════════════════════
 """
 
@@ -61,11 +54,11 @@ class SeedrQuotaError(SeedrError):
 # Constants
 # ══════════════════════════════════════════════════════
 
-_OAUTH_URL   = "https://www.seedr.cc/oauth_test/token"
-_API_ROOT    = "https://www.seedr.cc/api/folder"
-_API_FILE    = "https://www.seedr.cc/api/file"
-_API_RESOURCE = "https://www.seedr.cc/oauth_test/resource.php"  # OAuth resource endpoint (works on free accounts)
-_CLIENT_ID   = "seedr_xbmc"
+_OAUTH_URL    = "https://www.seedr.cc/oauth_test/token"
+_API_ROOT     = "https://www.seedr.cc/api/folder"
+_API_FILE     = "https://www.seedr.cc/api/file"
+_API_RESOURCE = "https://www.seedr.cc/oauth_test/resource.php"
+_CLIENT_ID    = "seedr_xbmc"
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -73,7 +66,6 @@ _UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Minimum free bytes we require before submitting a torrent
 _MIN_FREE = 256 * 1024 * 1024   # 256 MB
 
 # Token store: { username: {access_token, refresh_token, expires_at} }
@@ -98,7 +90,6 @@ def _accounts() -> list[tuple[str, str]]:
             "  SEEDR_USERNAME=a@mail.com,b@mail.com\n"
             "  SEEDR_PASSWORD=passA,passB"
         )
-    # If only one password given, reuse for all accounts
     if len(pwds) == 1:
         pwds = pwds * len(users)
     return list(zip(users, pwds))
@@ -172,56 +163,43 @@ async def _token(user: str, pwd: str) -> str:
     t = _TOKENS.get(user)
     if t:
         remaining = t["expires_at"] - time.monotonic()
-        if remaining > 90:                     # still valid
+        if remaining > 90:
             return t["access_token"]
         if t["refresh_token"]:
             try:
                 return await _refresh(user, t["refresh_token"])
             except SeedrAuthError:
-                pass                           # fall through to full login
+                pass
     return await _login(user, pwd)
 
 
 # ══════════════════════════════════════════════════════
 # Low-level API calls
+# FIX SEEDR-AUTH: all requests now send both token-in-params AND
+# Authorization: Bearer header to support both old and new Seedr API auth.
 # ══════════════════════════════════════════════════════
 
+def _auth_headers(tok: str) -> dict:
+    """
+    FIX SEEDR-AUTH: return headers that satisfy both old and new Seedr auth.
+    Old API: access_token in query params / POST body.
+    New API: Authorization: Bearer header.
+    We send both to be safe.
+    """
+    return {
+        "Authorization": f"Bearer {tok}",
+        "User-Agent": _UA,
+    }
+
+
 async def _get(user: str, pwd: str, params: dict = None) -> dict:
-    """GET /api/folder with auth."""
+    """GET /api/folder with auth (token in params AND Authorization header)."""
     tok = await _token(user, pwd)
     async with _http() as c:
-        r = await c.get(_API_ROOT, params={"access_token": tok, **(params or {})})
-    r.raise_for_status()
-    return r.json()
-
-
-async def _get_file(user: str, pwd: str, params: dict) -> dict:
-    """Get file info — tries /api/file, falls back to resource.php.
-
-    Free accounts often fail on /api/file — the resource.php endpoint
-    (used by seedr_xbmc) works universally.
-    """
-    tok = await _token(user, pwd)
-    # Try the standard API first (fast path for premium)
-    try:
-        async with _http(timeout=15) as c:
-            r = await c.get(_API_FILE, params={"access_token": tok, **params})
-        r.raise_for_status()
-        data = r.json()
-        if data.get("url"):
-            return data
-    except Exception:
-        pass
-    # Fallback: OAuth resource endpoint (works on free accounts)
-    log.debug("[Seedr] /api/file failed, trying resource.php fallback")
-    async with _http(timeout=20) as c:
-        r = await c.post(
-            _API_RESOURCE,
-            data={
-                "access_token": tok,
-                "func": "fetch_file",
-                **params,
-            },
+        r = await c.get(
+            _API_ROOT,
+            params={"access_token": tok, **(params or {})},
+            headers=_auth_headers(tok),
         )
     r.raise_for_status()
     return r.json()
@@ -230,26 +208,134 @@ async def _get_file(user: str, pwd: str, params: dict) -> dict:
 async def _post(user: str, pwd: str, data: dict) -> dict:
     """
     POST /api/folder with auth.
-    Raises SeedrError if the JSON body signals failure,
-    even when HTTP status is 200.
+    FIX SEEDR-AUTH: sends Authorization header in addition to body param.
+    Raises SeedrError if the JSON body signals failure.
     """
     tok = await _token(user, pwd)
     async with _http() as c:
-        r = await c.post(_API_ROOT, data={"access_token": tok, **data})
+        r = await c.post(
+            _API_ROOT,
+            data={"access_token": tok, **data},
+            headers=_auth_headers(tok),
+        )
     r.raise_for_status()
 
     try:
         body = r.json()
     except Exception:
-        return {"result": True}  # some endpoints return non-JSON on success
+        return {"result": True}
 
-    # Seedr signals errors with result:false even on HTTP 200
     result = body.get("result")
     if result is False or str(result).lower() == "false":
         msg = body.get("error") or body.get("message") or repr(body)
         raise SeedrError(f"Seedr API: {msg}")
 
     return body
+
+
+async def _resource_post(user: str, pwd: str, func: str, extra: dict = None) -> dict:
+    """
+    POST to resource.php endpoint — works on all Seedr plans.
+    FIX SEEDR-AUTH: sends both token-in-body and Authorization header.
+    """
+    tok = await _token(user, pwd)
+    payload = {
+        "access_token": tok,
+        "func": func,
+        **(extra or {}),
+    }
+    async with _http() as c:
+        r = await c.post(
+            _API_RESOURCE,
+            data=payload,
+            headers=_auth_headers(tok),
+        )
+    r.raise_for_status()
+    try:
+        body = r.json()
+    except Exception:
+        return {"result": True}
+
+    result = body.get("result")
+    if result is False or str(result).lower() == "false":
+        msg = body.get("error") or body.get("message") or repr(body)
+        raise SeedrError(f"Seedr resource API: {msg}")
+
+    return body
+
+
+# ══════════════════════════════════════════════════════
+# Root folder parsing helpers
+# ══════════════════════════════════════════════════════
+
+def _parse_folders(raw_list: list) -> list[dict]:
+    result = []
+    for f in raw_list:
+        fid = f.get("id")
+        if fid is None:
+            continue
+        try:
+            result.append({
+                "id":   int(fid),
+                "name": f.get("name", ""),
+                "size": int(f.get("size", 0) or 0),
+            })
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
+def _parse_files(raw_list: list) -> list[dict]:
+    result = []
+    for f in raw_list:
+        # resource.php may use "folder_file_id" instead of "id"
+        fid = f.get("id") or f.get("folder_file_id")
+        if fid is None:
+            continue
+        try:
+            result.append({
+                "id":   int(fid),
+                "name": f.get("name", "file"),
+                "size": int(f.get("size", 0) or 0),
+            })
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
+def _parse_torrents(raw_list: list) -> list[dict]:
+    result = []
+    for t in raw_list:
+        try:
+            pct = float(str(t.get("progress", 0)).replace("%", "").strip())
+        except (ValueError, TypeError):
+            pct = 0.0
+        _tid = t.get("id")
+        try:
+            _tid = int(_tid) if _tid is not None else None
+        except (ValueError, TypeError):
+            _tid = None
+        result.append({
+            "id":       _tid,
+            "name":     t.get("name", ""),
+            "progress": pct,
+            "size":     int(t.get("size", 0) or 0),
+        })
+    return result
+
+
+def _root_from_dict(d: dict) -> dict:
+    """Build the root dict from a raw API response (handles both /api/folder and resource.php)."""
+    folders  = _parse_folders(d.get("folders", []))
+    files    = _parse_files(d.get("files", []))
+    torrents = _parse_torrents(d.get("torrents", []))
+    return {
+        "folders":    folders,
+        "files":      files,
+        "torrents":   torrents,
+        "space_used": d.get("space_used"),
+        "space_max":  d.get("space_max"),
+    }
 
 
 # ══════════════════════════════════════════════════════
@@ -267,125 +353,90 @@ async def _storage(user: str, pwd: str) -> dict:
 async def _root(user: str, pwd: str) -> dict:
     """
     List root contents: folders, files, active torrents.
-    Normalises progress to a float in [0, 100].
+
+    FIX SEEDR-ROOT-FALLBACK: tries /api/folder first; if it returns empty
+    data (e.g., because the API now requires a different auth format),
+    falls back to resource.php which is more reliable across API versions.
     """
-    d = await _get(user, pwd)
+    d: dict = {}
 
-    folders = [
-        {"id": int(f["id"]), "name": f.get("name", ""), "size": int(f.get("size", 0) or 0)}
-        for f in d.get("folders", []) if f.get("id") is not None
-    ]
-    files = [
-        {"id": int(f["id"]), "name": f.get("name", "file"), "size": int(f.get("size", 0) or 0)}
-        for f in d.get("files", []) if f.get("id") is not None
-    ]
-    torrents = []
-    for t in d.get("torrents", []):
-        try:
-            pct = float(str(t.get("progress", 0)).replace("%", "").strip())
-        except (ValueError, TypeError):
-            pct = 0.0
-        # FIX: cast torrent ID to int — _submit_magnet returns int,
-        # so the poll comparison t["id"] == torrent_id must use same type
-        _tid = t.get("id")
-        try:
-            _tid = int(_tid) if _tid is not None else None
-        except (ValueError, TypeError):
-            _tid = None
-        torrents.append({
-            "id":       _tid,
-            "name":     t.get("name", ""),
-            "progress": pct,
-            "size":     int(t.get("size", 0) or 0),
-        })
+    # ── Primary: /api/folder ──────────────────────────────────
+    try:
+        d = await _get(user, pwd)
+        result = _root_from_dict(d)
 
-    return {"folders": folders, "files": files, "torrents": torrents,
-            "space_used": d.get("space_used"), "space_max": d.get("space_max")}
+        # If we got meaningful data, return immediately
+        if result["folders"] or result["files"] or result["torrents"]:
+            log.debug("[Seedr] _root via /api/folder: %d folders, %d torrents",
+                      len(result["folders"]), len(result["torrents"]))
+            return result
+
+        # Got a response but it's empty — may still be valid (truly empty account)
+        # Fall through to resource.php to double-check
+        log.debug("[Seedr] /api/folder returned empty root, verifying with resource.php")
+    except Exception as e:
+        log.warning("[Seedr] /api/folder root failed (%s) — trying resource.php", e)
+
+    # ── Fallback: resource.php ────────────────────────────────
+    try:
+        d2 = await _resource_post(user, pwd, "folder", {"content_id": "0"})
+        result2 = _root_from_dict(d2)
+        log.debug("[Seedr] _root via resource.php: %d folders, %d torrents",
+                  len(result2["folders"]), len(result2["torrents"]))
+        return result2
+    except Exception as e2:
+        log.warning("[Seedr] resource.php root also failed: %s", e2)
+
+    # Both failed — return the best we have (possibly empty from first call)
+    return _root_from_dict(d) if d else {"folders": [], "files": [], "torrents": []}
 
 
 async def _list_folder(user: str, pwd: str, folder_id: int) -> dict:
-    """List folder contents — tries /api/folder, falls back to resource.php.
-
-    Free accounts often return empty file lists from /api/folder.
-    The resource.php endpoint works universally.
     """
-    d = await _get(user, pwd, {"content_id": folder_id})
+    List folder contents.
+    Tries /api/folder first, falls back to resource.php.
+    FIX SEEDR-LIST-ROBUST: handles both 'id' and 'folder_file_id' field names.
+    """
+    # ── Primary: /api/folder ──────────────────────────────────
+    try:
+        d = await _get(user, pwd, {"content_id": folder_id})
+        folders = _parse_folders(d.get("folders", []))
+        files   = _parse_files(d.get("files", []))
+        if files or folders:
+            log.debug("[Seedr] _list_folder %d via /api/folder: %d files", folder_id, len(files))
+            return {"folders": folders, "files": files}
+    except Exception as e:
+        log.debug("[Seedr] /api/folder list %d failed: %s — trying resource.php", folder_id, e)
 
-    folders = [
-        {"id": int(f["id"]), "name": f.get("name", ""), "size": int(f.get("size", 0) or 0)}
-        for f in d.get("folders", []) if f.get("id") is not None
-    ]
-    files = [
-        {"id": int(f["id"]), "name": f.get("name", "file"), "size": int(f.get("size", 0) or 0)}
-        for f in d.get("files", []) if f.get("id") is not None
-    ]
-
-    # Fallback: if /api/folder returned no files, try resource.php
-    if not files:
-        log.debug("[Seedr] /api/folder returned 0 files for folder %d — trying resource.php", folder_id)
-        try:
-            tok = await _token(user, pwd)
-            async with _http(timeout=20) as c:
-                r = await c.post(
-                    _API_RESOURCE,
-                    data={
-                        "access_token": tok,
-                        "func": "folder",
-                        "content_id": folder_id,
-                    },
-                )
-            r.raise_for_status()
-            d2 = r.json()
-            log.debug("[Seedr] resource.php folder %d response keys: %s", folder_id, list(d2.keys()))
-
-            # Parse files from resource.php response
-            files_raw = d2.get("files", [])
-            for f in files_raw:
-                fid = f.get("id") or f.get("folder_file_id")
-                if fid is not None:
-                    files.append({
-                        "id": int(fid),
-                        "name": f.get("name", "file"),
-                        "size": int(f.get("size", 0) or 0),
-                    })
-
-            # Also parse folders from resource.php
-            folders_raw = d2.get("folders", [])
-            if folders_raw and not folders:
-                for f in folders_raw:
-                    fid = f.get("id")
-                    if fid is not None:
-                        folders.append({
-                            "id": int(fid),
-                            "name": f.get("name", ""),
-                            "size": int(f.get("size", 0) or 0),
-                        })
-
-            log.info("[Seedr] resource.php fallback: %d files, %d folders for folder %d",
-                     len(files), len(folders), folder_id)
-        except Exception as e:
-            log.warning("[Seedr] resource.php folder listing failed for %d: %s", folder_id, e)
-
-    return {"folders": folders, "files": files}
+    # ── Fallback: resource.php ────────────────────────────────
+    log.debug("[Seedr] resource.php fallback for folder %d", folder_id)
+    try:
+        d2 = await _resource_post(user, pwd, "folder", {"content_id": folder_id})
+        folders2 = _parse_folders(d2.get("folders", []))
+        files2   = _parse_files(d2.get("files", []))
+        log.info("[Seedr] resource.php folder %d: %d files, %d subfolders",
+                 folder_id, len(files2), len(folders2))
+        return {"folders": folders2, "files": files2}
+    except Exception as e2:
+        log.warning("[Seedr] resource.php list %d failed: %s", folder_id, e2)
+        return {"folders": [], "files": []}
 
 
 async def _submit_magnet(user: str, pwd: str, magnet: str) -> Optional[int]:
     """
-    Submit a magnet link via the Seedr OAuth resource endpoint.
-    Works on free accounts — uses the access token, not Basic Auth.
-
-    Endpoint: POST https://www.seedr.cc/oauth_test/resource.php
-    Form fields: access_token, func=add_torrent, torrent_magnet=<magnet>
+    Submit a magnet link via the resource.php endpoint.
+    FIX SEEDR-AUTH: also sends Authorization header.
     """
     tok = await _token(user, pwd)
     async with _http() as c:
         r = await c.post(
             _API_RESOURCE,
             data={
-                "access_token":  tok,
-                "func":          "add_torrent",
+                "access_token":   tok,
+                "func":           "add_torrent",
                 "torrent_magnet": magnet,
             },
+            headers=_auth_headers(tok),
         )
     r.raise_for_status()
 
@@ -409,6 +460,45 @@ async def _file_url(user: str, pwd: str, file_id: int) -> str:
     if not url:
         raise SeedrError(f"No URL for file id={file_id}: {d}")
     return url
+
+
+async def _get_file(user: str, pwd: str, params: dict) -> dict:
+    """
+    Get file download URL.
+    FIX SEEDR-AUTH: sends Authorization header on both attempts.
+    """
+    tok = await _token(user, pwd)
+    headers = _auth_headers(tok)
+
+    # ── Try /api/file first ───────────────────────────────────
+    try:
+        async with _http(timeout=15) as c:
+            r = await c.get(
+                _API_FILE,
+                params={"access_token": tok, **params},
+                headers=headers,
+            )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("url"):
+            return data
+    except Exception:
+        pass
+
+    # ── Fallback: resource.php fetch_file ─────────────────────
+    log.debug("[Seedr] /api/file failed, trying resource.php fetch_file")
+    async with _http(timeout=20) as c:
+        r = await c.post(
+            _API_RESOURCE,
+            data={
+                "access_token": tok,
+                "func":         "fetch_file",
+                **params,
+            },
+            headers=headers,
+        )
+    r.raise_for_status()
+    return r.json()
 
 
 async def _del_folder(user: str, pwd: str, folder_id: int) -> None:
@@ -437,12 +527,7 @@ async def _wipe_all_folders(user: str, pwd: str) -> int:
 
 
 async def _ensure_free(user: str, pwd: str, needed: int = 0) -> int:
-    """
-    Guarantee at least `needed` (or _MIN_FREE, whichever is larger) bytes free.
-    Auto-deletes all completed folders if space is tight.
-    Returns bytes free after any cleanup.
-    Raises SeedrQuotaError if still not enough.
-    """
+    """Guarantee at least `needed` (or _MIN_FREE) bytes free."""
     want = max(needed, _MIN_FREE)
     s = await _storage(user, pwd)
     log.info(
@@ -453,7 +538,6 @@ async def _ensure_free(user: str, pwd: str, needed: int = 0) -> int:
     if s["free"] >= want:
         return s["free"]
 
-    # Try cleanup
     log.info("[Seedr] Low space on %s — wiping old folders…", user[:25])
     deleted = await _wipe_all_folders(user, pwd)
 
@@ -470,15 +554,10 @@ async def _ensure_free(user: str, pwd: str, needed: int = 0) -> int:
 
 
 # ══════════════════════════════════════════════════════
-# Account selector — picks the roomiest account
+# Account selector
 # ══════════════════════════════════════════════════════
 
 async def _pick_account(needed: int = 0) -> tuple[str, str, int]:
-    """
-    Try all configured accounts.
-    Returns (username, password, free_bytes) for the one with most space.
-    Raises SeedrQuotaError / SeedrAuthError if nothing works.
-    """
     candidates = _accounts()
     best_user = best_pwd = None
     best_free = -1
@@ -512,29 +591,20 @@ async def _pick_account(needed: int = 0) -> tuple[str, str, int]:
 async def _poll(
     user: str,
     pwd:  str,
-    torrent_id:          Optional[int],
+    torrent_id:              Optional[int],
     pre_existing_folder_ids: set,
-    timeout_s:           int   = 7200,
-    progress_cb:         Optional[Callable] = None,
-    interval:            float = 10.0,
+    timeout_s:               int   = 7200,
+    progress_cb:             Optional[Callable] = None,
+    interval:                float = 10.0,
 ) -> dict:
     """
     Poll until the submitted torrent finishes.
-
-    Strategy:
-      1. Look for our torrent_id in the active torrents list.
-         If found: report progress.
-      2. Once the torrent disappears, look for a folder that
-         wasn't there before we submitted.
-      3. If neither torrent nor new folder shows up for too long
-         after we first saw the torrent, raise an error.
-
     Returns the new folder dict {id, name, size}.
     """
     deadline      = time.monotonic() + timeout_s
     last_pct      = -1.0
     last_hb       = time.monotonic()
-    ever_seen     = False    # did we ever see this torrent as active?
+    ever_seen     = False
     gone_polls    = 0
 
     while time.monotonic() < deadline:
@@ -549,7 +619,6 @@ async def _poll(
             if torrent_id is not None:
                 active = next((t for t in torrents if t["id"] == torrent_id), None)
             if active is None and torrents and not ever_seen:
-                # Torrent ID not returned by API — track any active one
                 active = torrents[0]
 
             if active is not None:
@@ -558,13 +627,9 @@ async def _poll(
                 pct  = active["progress"]
                 name = active.get("name", "…")
 
-                # FIX: If torrent shows 100% but is still in active list,
-                # Seedr is finalising — check if folder appeared already
+                # 100% but still in active list — check if folder appeared
                 if pct >= 100.0:
-                    new_folders = [
-                        f for f in folders
-                        if f["id"] not in pre_existing_folder_ids
-                    ]
+                    new_folders = [f for f in folders if f["id"] not in pre_existing_folder_ids]
                     if new_folders:
                         folder = max(new_folders, key=lambda f: f["id"])
                         log.info("[Seedr] ✅ Done (100%% + folder): '%s' (id=%d)",
@@ -573,7 +638,6 @@ async def _poll(
                             await progress_cb(100.0, folder["name"])
                         return folder
 
-                # Report only on meaningful change or heartbeat
                 if abs(pct - last_pct) >= 1.0 or (now - last_hb) >= 20.0:
                     last_pct = pct
                     last_hb  = now
@@ -582,13 +646,9 @@ async def _poll(
                         await progress_cb(pct, name)
 
             else:
-                # Torrent is not active (done, errored, or not started yet)
-                new_folders = [
-                    f for f in folders
-                    if f["id"] not in pre_existing_folder_ids
-                ]
+                # Torrent not active — check for new folder
+                new_folders = [f for f in folders if f["id"] not in pre_existing_folder_ids]
                 if new_folders:
-                    # Pick the most recent one (highest id)
                     folder = max(new_folders, key=lambda f: f["id"])
                     log.info("[Seedr] ✅ Done: '%s' (id=%d)", folder["name"], folder["id"])
                     if progress_cb:
@@ -599,30 +659,18 @@ async def _poll(
 
                 if ever_seen:
                     log.info("[Seedr] Torrent gone, waiting for folder (attempt %d)…", gone_polls)
-
-                    # FIX: After 3 failed attempts, fall back to ANY existing folder.
-                    # This handles cached/duplicate magnets: Seedr returns torrent_id=None,
-                    # the torrent completes instantly, and the folder was already in
-                    # pre_existing_folder_ids from the snapshot. The folder IS there,
-                    # we just filtered it out.
                     if gone_polls >= 3 and folders:
-                        # Pick the largest folder (most likely to be our video)
                         folder = max(folders, key=lambda f: f.get("size", 0))
-                        log.info("[Seedr] ✅ Fallback: using existing folder '%s' (id=%d, %d bytes)",
-                                 folder["name"], folder["id"], folder.get("size", 0))
+                        log.info("[Seedr] ✅ Fallback: '%s' (id=%d)", folder["name"], folder["id"])
                         if progress_cb:
                             await progress_cb(100.0, folder["name"])
                         return folder
-
                     if gone_polls >= 15:
                         raise SeedrError(
                             "Torrent vanished from Seedr without producing a folder. "
-                            "It may have been rejected (private tracker, bad magnet, "
-                            "or Seedr flagged it). Check your Seedr dashboard."
+                            "It may have been rejected (private tracker, bad magnet)."
                         )
                 else:
-                    # Not yet visible — might be in Seedr's queue / metadata fetch phase
-                    # FIX: Also check for cached torrent (torrent_id=None, instant complete)
                     if gone_polls >= 3 and torrent_id is None and folders:
                         folder = max(folders, key=lambda f: f.get("size", 0))
                         log.info("[Seedr] ✅ Cached torrent fallback: '%s' (id=%d)",
@@ -630,7 +678,6 @@ async def _poll(
                         if progress_cb:
                             await progress_cb(100.0, folder["name"])
                         return folder
-
                     if (now - last_hb) >= 20.0:
                         last_hb = now
                         log.debug("[Seedr] Waiting for torrent to appear…")
@@ -638,7 +685,7 @@ async def _poll(
                             await progress_cb(0.0, "Waiting for Seedr to start…")
 
         except (SeedrError, SeedrAuthError):
-            raise   # propagate hard errors
+            raise
         except Exception as e:
             log.warning("[Seedr] Poll error (will retry): %s", e)
 
@@ -655,23 +702,16 @@ async def _poll(
 # ══════════════════════════════════════════════════════
 
 async def _collect_files(user: str, pwd: str, folder_id: int) -> list[dict]:
-    """
-    Walk a folder tree and return all files as:
-      [{name, url, size}, ...]
-
-    Raises SeedrError if the folder itself cannot be listed.
-    Individual file URL errors are logged and skipped.
-    """
+    """Walk a folder tree and return all files as [{name, url, size}, ...]."""
     result: list[dict] = []
 
     async def _walk(fid: int, depth: int = 0) -> None:
-        if depth > 5:  # safety: prevent infinite recursion
+        if depth > 5:
             return
         try:
             contents = await _list_folder(user, pwd, fid)
         except Exception as e:
             if depth == 0:
-                # Top-level folder listing failed — this IS fatal
                 raise SeedrError(f"Cannot list Seedr folder {fid}: {e}")
             log.warning("[Seedr] Cannot list subfolder %d: %s", fid, e)
             return
@@ -686,8 +726,7 @@ async def _collect_files(user: str, pwd: str, folder_id: int) -> list[dict]:
             try:
                 url = await _file_url(user, pwd, fid2)
                 result.append({"name": f["name"], "url": url, "size": f.get("size", 0)})
-                log.info("[Seedr] Got URL for '%s' (%s)",
-                         f["name"], f.get("size", 0))
+                log.info("[Seedr] Got URL for '%s'", f["name"])
             except Exception as e:
                 log.warning("[Seedr] URL error '%s': %s", f.get("name"), e)
 
@@ -711,188 +750,32 @@ async def download_via_seedr(
     timeout_s:   int = 7200,
 ) -> list[str]:
     """
-    Full pipeline:
-      1. Pick account with most free space (auto-cleanup quota)
-      2. Snapshot existing folders (to detect the new one)
-      3. Submit magnet
-      4. Poll until done
-      5. Collect CDN download URLs
-      6. Download to `dest`
-      7. Cleanup Seedr folder (reclaim quota)
+    Full pipeline: submit magnet → poll → collect URLs → download locally → cleanup.
 
-    progress_cb(stage, pct, detail) — stages:
-      "selecting"   0%   picking account
-      "submitting"  5%   sending magnet
-      "waiting"     5%   metadata / queued
-      "downloading" N%   torrent progress
-      "fetching"   99%   getting CDN links
-      "saving"     N%    writing local files
-
-    Returns list of local file paths.
+    progress_cb(stage, pct, detail, **kw) — stages:
+      "selecting", "submitting", "waiting", "downloading" — 3-arg calls
+      "dl_file"  — also passes done_bytes, total_bytes, speed, eta as kwargs
     """
-    from services.downloader  import download_direct   # noqa: keep lazy
-    from services.cc_sanitize import sanitize_filename  # noqa: keep lazy
+    from services.downloader  import download_direct
+    from services.cc_sanitize import sanitize_filename
 
-    # ── Step 1: account selection ─────────────────────────────
     if progress_cb:
         await progress_cb("selecting", 0.0, "Selecting Seedr account…")
 
     user, pwd, _ = await _pick_account()
 
-    # ── Step 2: snapshot ─────────────────────────────────────
     if progress_cb:
         await progress_cb("submitting", 3.0, "Snapshotting account state…")
 
     root_before = await _root(user, pwd)
     pre_ids = {f["id"] for f in root_before["folders"]}
 
-    # ── Step 3: submit magnet ─────────────────────────────────
     if progress_cb:
         await progress_cb("submitting", 5.0, "Submitting magnet to Seedr…")
 
     torrent_id = await _submit_magnet(user, pwd, magnet)
     log.info("[Seedr] Submitted. torrent_id=%s", torrent_id)
 
-    # ── Step 4: poll ──────────────────────────────────────────
-    if progress_cb:
-        await progress_cb("waiting", 5.0, "Seedr is fetching torrent…")
-
-    async def _pcb(pct: float, name: str) -> None:
-        if progress_cb:
-            stage = "downloading" if pct > 0.5 else "waiting"
-            await progress_cb(stage, min(pct, 99.0), name or "Downloading…")
-
-    folder = await _poll(
-        user, pwd,
-        torrent_id          = torrent_id,
-        pre_existing_folder_ids = pre_ids,
-        timeout_s           = timeout_s,
-        progress_cb         = _pcb,
-    )
-    folder_id = folder["id"]
-
-    # ── Step 5: collect file URLs ─────────────────────────────
-    if progress_cb:
-        await progress_cb("fetching", 99.0, "Getting CDN links…")
-
-    files = await _collect_files(user, pwd, folder_id)
-
-    # Edge case: single-file torrent sometimes lands as a root file, not a folder
-    if not files:
-        log.warning("[Seedr] Folder empty — checking for root file…")
-        fresh = await _root(user, pwd)
-        for f in fresh["files"]:
-            fid2 = f.get("id")
-            if fid2 and fid2 not in pre_ids:
-                try:
-                    url = await _file_url(user, pwd, fid2)
-                    files.append({"name": f["name"], "url": url, "size": f["size"]})
-                except Exception:
-                    pass
-
-    if not files:
-        raise SeedrError(
-            "Seedr produced no downloadable files. "
-            "The torrent may be empty or all files are unsupported."
-        )
-
-    # ── Step 6: download locally ──────────────────────────────
-    # FIX: Added progress reporting during local CDN download.
-    # Previously, after Seedr reached 100%, the bot went silent during
-    # what could be a multi-minute file download — users thought it froze.
-    os.makedirs(dest, exist_ok=True)
-    local_paths: list[str] = []
-
-    for i, f in enumerate(files):
-        clean = sanitize_filename(f["name"])
-        fsize_f = f.get("size", 0)
-
-        # Per-file progress callback that reports through the pipeline cb
-        async def _file_progress(done: int, total: int, speed: float, eta: int,
-                                 _i=i, _clean=clean, _fsize=fsize_f) -> None:
-            if progress_cb:
-                pct = (done / total * 100) if total else 0
-                speed_s = f"{speed / 1e6:.1f} MB/s" if speed else ""
-                await progress_cb(
-                    "dl_file", pct,
-                    f"⬇️ {_clean[:35]} ({_i+1}/{len(files)})",
-                    done_bytes=done, total_bytes=total,
-                    speed=speed, eta=eta,
-                )
-
-        if progress_cb:
-            await progress_cb("dl_file", 0,
-                              f"⬇️ {clean[:40]} ({i+1}/{len(files)})",
-                              done_bytes=0, total_bytes=fsize_f,
-                              speed=0.0, eta=0)
-
-        log.info("[Seedr] Downloading %d/%d: %s", i + 1, len(files), f["name"])
-        try:
-            path = await download_direct(f["url"], dest, progress=_file_progress)
-            # Rename to the sanitised filename if needed
-            target = os.path.join(dest, clean)
-            if path != target:
-                try:
-                    os.rename(path, target)
-                    path = target
-                except OSError:
-                    pass
-            local_paths.append(path)
-        except Exception as e:
-            log.error("[Seedr] Failed to download '%s': %s", f["name"], e)
-
-    # ── Step 7: cleanup to reclaim quota ─────────────────────
-    try:
-        await _del_folder(user, pwd, folder_id)
-        log.info("[Seedr] Cleaned folder id=%d", folder_id)
-    except Exception as e:
-        log.warning("[Seedr] Cleanup (non-fatal): %s", e)
-
-    return local_paths
-
-
-async def fetch_urls_via_seedr(
-    magnet:      str,
-    progress_cb: Optional[Callable] = None,
-    timeout_s:   int = 7200,
-) -> list[dict]:
-    """
-    Steps 1-5 of the full pipeline WITHOUT local download:
-      1. Pick account with most free space
-      2. Snapshot existing folders
-      3. Submit magnet
-      4. Poll until torrent completes on Seedr
-      5. Collect CDN download URLs
-
-    Returns list of {name, url, size} dicts.
-    The Seedr folder is NOT deleted so that CloudConvert/FreeConvert
-    can pull the file directly. Caller is responsible for cleanup
-    via delete_folder(folder_id) once the conversion job is done.
-    Returns (files, folder_id, user, pwd) so caller can clean up.
-    """
-    from services.cc_sanitize import sanitize_filename  # noqa: keep lazy
-
-    # ── Step 1: account selection ─────────────────────────────
-    if progress_cb:
-        await progress_cb("selecting", 0.0, "Selecting Seedr account…")
-
-    user, pwd, _ = await _pick_account()
-
-    # ── Step 2: snapshot ─────────────────────────────────────
-    if progress_cb:
-        await progress_cb("submitting", 3.0, "Snapshotting account state…")
-
-    root_before = await _root(user, pwd)
-    pre_ids = {f["id"] for f in root_before["folders"]}
-
-    # ── Step 3: submit magnet ─────────────────────────────────
-    if progress_cb:
-        await progress_cb("submitting", 5.0, "Submitting magnet to Seedr…")
-
-    torrent_id = await _submit_magnet(user, pwd, magnet)
-    log.info("[Seedr] Submitted. torrent_id=%s", torrent_id)
-
-    # ── Step 4: poll ──────────────────────────────────────────
     if progress_cb:
         await progress_cb("waiting", 5.0, "Seedr is fetching torrent…")
 
@@ -910,13 +793,11 @@ async def fetch_urls_via_seedr(
     )
     folder_id = folder["id"]
 
-    # ── Step 5: collect file URLs ─────────────────────────────
     if progress_cb:
         await progress_cb("fetching", 99.0, "Getting CDN links…")
 
     files = await _collect_files(user, pwd, folder_id)
 
-    # Edge case: single-file torrent lands as a root file
     if not files:
         log.warning("[Seedr] Folder empty — checking for root file…")
         fresh = await _root(user, pwd)
@@ -935,11 +816,127 @@ async def fetch_urls_via_seedr(
             "The torrent may be empty or all files are unsupported."
         )
 
-    # Sanitise filenames in metadata (URL stays raw)
+    os.makedirs(dest, exist_ok=True)
+    local_paths: list[str] = []
+
+    for i, f in enumerate(files):
+        clean   = sanitize_filename(f["name"])
+        fsize_f = f.get("size", 0)
+
+        async def _file_progress(done: int, total: int, speed: float, eta: int,
+                                  _i=i, _clean=clean, _fsize=fsize_f) -> None:
+            if progress_cb:
+                pct = (done / total * 100) if total else 0
+                await progress_cb(
+                    "dl_file", pct,
+                    f"⬇️ {_clean[:35]} ({_i+1}/{len(files)})",
+                    done_bytes=done, total_bytes=total,
+                    speed=speed, eta=eta,
+                )
+
+        if progress_cb:
+            await progress_cb(
+                "dl_file", 0.0,
+                f"⬇️ {clean[:40]} ({i+1}/{len(files)})",
+                done_bytes=0, total_bytes=fsize_f, speed=0.0, eta=0,
+            )
+
+        log.info("[Seedr] Downloading %d/%d: %s", i + 1, len(files), f["name"])
+        try:
+            path = await download_direct(f["url"], dest, progress=_file_progress)
+            target = os.path.join(dest, clean)
+            if path != target:
+                try:
+                    os.rename(path, target)
+                    path = target
+                except OSError:
+                    pass
+            local_paths.append(path)
+        except Exception as e:
+            log.error("[Seedr] Failed to download '%s': %s", f["name"], e)
+
+    try:
+        await _del_folder(user, pwd, folder_id)
+        log.info("[Seedr] Cleaned folder id=%d", folder_id)
+    except Exception as e:
+        log.warning("[Seedr] Cleanup (non-fatal): %s", e)
+
+    return local_paths
+
+
+async def fetch_urls_via_seedr(
+    magnet:      str,
+    progress_cb: Optional[Callable] = None,
+    timeout_s:   int = 7200,
+) -> tuple:
+    """
+    Steps 1–5 without local download.
+    Returns (files, folder_id, user, pwd).
+    Caller is responsible for calling _del_folder() after conversion completes.
+    files[i] = {name, url, size, clean_name}
+    """
+    from services.cc_sanitize import sanitize_filename
+
+    if progress_cb:
+        await progress_cb("selecting", 0.0, "Selecting Seedr account…")
+
+    user, pwd, _ = await _pick_account()
+
+    if progress_cb:
+        await progress_cb("submitting", 3.0, "Snapshotting account state…")
+
+    root_before = await _root(user, pwd)
+    pre_ids = {f["id"] for f in root_before["folders"]}
+
+    if progress_cb:
+        await progress_cb("submitting", 5.0, "Submitting magnet to Seedr…")
+
+    torrent_id = await _submit_magnet(user, pwd, magnet)
+    log.info("[Seedr] Submitted. torrent_id=%s", torrent_id)
+
+    if progress_cb:
+        await progress_cb("waiting", 5.0, "Seedr is fetching torrent…")
+
+    async def _pcb(pct: float, name: str) -> None:
+        if progress_cb:
+            stage = "downloading" if pct > 0.5 else "waiting"
+            await progress_cb(stage, min(pct, 99.0), name or "Downloading…")
+
+    folder = await _poll(
+        user, pwd,
+        torrent_id              = torrent_id,
+        pre_existing_folder_ids = pre_ids,
+        timeout_s               = timeout_s,
+        progress_cb             = _pcb,
+    )
+    folder_id = folder["id"]
+
+    if progress_cb:
+        await progress_cb("fetching", 99.0, "Getting CDN links…")
+
+    files = await _collect_files(user, pwd, folder_id)
+
+    if not files:
+        log.warning("[Seedr] Folder empty — checking for root file…")
+        fresh = await _root(user, pwd)
+        for f in fresh["files"]:
+            fid2 = f.get("id")
+            if fid2 and fid2 not in pre_ids:
+                try:
+                    url = await _file_url(user, pwd, fid2)
+                    files.append({"name": f["name"], "url": url, "size": f["size"]})
+                except Exception:
+                    pass
+
+    if not files:
+        raise SeedrError(
+            "Seedr produced no downloadable files. "
+            "The torrent may be empty or all files are unsupported."
+        )
+
     for f in files:
         f["clean_name"] = sanitize_filename(f["name"])
 
-    # Return files + context needed for deferred cleanup
     return files, folder_id, user, pwd
 
 
@@ -948,7 +945,6 @@ async def fetch_urls_via_seedr(
 # ══════════════════════════════════════════════════════
 
 async def check_credentials() -> bool:
-    """Return True if at least one account authenticates successfully."""
     try:
         await _pick_account()
         return True
@@ -958,20 +954,17 @@ async def check_credentials() -> bool:
 
 
 async def get_storage_info() -> dict:
-    """Storage info for the first configured account."""
     user, pwd = _accounts()[0]
     return await _storage(user, pwd)
 
 
 async def add_magnet(magnet: str) -> dict:
-    """Submit a magnet on the best available account. Returns {result, torrent_id}."""
     user, pwd, _ = await _pick_account()
     tid = await _submit_magnet(user, pwd, magnet)
     return {"result": True, "torrent_id": tid}
 
 
 async def list_folder(folder_id: int = 0) -> dict:
-    """List root (folder_id=0) or a specific folder."""
     user, pwd = _accounts()[0]
     if folder_id == 0:
         return await _root(user, pwd)
