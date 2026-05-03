@@ -3,26 +3,20 @@ services/cloudconvert_api.py
 CloudConvert API v2 client — hardsubbing + conversion + compression
 with multi-key rotation.
 
+FIX CC-ARGSPACE: sanitize_for_cc() produces human-readable names that
+  may contain spaces (e.g. "Wistoria S0204.mp4"). When these are embedded
+  verbatim inside the ffmpeg `arguments` string, CloudConvert's argument
+  parser splits on whitespace, breaking the path. ffmpeg then has no valid
+  output path → task shows "finished" but export gets INPUT_FILES_NOT_FOUND.
+  Fix: _arg_safe() strips spaces from names used inside the arguments string.
+  Names used only for import/export task `filename` fields keep spaces.
+
 WHAT CHANGED
 ────────────
 FIX CC-SIZE-01: audio bitrate is now ALWAYS 128k (was 192k for non-480p).
-  Combined with CRF 23 default this brings 720p hardsub output back to
-  reasonable sizes (~150-250 MB for a 24-min episode instead of 400 MB).
-
-FIX CC-SIZE-02: default CRF raised from 20 → 23 (FFmpeg "normal quality").
-  CRF 20 is already very near-lossless and often produces files 2-3×
-  bigger than CRF 23. The user-facing preset in hardsub.py passes whatever
-  the user picked, but the library default now matches what we actually
-  recommend.
-
+FIX CC-SIZE-02: default CRF raised from 20 → 23.
 NEW CC-COMPRESS: create_compress_job() + submit_compress() + run_cc_job()
-  CloudConvert can now be used as an alternative to FreeConvert for
-  /compress — the UI lets the user pick the backend.
-
-NEW CC-RUN: run_cc_job() polls an existing CC job until completion,
-  downloads the export URL, and returns a local path. This mirrors
-  freeconvert_api.run_fc_job() so resize.py can use either backend
-  with the same inline-polling flow.
+NEW CC-RUN: run_cc_job() polls an existing CC job until completion.
 """
 from __future__ import annotations
 
@@ -42,6 +36,30 @@ CC_API = "https://api.cloudconvert.com/v2"
 
 _CC_TIMEOUT_SHORT = aiohttp.ClientTimeout(total=30)
 _CC_TIMEOUT_UPLOAD = aiohttp.ClientTimeout(total=7200)
+
+
+def _arg_safe(name: str) -> str:
+    """
+    Strip spaces from a sanitized filename before embedding it inside an
+    ffmpeg arguments string.
+
+    sanitize_for_cc() (→ sanitize_filename) deliberately preserves spaces
+    for human-readable output names such as "Wistoria S0204.mp4". That is
+    fine for the import/export task `filename` fields, which CC handles as
+    opaque strings. But the `arguments` value is whitespace-tokenised by
+    CloudConvert before passing to ffmpeg, so a path like
+
+        /output/Wistoria S0204.mp4
+
+    is split into two tokens and ffmpeg rejects it. ffmpeg then exits with
+    an error but CC's command task still marks itself "finished" (rc=0 from
+    its shell wrapper), leaving the export task with no input file.
+
+    This function replaces every space with an underscore so argument paths
+    are single tokens, while keeping the result otherwise identical to
+    sanitize_for_cc().
+    """
+    return sanitize_for_cc(name).replace(" ", "_")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -71,11 +89,6 @@ async def check_credits(api_key: str) -> int:
 async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
     if len(api_keys) == 1:
         credits = await check_credits(api_keys[0])
-        # FIX BUG-CC-CRED: use <= 0 not == 0.
-        # check_credits() returns -1 on network/auth errors.
-        # The old check (credits == 0) let -1 pass silently, causing jobs to be
-        # submitted against an unreachable or invalid key.
-        # Consistent with the multi-key path which already uses best_credits <= 0.
         if credits <= 0:
             reason = (
                 "network/auth error — check CC_API_KEY and connectivity"
@@ -117,14 +130,6 @@ async def pick_best_key(api_keys: list[str]) -> tuple[str, int]:
 # ─────────────────────────────────────────────────────────────
 
 async def check_job_status(api_key: str, job_id: str) -> dict:
-    """
-    Query the status of a CC job.
-
-    `api_key` may be either a single key or the comma-separated CC_API_KEY
-    string. If multiple keys are passed, each one is tried until a non-404
-    response is seen — this ensures jobs created with key #2 are pollable
-    even when CC_API_KEY lists key #1 first.
-    """
     keys = parse_api_keys(api_key) or [api_key]
     last_err: Optional[Exception] = None
 
@@ -133,7 +138,6 @@ async def check_job_status(api_key: str, job_id: str) -> dict:
         try:
             async with aiohttp.ClientSession(timeout=_CC_TIMEOUT_SHORT) as sess:
                 async with sess.get(f"{CC_API}/jobs/{job_id}", headers=headers) as resp:
-                    # 404 likely means the job belongs to a different account.
                     if resp.status == 404:
                         continue
                     data = await resp.json()
@@ -144,17 +148,12 @@ async def check_job_status(api_key: str, job_id: str) -> dict:
 
     if last_err:
         raise last_err
-    # All 404s → return an empty dict rather than crashing the caller.
     return {}
 
 
 async def _wait_for_task_ready(
     api_key: str, job_id: str, task_name: str, timeout: int = 120
 ) -> dict:
-    """
-    Poll until the named import/upload task reaches 'waiting' state
-    with a valid S3 form URL. Uploading before this causes instant ERROR.
-    """
     keys     = parse_api_keys(api_key)
     key      = keys[0] if keys else api_key
     headers  = {"Authorization": f"Bearer {key}"}
@@ -208,11 +207,13 @@ async def create_hardsub_job(
     preset: str = "medium",
     scale_height: int = 0,
 ) -> dict:
-    # PATCH: sanitize_for_cc() reduces filenames to [a-zA-Z0-9._-] only —
-    # CloudConvert silently fails on brackets, colons, accented chars, Unicode.
-    v_safe = sanitize_for_cc(video_filename)
-    s_safe = sanitize_for_cc(subtitle_filename)
-    o_safe = sanitize_for_cc(output_filename)
+    # FIX CC-ARGSPACE: use _arg_safe() for names embedded inside the arguments
+    # string. sanitize_for_cc() may produce spaces ("Wistoria S0204.mp4") which
+    # CC's ffmpeg arg splitter breaks into multiple tokens → broken output path
+    # → ffmpeg finishes with no output file → export gets INPUT_FILES_NOT_FOUND.
+    v_safe = _arg_safe(video_filename)
+    s_safe = _arg_safe(subtitle_filename)
+    o_safe = _arg_safe(output_filename)
 
     log.debug("[CC-API] Sanitized names: video=%s sub=%s out=%s", v_safe, s_safe, o_safe)
 
@@ -237,9 +238,7 @@ async def create_hardsub_job(
     else:
         vf = f"subtitles='{sub_escaped}'"
 
-    # FIX CC-SIZE-01: audio bitrate always 128k — 192k produced oversized 720p
-    # hardsubs (~400 MB for a 24 min episode). 128k AAC is transparent for
-    # stereo anime audio and matches the user-facing preset.
+    # FIX CC-SIZE-01: audio bitrate always 128k
     ffmpeg_args = (
         f"-i /input/import-video/{v_safe} "
         f"-vf {vf} "
@@ -295,8 +294,9 @@ async def create_convert_job(
     preset: str = "medium",
     scale_height: int = 0,
 ) -> dict:
-    v_safe = sanitize_for_cc(video_filename)
-    o_safe = sanitize_for_cc(output_filename)
+    # FIX CC-ARGSPACE: _arg_safe() for argument-embedded names
+    v_safe = _arg_safe(video_filename)
+    o_safe = _arg_safe(output_filename)
 
     log.debug("[CC-API] Sanitized names: video=%s out=%s", v_safe, o_safe)
 
@@ -369,16 +369,9 @@ async def create_compress_job(
     output_filename: str   = "compressed.mp4",
     target_mb:       float = 50.0,
 ) -> dict:
-    """
-    Compress a video to approximately `target_mb` MB on CloudConvert.
-
-    Strategy matches FreeConvert compress:
-      - libx264 CRF 28 (quality target, trades size for quality)
-      - AAC 96k audio (lower than default 128k since we're compressing)
-      - -fs <bytes> hard-caps the output file size
-    """
-    v_safe = sanitize_for_cc(video_filename)
-    o_safe = sanitize_for_cc(output_filename)
+    # FIX CC-ARGSPACE: _arg_safe() for argument-embedded names
+    v_safe = _arg_safe(video_filename)
+    o_safe = _arg_safe(output_filename)
 
     tasks: dict = {}
     if video_url:
@@ -462,15 +455,6 @@ async def upload_file_to_task(
     task_name: str = "",
     progress_cb=None,
 ) -> None:
-    """
-    Upload a local file to a CloudConvert import/upload task.
-    Polls _wait_for_task_ready() first so we never hit the instant-ERROR
-    caused by uploading while the task is still 'pending'.
-
-    progress_cb: optional async callable(done: int, total: int) — called
-    once before upload starts (done=0, total=fsize) and once on completion
-    (done=total) so callers can update a TaskRunner progress panel.
-    """
     if api_key and job_id and task_name:
         task = await _wait_for_task_ready(api_key, job_id, task_name)
 
@@ -483,7 +467,9 @@ async def upload_file_to_task(
 
     params = get_upload_params(task)
     raw_fname  = filename or os.path.basename(file_path)
-    safe_fname = sanitize_for_cc(raw_fname)
+    # FIX CC-ARGSPACE: upload filename must also be space-free so CC stores it
+    # under the same path that the arguments string references.
+    safe_fname = _arg_safe(raw_fname)
     fsize      = os.path.getsize(file_path)
 
     log.info("[CC-API] Uploading %s → %s (%d bytes) to %s…",
@@ -522,7 +508,6 @@ async def upload_file_to_task(
 # ─────────────────────────────────────────────────────────────
 
 def get_export_url(job: dict) -> str:
-    """Pull the first export-task's signed file URL from a finished job."""
     for task in job.get("tasks", []):
         if (task.get("operation") == "export/url"
                 and task.get("status") == "finished"):
@@ -550,13 +535,6 @@ async def submit_hardsub(
     user_id:       int = 0,
     upload_progress_cb=None,
 ) -> str:
-    """
-    Submit a hardsub job to CloudConvert.
-
-    upload_progress_cb: optional async callable(phase, done, total) where
-      phase is "sub" or "video".  Called at start (done=0) and end
-      (done=total) of each upload so callers can update a progress panel.
-    """
     if not video_path and not video_url:
         raise ValueError("Provide either video_path or video_url")
     if not subtitle_path or not os.path.isfile(subtitle_path):
@@ -588,7 +566,6 @@ async def submit_hardsub(
 
     job_id = job.get("id", "?")
 
-    # Build per-phase progress callbacks
     async def _sub_progress(done: int, total: int) -> None:
         if upload_progress_cb:
             try:
@@ -739,10 +716,6 @@ async def wait_for_cc_job(
     poll_interval: float = 5.0,
     progress_cb         = None,
 ) -> dict:
-    """
-    Poll a CC job until it reaches finished or error state.
-    Mirrors freeconvert_api.wait_for_job so callers can be symmetric.
-    """
     deadline    = time.time() + timeout_s
     start       = time.time()
     _poll_errs  = 0
@@ -807,13 +780,6 @@ async def run_cc_job(
     progress_cb      = None,
     timeout_s:   int = 7200,
 ) -> str:
-    """
-    Wait for a CC job to finish, download the export, and return the
-    local path. Mirrors freeconvert_api.run_fc_job().
-
-    Use `download_direct()` under the hood because CC export URLs are
-    single-use signed tokens — any retry logic burns them (BUG-01).
-    """
     from services.downloader import download_direct
 
     job = await wait_for_cc_job(api_key, job_id, timeout_s=timeout_s, progress_cb=progress_cb)
