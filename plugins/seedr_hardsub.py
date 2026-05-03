@@ -2,18 +2,10 @@
 plugins/seedr_hardsub.py
 Seedr → Auto-Hardsub pipeline.
 
-WHAT THIS DOES:
-  1. User sends magnet → clicks "🔥 Seedr+Hardsub"
-  2. Seedr downloads torrent at datacenter speed
-  3. Bot downloads video from Seedr to local
-  4. ffprobe auto-detects French subtitle track (fra/fre/fr)
-  5. Extracts subtitle to .ass/.srt
-  6. Submits video + subtitle to CloudConvert for hardsub
-  7. CC processes → ccstatus poller auto-uploads result
+[original docstring preserved — see repo for full description]
 
 FIX C-05 (audit v3): _WAITING_SUB now has 30-minute TTL eviction.
-Previously, if a user abandoned the manual-subtitle flow (no French sub found),
-the cached video file (1-2 GB) persisted forever in the temp directory.
+MAIN-06 addition: smon| callback handlers for Seedr monitor buttons.
 """
 from __future__ import annotations
 
@@ -97,7 +89,7 @@ def _find_french_subs(subtitle_streams: list[dict]) -> tuple[list[dict], list[di
 # ─────────────────────────────────────────────────────────────
 
 _WAITING_SUB: dict[int, dict] = {}
-_WAITING_SUB_TTL = 1800  # 30 min — auto-cleanup cached video files
+_WAITING_SUB_TTL = 1800  # 30 min
 
 
 def _clear_waiting(uid: int) -> None:
@@ -106,8 +98,6 @@ def _clear_waiting(uid: int) -> None:
         return
     if state.get("tmp"):
         cleanup(state["tmp"])
-    # FIX MED-01: also clean up the Seedr folder to reclaim quota.
-    # Without this, /cancel and TTL eviction would leak Seedr folders.
     folder_id  = state.get("folder_id", 0)
     seedr_user = state.get("seedr_user", "")
     seedr_pwd  = state.get("seedr_pwd", "")
@@ -123,11 +113,10 @@ def _clear_waiting(uid: int) -> None:
         try:
             asyncio.get_event_loop().create_task(_deferred_del())
         except RuntimeError:
-            pass  # no event loop — skip async cleanup
+            pass
 
 
 def _evict_waiting_subs() -> None:
-    """FIX C-05: evict stale entries holding multi-GB video files."""
     now = time.time()
     dead = [uid for uid, s in _WAITING_SUB.items()
             if now - s.get("_created", 0) > _WAITING_SUB_TTL]
@@ -265,7 +254,6 @@ async def _seedr_hardsub_pipeline(
             parse_mode=enums.ParseMode.HTML,
         )
 
-    # Pick the largest video file
     video_files = [f for f in files
                    if os.path.splitext(f["name"])[1].lower() in _VIDEO_EXTS]
     if not video_files:
@@ -289,25 +277,23 @@ async def _seedr_hardsub_pipeline(
         parse_mode=enums.ParseMode.HTML,
     )
 
-    # Download only what's needed for ffprobe (first 50 MB is enough for MKV headers + sub tracks)
-    probe_path = video_url  # fallback: probe directly by URL
+    probe_path = video_url
     try:
         import aiohttp as _aiohttp
-        _probe_fname = fname
-        _probe_fpath = os.path.join(tmp, _probe_fname)
+        _probe_fpath = os.path.join(tmp, fname)
         _timeout     = _aiohttp.ClientTimeout(total=300)
         async with _aiohttp.ClientSession(timeout=_timeout) as _sess:
             async with _sess.get(video_url, headers={"User-Agent": "Mozilla/5.0"},
                                   allow_redirects=True) as _resp:
                 _resp.raise_for_status()
-                _MAX = 50 * 1024 * 1024  # 50 MB cap
+                _MAX = 50 * 1024 * 1024
                 _done = 0
                 with open(_probe_fpath, "wb") as _fh:
                     async for _chunk in _resp.content.iter_chunked(1024 * 1024):
                         _fh.write(_chunk)
                         _done += len(_chunk)
                         if _done >= _MAX:
-                            break  # enough for stream headers
+                            break
         probe_path = _probe_fpath
         log.info("[SeedrHS] Partial download for probe: %s bytes -> %s", _done, _probe_fpath)
     except Exception as exc:
@@ -342,14 +328,12 @@ async def _seedr_hardsub_pipeline(
         len(french_text), len(french_bitmap),
     )
 
-    # Case A: French text subtitle found — extract from probe file, then send video_url to CC
     if french_text:
         best = french_text[0]
         await _auto_hardsub_url(client, st, probe_path, video_url, fname, fsize,
                                  best, tmp, uid, folder_id, seedr_user, seedr_pwd)
         return
 
-    # Case B: French bitmap subtitle (PGS/DVB) — can't use
     if french_bitmap:
         b = french_bitmap[0]
         b_codec = (b.get("codec_name") or "PGS").upper()
@@ -386,7 +370,6 @@ async def _seedr_hardsub_pipeline(
             parse_mode=enums.ParseMode.HTML,
         )
 
-    # Case C: No French subtitle at all
     sub_lines = []
     for s in all_subs:
         tags  = s.get("tags", {}) or {}
@@ -441,8 +424,8 @@ async def _seedr_hardsub_pipeline(
 
 async def _auto_hardsub_url(
     client: Client, st,
-    probe_path: str,        # local partial file used only for sub extraction
-    video_url: str,         # Seedr CDN URL sent directly to CloudConvert
+    probe_path: str,
+    video_url: str,
     fname: str,
     fsize: int,
     sub_stream: dict,
@@ -479,11 +462,7 @@ async def _auto_hardsub_url(
         parse_mode=enums.ParseMode.HTML,
     )
 
-    # FIX CRIT-04: Extract subtitle from the FULL file via Seedr CDN URL
-    # instead of the 50 MB partial probe file.  FFmpeg supports HTTP input
-    # natively.  The partial file only contains the first ~2-3 min of
-    # interleaved subtitle cues — the rest is silently truncated.
-    extract_source = video_url  # HTTP URL — FFmpeg streams only what it needs
+    extract_source = video_url
     try:
         await FF.stream_op(extract_source, sub_path, [
             "-map", f"0:{idx}", "-c", "copy",
@@ -526,12 +505,12 @@ async def _auto_hardsub_url(
 
 
 # ─────────────────────────────────────────────────────────────
-# Submit CDN URL + subtitle to CloudConvert (URL-based, no video upload)
+# Submit CDN URL + subtitle to CloudConvert
 # ─────────────────────────────────────────────────────────────
 
 async def _submit_to_cc_url(
     client: Client, st,
-    video_url: str,         # ← Seedr CDN URL sent directly to CloudConvert
+    video_url: str,
     video_fname: str,
     sub_path: str,
     sub_fname: str,
@@ -595,22 +574,16 @@ async def _submit_to_cc_url(
         selected, credits = await pick_best_key(keys)
         key_info = f"🔑 Key {keys.index(selected)+1}/{len(keys)} ({credits} credits)"
 
-        # FIX CRIT-02: pass the selected key, not the raw comma-separated
-        # string.  submit_hardsub() calls pick_best_key() internally — by
-        # passing just the chosen key we skip the redundant credit check
-        # and guarantee key_info matches the actually used key.
         job_id = await submit_hardsub(
             selected,
-            video_url=video_url,        # ← CDN URL, CloudConvert pulls directly
-            subtitle_path=sub_path,     # ← small subtitle file uploaded
+            video_url=video_url,
+            subtitle_path=sub_path,
             output_name=output_name,
             upload_progress_cb=_upload_progress,
         )
 
         await tracker.finish(ul_tid, success=True)
 
-        # FIX CRIT-01: store Seedr cleanup info so the folder is deleted
-        # AFTER CloudConvert finishes pulling the video, not at submit time.
         await cc_job_store.add(CCJob(
             job_id=job_id,
             uid=uid,
@@ -664,16 +637,11 @@ async def _submit_to_cc_url(
             parse_mode=enums.ParseMode.HTML,
         )
     finally:
-        # FIX CRIT-01: Do NOT delete the Seedr folder here!
-        # CloudConvert's import/url task has NOT finished downloading yet.
-        # The Seedr CDN URL will 404 if we delete now.  Cleanup is deferred
-        # to ccstatus._deliver_job() which runs after CC finishes.
         cleanup(tmp)
 
 
 # ─────────────────────────────────────────────────────────────
-# Legacy: Submit video + subtitle to CloudConvert (local file upload)
-# Kept for backward compatibility; prefer _submit_to_cc_url
+# Legacy: local-file upload to CloudConvert (kept for compatibility)
 # ─────────────────────────────────────────────────────────────
 
 async def _submit_to_cc(
@@ -749,7 +717,6 @@ async def _submit_to_cc(
             selected, credits = await pick_best_key(keys)
             key_info = f"🔑 {credits} credits remaining"
 
-        # FIX MED-01 / CRIT-02: pass the selected key, not the raw string
         job_id = await submit_hardsub(
             selected,
             video_path=video_path,
@@ -920,14 +887,10 @@ async def shs_manual_sub_url(client: Client, msg: Message):
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.get(text, headers=headers, allow_redirects=True) as resp:
                 resp.raise_for_status()
-
-                # FIX MED-02: check Content-Length BEFORE downloading
                 cl = int(resp.headers.get("Content-Length", 0) or 0)
                 if cl > 10_000_000:
                     return await safe_edit(st, "❌ File too large — not a subtitle.")
-
                 content = await resp.read()
-
                 cd = resp.headers.get("Content-Disposition", "")
                 if "filename=" in cd:
                     raw = cd.split("filename=")[-1].strip().strip('"').strip("'")
@@ -949,7 +912,6 @@ async def shs_manual_sub_url(client: Client, msg: Message):
         with open(sub_path, "wb") as f:
             f.write(content)
 
-        # Double-check actual size (Content-Length may be absent or wrong)
         if len(content) > 10_000_000:
             return await safe_edit(st, "❌ File too large — not a subtitle.")
 
@@ -993,3 +955,109 @@ async def shs_cancel(client: Client, msg: Message):
     _clear_waiting(uid)
     await msg.reply("❌ Seedr+Hardsub cancelled. Video files cleaned up.")
     msg.stop_propagation()
+
+
+# ─────────────────────────────────────────────────────────────
+# Seedr Monitor button callbacks  (smon|sub|  smon|upload|  smon|skip|)
+# Handles the three inline buttons shown by services/seedr_monitor.py
+# when a new Seedr folder has no French subtitle.
+# ─────────────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^smon\|"))
+async def seedr_monitor_cb(client: Client, cb: CallbackQuery) -> None:
+    """
+    smon|sub|<folder_id>    — keep _WAITING_SUB active, remind user to send a sub
+    smon|upload|<folder_id> — download the full video from Seedr CDN, upload to DM
+    smon|skip|<folder_id>   — discard pending state and do nothing
+    """
+    parts = cb.data.split("|")
+    if len(parts) < 3:
+        return await cb.answer("Invalid data.", show_alert=True)
+
+    _, action, folder_id_str = parts[:3]
+    try:
+        folder_id = int(folder_id_str)
+    except ValueError:
+        return await cb.answer("Invalid folder ID.", show_alert=True)
+
+    uid = cb.from_user.id
+    await cb.answer()
+
+    # ── "I'll send a subtitle" — _WAITING_SUB already populated ─────────────
+    if action == "sub":
+        try:
+            await cb.message.edit(
+                cb.message.text + "\n\n"
+                "💬 <b>Waiting for your subtitle file or URL…</b>\n"
+                "<i>Send .ass / .srt / .vtt or a direct URL.\n"
+                "Send /cancel to abort.</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    # ── "Upload as-is" — download full file, upload to DM, no hardsub ───────
+    if action == "upload":
+        _WAITING_SUB.pop(uid, None)
+        try:
+            await cb.message.edit(
+                "📤 <b>Uploading original file…</b>\n"
+                "<i>Downloading from Seedr CDN — this may take a few minutes.</i>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        asyncio.create_task(_do_upload_as_is(client, cb.message, folder_id, uid))
+        return
+
+    # ── "Skip" — clean up and move on ────────────────────────────────────────
+    if action == "skip":
+        _WAITING_SUB.pop(uid, None)
+        try:
+            from services.seedr_monitor import _pending_upload
+            info = _pending_upload.pop(folder_id, None)
+            if info and info.get("tmp"):
+                cleanup(info["tmp"])
+            # Best-effort Seedr folder cleanup
+            s_user = (info or {}).get("seedr_user", "")
+            s_pwd  = (info or {}).get("seedr_pwd",  "")
+            if s_user and folder_id:
+                asyncio.create_task(_deferred_seedr_del(s_user, s_pwd, folder_id))
+        except Exception:
+            pass
+        try:
+            await cb.message.edit(
+                cb.message.text + "\n\n❌ <b>Folder skipped.</b>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+
+async def _do_upload_as_is(
+    client: Client, status_msg, folder_id: int, uid: int,
+) -> None:
+    """Download the full Seedr CDN file and upload it to the user's DM."""
+    try:
+        from services.seedr_monitor import handle_upload_as_is
+        await handle_upload_as_is(folder_id, uid, client)
+    except Exception as exc:
+        log.error("[SeedrMon-CB] upload_as_is: %s", exc)
+        try:
+            await status_msg.edit(
+                f"❌ <b>Upload failed</b>\n<code>{str(exc)[:200]}</code>",
+                parse_mode=enums.ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+
+async def _deferred_seedr_del(user: str, pwd: str, folder_id: int) -> None:
+    try:
+        from services.seedr import _del_folder
+        await _del_folder(user, pwd, folder_id)
+        log.info("[SeedrMon-CB] Seedr folder %d cleaned on skip", folder_id)
+    except Exception as exc:
+        log.warning("[SeedrMon-CB] Seedr cleanup (non-fatal): %s", exc)
