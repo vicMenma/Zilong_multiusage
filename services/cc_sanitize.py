@@ -114,6 +114,10 @@ def build_cc_output_name(input_name: str, tag: str = "VOSTFR") -> str:
     return f"{clean_base}_{tag}.mp4"
 
 
+# ── Backward-compat alias used by cloudconvert_api.py ────────────────────────
+sanitize_for_cc = sanitize_filename
+
+
 def sanitize_url_filename(name: str) -> str:
     """
     Extra-strict sanitisation for filenames embedded inside URLs.

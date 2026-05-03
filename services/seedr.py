@@ -340,21 +340,23 @@ async def _file_url_fallback(username: str, password: str, file_id: int) -> str:
     try:
         raw  = await client.fetch_file(file_id=str(file_id))
         data = _to_dict(raw)
-        url  = (
-            data.get("url") or
-            data.get("download_url") or
-            (data.get("result") or {}).get("url") if isinstance(data.get("result"), dict) else None or
-            (data.get("data")   or {}).get("url") if isinstance(data.get("data"),   dict) else None or
-            ""
-        )
+        url  = data.get("url") or data.get("download_url") or ""
+        if not url and isinstance(data.get("result"), dict):
+            url = data["result"].get("url") or data["result"].get("download_url") or ""
+        if not url and isinstance(data.get("data"), dict):
+            url = data["data"].get("url") or data["data"].get("download_url") or ""
         if not url:
-            # result might be the URL string itself
             rv = data.get("result")
             if isinstance(rv, str) and rv.startswith("http"):
                 url = rv
         if url:
             return url
-        log.warning("[Seedr] fetch_file(%d) no URL. Keys: %s", file_id, list(data.keys()))
+        # url key present but empty — log actual value for debugging future API changes
+        log.warning(
+            "[Seedr] fetch_file(%d) returned empty URL. "
+            "Keys: %s  url=%r  name=%r",
+            file_id, list(data.keys()), data.get("url"), data.get("name"),
+        )
     except Exception as exc:
         log.warning("[Seedr] fetch_file(%d): %s", file_id, exc)
         _invalidate(username)
@@ -402,24 +404,36 @@ async def _storage(username: str, password: str) -> dict:
                    "quota_used", "disk_used")
 
     def _read_storage(data: dict) -> tuple[int, int]:
-        total = 0
-        used  = 0
-        for k in _TOTAL_KEYS:
-            v = data.get(k)
-            if v:
-                try:
-                    total = int(v)
-                    break
-                except (ValueError, TypeError):
-                    pass
-        for k in _USED_KEYS:
-            v = data.get(k)
-            if v:
-                try:
-                    used = int(v)
-                    break
-                except (ValueError, TypeError):
-                    pass
+        # The log showed Seedr puts space_used/space_max inside data['account']
+        # Try top-level first, then the 'account' sub-dict as fallback
+        sources = [data]
+        account = data.get("account")
+        if isinstance(account, dict):
+            sources.append(account)
+
+        total = used = 0
+        for src in sources:
+            for k in _TOTAL_KEYS:
+                v = src.get(k)
+                if v:
+                    try:
+                        total = int(v)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+            if total:
+                break
+        for src in sources:
+            for k in _USED_KEYS:
+                v = src.get(k)
+                if v is not None:
+                    try:
+                        used = int(v)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+            if used:
+                break
         return total, used
 
     client = await _get_client(username, password)
@@ -522,12 +536,18 @@ async def _submit_magnet(username: str, password: str, magnet: str) -> Optional[
             )
 
         tid = (
+            result.get("user_torrent_id") or   # ← actual field name in current Seedr API
             result.get("torrent_id") or
             result.get("id") or
+            (result.get("data") or {}).get("user_torrent_id") or
             (result.get("data") or {}).get("torrent_id") or
-            (isinstance(rv, int) and rv > 0 and rv) or
             None
         )
+        # Guard: rv=True (boolean success flag) must never be used as torrent_id
+        if not tid:
+            rv2 = result.get("result")
+            if isinstance(rv2, int) and rv2 > 1:   # >1 to exclude True==1
+                tid = rv2
         log.info("[Seedr] Submitted via seedrcc: torrent_id=%s", tid)
         return int(tid) if tid else None
 
