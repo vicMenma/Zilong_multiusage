@@ -458,15 +458,45 @@ async def _auto_hardsub_url(
         "──────────────────────\n\n"
         f"📁 <code>{fname[:40]}</code>\n"
         f"✅ French sub: <code>{detail_s}</code>\n\n"
-        "📤 <i>Extracting subtitle from Seedr CDN…</i>",
+        "📤 <i>Extracting subtitle from probe file…</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
-    extract_source = video_url
+    # CRITICAL FIX: use the already-downloaded local probe file, NOT the CDN URL.
+    # ffmpeg on a remote URL must stream/buffer gigabytes before reaching subtitle
+    # packets → hangs indefinitely.  The 50 MB probe file always contains the full
+    # subtitle track (subtitles are muxed in the first few MB of any MKV).
+    # Fall back to CDN URL only if probe_path is not a real local file.
+    if os.path.isfile(str(probe_path)) and os.path.getsize(str(probe_path)) > 1024:
+        extract_source = probe_path
+        log.info("[SeedrHS] Extracting sub from local probe file (%s)",
+                 human_size(os.path.getsize(str(probe_path))))
+    else:
+        extract_source = video_url
+        log.warning("[SeedrHS] Probe file missing — falling back to CDN URL (may be slow)")
+
     try:
-        await FF.stream_op(extract_source, sub_path, [
-            "-map", f"0:{idx}", "-c", "copy",
-        ])
+        await asyncio.wait_for(
+            FF.stream_op(str(extract_source), sub_path, [
+                "-map", f"0:{idx}", "-c", "copy",
+            ]),
+            timeout=120,   # 2 min hard limit — local extraction should take <5 s
+        )
+    except asyncio.TimeoutError:
+        cleanup(tmp)
+        try:
+            from services.seedr import _del_folder
+            await _del_folder(seedr_user, seedr_pwd, folder_id)
+        except Exception:
+            pass
+        log.error("[SeedrHS] Sub extraction timed out (source=%s)", extract_source)
+        return await safe_edit(
+            st,
+            "❌ <b>Subtitle extraction timed out.</b>\n\n"
+            "The probe file may be too small to contain the subtitle track.\n"
+            "Try sending a .ass / .srt subtitle file manually.",
+            parse_mode=enums.ParseMode.HTML,
+        )
     except Exception as exc:
         cleanup(tmp)
         try:
