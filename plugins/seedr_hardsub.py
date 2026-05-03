@@ -206,332 +206,264 @@ _VIDEO_EXTS = frozenset({
 async def _seedr_hardsub_pipeline(
     client: Client, st, magnet: str, uid: int,
 ) -> None:
-    from services.seedr import fetch_urls_via_seedr
+    """
+    Full pipeline (linear, no intermediate state):
+      magnet → Seedr CDN URL → 50 MB probe → detect French sub
+           → extract sub from probe locally → submit CDN URL + sub to CC
+    CloudConvert pulls the video directly from Seedr's CDN.
+    Only the subtitle file (~20 KB) is uploaded.
+    """
+    from services.seedr import fetch_urls_via_seedr, _del_folder
     from services import ffmpeg as FF
+    from services.cloudconvert_api import submit_hardsub, parse_api_keys, pick_best_key
+    from services.cc_job_store import cc_job_store, CCJob
+    from services.cc_sanitize import build_cc_output_name
 
-    tmp = make_tmp(cfg.download_dir, uid)
+    tmp   = make_tmp(cfg.download_dir, uid)
     start = time.time()
 
-    async def _progress(stage: str, pct: float, detail: str) -> None:
-        from services.utils import human_dur
-        elapsed = human_dur(int(time.time() - start))
-        icons = {
-            "selecting": "🔍", "submitting": "⬆️", "waiting": "⏳",
-            "downloading": "☁️", "fetching": "🔗",
-        }
-        icon   = icons.get(stage, "⏳")
+    # ── Step 1: Seedr ─────────────────────────────────────────────────────────
+    async def _seedr_progress(stage: str, pct: float, detail: str) -> None:
+        icons  = {"selecting": "🔍", "submitting": "⬆️",
+                  "waiting": "⏳", "downloading": "☁️", "fetching": "🔗"}
         filled = int(pct / 10)
         bar    = "█" * filled + "░" * (10 - filled)
         await safe_edit(
             st,
             f"🔥 <b>Seedr → Hardsub</b>\n"
             "──────────────────────\n\n"
-            f"{icon} <i>{detail}</i>\n\n"
-            f"<code>[{bar}]</code>  <b>{pct:.0f}%</b>  ·  ⏱ <i>{elapsed}</i>\n\n"
-            "<i>Seedr fetches at datacenter speed.\n"
-            "CDN link will be sent directly to CloudConvert.</i>",
+            f"{icons.get(stage, '⏳')} <i>{detail}</i>\n\n"
+            f"<code>[{bar}]</code>  <b>{pct:.0f}%</b>",
             parse_mode=enums.ParseMode.HTML,
         )
 
     try:
         files, folder_id, seedr_user, seedr_pwd = await fetch_urls_via_seedr(
-            magnet, progress_cb=_progress, timeout_s=7200,
+            magnet, progress_cb=_seedr_progress, timeout_s=7200,
         )
     except Exception as exc:
         cleanup(tmp)
         log.error("[SeedrHS] Seedr failed: %s", exc, exc_info=True)
         return await safe_edit(
-            st,
-            f"❌ <b>Seedr failed</b>\n\n<code>{str(exc)[:300]}</code>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-
-    if not files:
-        cleanup(tmp)
-        return await safe_edit(
-            st,
-            "❌ <b>Seedr: no files found.</b>",
+            st, f"❌ <b>Seedr failed</b>\n\n<code>{str(exc)[:300]}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
 
     video_files = [f for f in files
-                   if os.path.splitext(f["name"])[1].lower() in _VIDEO_EXTS]
-    if not video_files:
-        video_files = files
-
-    best      = max(video_files, key=lambda f: f.get("size", 0))
+                   if os.path.splitext(f.get("name",""))[1].lower() in _VIDEO_EXTS]
+    best      = max(video_files or files, key=lambda f: f.get("size", 0))
     fname     = best["clean_name"]
     fsize     = best.get("size", 0)
     video_url = best["url"]
+    log.info("[SeedrHS] CDN URL: %s (%s)", fname, human_size(fsize))
 
-    log.info("[SeedrHS] Phase 2: video=%s (%s) — probing via partial download", fname, human_size(fsize))
-
+    # ── Step 2: Download 50 MB probe ─────────────────────────────────────────
     await safe_edit(
         st,
         f"🔥 <b>Seedr → Hardsub</b>\n"
         "──────────────────────\n\n"
-        f"✅ Seedr ready — CDN link obtained\n"
-        f"📁 <code>{fname[:45]}</code>  <code>{human_size(fsize)}</code>\n\n"
-        "🔍 <i>Probing streams for French subtitle…\n"
-        "(downloading first 50 MB for stream analysis)</i>",
+        f"✅ CDN link obtained\n"
+        f"📁 <code>{fname[:45]}</code>  <i>{human_size(fsize)}</i>\n\n"
+        "🔍 <i>Downloading 50 MB probe for subtitle detection…</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
-    probe_path = video_url
+    probe_path: object = video_url   # fallback to CDN URL if download fails
     try:
         import aiohttp as _aiohttp
         _probe_fpath = os.path.join(tmp, fname)
         _timeout     = _aiohttp.ClientTimeout(total=300)
         async with _aiohttp.ClientSession(timeout=_timeout) as _sess:
-            async with _sess.get(video_url, headers={"User-Agent": "Mozilla/5.0"},
-                                  allow_redirects=True) as _resp:
+            async with _sess.get(
+                video_url, headers={"User-Agent": "Mozilla/5.0"},
+                allow_redirects=True,
+            ) as _resp:
                 _resp.raise_for_status()
-                _MAX = 50 * 1024 * 1024
                 _done = 0
                 with open(_probe_fpath, "wb") as _fh:
                     async for _chunk in _resp.content.iter_chunked(1024 * 1024):
                         _fh.write(_chunk)
                         _done += len(_chunk)
-                        if _done >= _MAX:
+                        if _done >= 50 * 1024 * 1024:
                             break
         probe_path = _probe_fpath
-        log.info("[SeedrHS] Partial download for probe: %s bytes -> %s", _done, _probe_fpath)
+        log.info("[SeedrHS] Probe saved: %s", human_size(_done))
     except Exception as exc:
-        log.warning("[SeedrHS] Partial download for probe failed: %s — probing URL directly", exc)
+        log.warning("[SeedrHS] Probe download failed (%s) — using CDN URL for probe", exc)
 
+    # ── Step 3: Detect subtitle streams ──────────────────────────────────────
     try:
-        sd = await FF.probe_streams(probe_path)
+        sd = await FF.probe_streams(str(probe_path))
     except Exception as exc:
         cleanup(tmp)
-        try:
-            from services.seedr import _del_folder
-            await _del_folder(seedr_user, seedr_pwd, folder_id)
-        except Exception:
-            pass
+        await _del_folder(seedr_user, seedr_pwd, folder_id)
         return await safe_edit(
-            st,
-            f"❌ <b>Stream probe failed</b>\n\n<code>{exc}</code>",
+            st, f"❌ <b>Stream probe failed</b>\n\n<code>{exc}</code>",
             parse_mode=enums.ParseMode.HTML,
         )
 
     all_subs = sd.get("subtitle", [])
     french_text, french_bitmap = _find_french_subs(all_subs)
+    log.info("[SeedrHS] %dv %da %ds | %d FR text, %d FR bitmap",
+             len(sd.get("video",[])), len(sd.get("audio",[])), len(all_subs),
+             len(french_text), len(french_bitmap))
 
-    v_count = len(sd.get("video", []))
-    a_count = len(sd.get("audio", []))
-    s_count = len(all_subs)
-
-    log.info(
-        "[SeedrHS] Streams: %d video, %d audio, %d sub "
-        "(%d French text, %d French bitmap)",
-        v_count, a_count, s_count,
-        len(french_text), len(french_bitmap),
-    )
-
-    if french_text:
-        best = french_text[0]
-        await _auto_hardsub_url(client, st, probe_path, video_url, fname, fsize,
-                                 best, tmp, uid, folder_id, seedr_user, seedr_pwd)
-        return
-
-    if french_bitmap:
-        b = french_bitmap[0]
-        b_codec = (b.get("codec_name") or "PGS").upper()
-        b_idx   = b.get("index", "?")
-
+    # ── Step 4: No French text sub → ask user for manual subtitle ─────────────
+    if not french_text:
+        if french_bitmap:
+            b_codec = (french_bitmap[0].get("codec_name") or "PGS").upper()
+            msg = (
+                f"⚠️ <b>French subtitle is bitmap ({b_codec})</b>\n"
+                "──────────────────────\n\n"
+                f"📁 <code>{fname[:40]}</code>\n\n"
+                f"<b>{b_codec}</b> is image-based — CC needs text (.ass/.srt).\n\n"
+                "Send a <b>French .ass / .srt</b> file or URL.\n"
+                "<i>Send /cancel to abort.</i>"
+            )
+        else:
+            sub_info = "\n".join(
+                f"  #{s.get('index','?')} "
+                f"{lang_flag((s.get('tags',{}) or {}).get('language','und'))} "
+                f"[{(s.get('codec_name','?')).upper()}]"
+                for s in all_subs
+            ) or "  <i>none</i>"
+            msg = (
+                f"⚠️ <b>No French subtitle found</b>\n"
+                "──────────────────────\n\n"
+                f"📁 <code>{fname[:40]}</code>\n"
+                f"🎬 {len(sd.get('video',[]))}v · 🎵 {len(sd.get('audio',[]))}a "
+                f"· 💬 {len(all_subs)} sub\n\n"
+                f"<b>Available:</b>\n{sub_info}\n\n"
+                "Send a <b>French .ass / .srt</b> file or URL.\n"
+                "<i>Send /cancel to abort.</i>"
+            )
         _evict_waiting_subs()
         _WAITING_SUB[uid] = {
-            "video_url":   video_url,
-            "video_path":  probe_path if os.path.isfile(str(probe_path)) else None,
-            "fname":       fname,
-            "fsize":       fsize,
-            "tmp":         tmp,
-            "folder_id":   folder_id,
-            "seedr_user":  seedr_user,
-            "seedr_pwd":   seedr_pwd,
-            "_created":    time.time(),
+            "video_url": video_url,
+            "video_path": probe_path if os.path.isfile(str(probe_path)) else None,
+            "fname": fname, "fsize": fsize, "tmp": tmp,
+            "folder_id": folder_id, "seedr_user": seedr_user,
+            "seedr_pwd": seedr_pwd, "_created": time.time(),
         }
+        return await safe_edit(st, msg, parse_mode=enums.ParseMode.HTML)
 
-        return await safe_edit(
-            st,
-            f"⚠️ <b>French subtitle found — but bitmap</b>\n"
-            "──────────────────────\n\n"
-            f"📁 <code>{fname[:40]}</code>\n"
-            f"💬 French sub: <code>#{b_idx} {b_codec}</code>\n\n"
-            f"<b>{b_codec}</b> is a bitmap format (image-based).\n"
-            "CloudConvert needs <b>text-based</b> subtitles\n"
-            "(.ass / .srt) for the FFmpeg subtitles filter.\n\n"
-            "──────────────────────\n\n"
-            "Send me a <b>French text subtitle</b>:\n"
-            "• A <b>.ass / .srt / .vtt file</b>\n"
-            "• A <b>URL</b> to a subtitle file\n\n"
-            "<i>Video is on Seedr — no re-download needed.\n"
-            "Send /cancel to abort.</i>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-
-    sub_lines = []
-    for s in all_subs:
-        tags  = s.get("tags", {}) or {}
-        lang  = (tags.get("language") or "und").lower()
-        codec = (s.get("codec_name") or "?").upper()
-        idx   = s.get("index", "?")
-        title = tags.get("title", "")
-        flag  = lang_flag(lang)
-        lname = lang_name(lang)
-        forced_s = " ⚡Forced" if str(tags.get("forced", "0")).lower() in ("1", "true", "yes") else ""
-        line = f"  #{idx} {flag} {lname} [{codec}]{forced_s}"
-        if title:
-            line += f" — {title}"
-        sub_lines.append(line)
-
-    sub_info = "\n".join(sub_lines) if sub_lines else "  <i>No subtitle tracks found</i>"
-
-    _evict_waiting_subs()
-    _WAITING_SUB[uid] = {
-        "video_url":   video_url,
-        "video_path":  probe_path if os.path.isfile(str(probe_path)) else None,
-        "fname":       fname,
-        "fsize":       fsize,
-        "tmp":         tmp,
-        "folder_id":   folder_id,
-        "seedr_user":  seedr_user,
-        "seedr_pwd":   seedr_pwd,
-        "_created":    time.time(),
-    }
-
-    await safe_edit(
-        st,
-        f"⚠️ <b>No French subtitle found</b>\n"
-        "──────────────────────\n\n"
-        f"📁 <code>{fname[:40]}</code>\n"
-        f"💾 <code>{human_size(fsize)}</code>\n"
-        f"🎬 {v_count} video · 🎵 {a_count} audio · 💬 {s_count} sub\n\n"
-        f"<b>Available subtitles:</b>\n{sub_info}\n\n"
-        "──────────────────────\n\n"
-        "Send me a <b>French subtitle</b>:\n"
-        "• A <b>.ass / .srt / .vtt file</b>\n"
-        "• A <b>URL</b> to a subtitle file\n\n"
-        "<i>Video is on Seedr — no re-download needed.\n"
-        "Send /cancel to abort.</i>",
-        parse_mode=enums.ParseMode.HTML,
-    )
-
-
-# ─────────────────────────────────────────────────────────────
-# Auto-hardsub URL: extract sub from probe file, submit video_url to CC
-# ─────────────────────────────────────────────────────────────
-
-async def _auto_hardsub_url(
-    client: Client, st,
-    probe_path: str,
-    video_url: str,
-    fname: str,
-    fsize: int,
-    sub_stream: dict,
-    tmp: str,
-    uid: int,
-    folder_id: int,
-    seedr_user: str,
-    seedr_pwd: str,
-) -> None:
-    from services import ffmpeg as FF
-
+    # ── Step 5: Extract French subtitle from local probe file ─────────────────
+    sub_stream = french_text[0]
     idx    = sub_stream.get("index", 0)
     codec  = (sub_stream.get("codec_name") or "ass").lower()
     ext    = FF.subtitle_ext(codec)
     tags   = sub_stream.get("tags", {}) or {}
-    title  = tags.get("title", "")
-    forced = sub_stream.get("_is_forced", False)
+    detail = f"#{idx} {codec.upper()}"
+    if sub_stream.get("_is_forced"): detail += " (Forced)"
+    if tags.get("title"):            detail += f" — {tags['title']}"
 
     sub_path  = os.path.join(tmp, f"french_sub{ext}")
     sub_fname = os.path.basename(sub_path)
-
-    forced_s = " (Forced)" if forced else ""
-    detail_s = f"#{idx} {codec.upper()}{forced_s}"
-    if title:
-        detail_s += f" — {title}"
 
     await safe_edit(
         st,
         f"🔥 <b>Seedr → Hardsub</b>\n"
         "──────────────────────\n\n"
         f"📁 <code>{fname[:40]}</code>\n"
-        f"✅ French sub: <code>{detail_s}</code>\n\n"
-        "📤 <i>Extracting subtitle from probe file…</i>",
+        f"💬 French sub: <code>{detail}</code>\n\n"
+        "📤 <i>Extracting subtitle…</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
-    # CRITICAL FIX: use the already-downloaded local probe file, NOT the CDN URL.
-    # ffmpeg on a remote URL must stream/buffer gigabytes before reaching subtitle
-    # packets → hangs indefinitely.  The 50 MB probe file always contains the full
-    # subtitle track (subtitles are muxed in the first few MB of any MKV).
-    # Fall back to CDN URL only if probe_path is not a real local file.
-    if os.path.isfile(str(probe_path)) and os.path.getsize(str(probe_path)) > 1024:
-        extract_source = probe_path
-        log.info("[SeedrHS] Extracting sub from local probe file (%s)",
-                 human_size(os.path.getsize(str(probe_path))))
-    else:
-        extract_source = video_url
-        log.warning("[SeedrHS] Probe file missing — falling back to CDN URL (may be slow)")
-
+    # Extract from local probe — never from CDN URL (that streams the whole file)
+    extract_src = str(probe_path) if os.path.isfile(str(probe_path)) else video_url
     try:
         await asyncio.wait_for(
-            FF.stream_op(str(extract_source), sub_path, [
-                "-map", f"0:{idx}", "-c", "copy",
-            ]),
-            timeout=120,   # 2 min hard limit — local extraction should take <5 s
-        )
-    except asyncio.TimeoutError:
-        cleanup(tmp)
-        try:
-            from services.seedr import _del_folder
-            await _del_folder(seedr_user, seedr_pwd, folder_id)
-        except Exception:
-            pass
-        log.error("[SeedrHS] Sub extraction timed out (source=%s)", extract_source)
-        return await safe_edit(
-            st,
-            "❌ <b>Subtitle extraction timed out.</b>\n\n"
-            "The probe file may be too small to contain the subtitle track.\n"
-            "Try sending a .ass / .srt subtitle file manually.",
-            parse_mode=enums.ParseMode.HTML,
+            FF.stream_op(extract_src, sub_path, ["-map", f"0:{idx}", "-c", "copy"]),
+            timeout=120,
         )
     except Exception as exc:
         cleanup(tmp)
-        try:
-            from services.seedr import _del_folder
-            await _del_folder(seedr_user, seedr_pwd, folder_id)
-        except Exception:
-            pass
+        await _del_folder(seedr_user, seedr_pwd, folder_id)
         log.error("[SeedrHS] Sub extraction failed: %s", exc)
         return await safe_edit(
             st,
-            f"❌ <b>Subtitle extraction failed</b>\n\n<code>{exc}</code>",
+            f"❌ <b>Subtitle extraction failed</b>\n\n<code>{exc}</code>\n\n"
+            "Send a .ass / .srt file manually.",
             parse_mode=enums.ParseMode.HTML,
         )
 
     if not os.path.isfile(sub_path) or os.path.getsize(sub_path) < 10:
         cleanup(tmp)
-        try:
-            from services.seedr import _del_folder
-            await _del_folder(seedr_user, seedr_pwd, folder_id)
-        except Exception:
-            pass
+        await _del_folder(seedr_user, seedr_pwd, folder_id)
         return await safe_edit(
-            st,
-            "❌ <b>Extracted subtitle is empty.</b>\n\n"
-            "Try sending a subtitle file manually.",
+            st, "❌ <b>Extracted subtitle is empty.</b>\n\nSend a .ass/.srt manually.",
             parse_mode=enums.ParseMode.HTML,
         )
+    log.info("[SeedrHS] Sub extracted: %s (%s)", sub_fname,
+             human_size(os.path.getsize(sub_path)))
 
-    sub_size = os.path.getsize(sub_path)
-    log.info("[SeedrHS] Extracted: %s (%s) — submitting via CDN URL", sub_fname, human_size(sub_size))
+    # ── Step 6: Submit CDN URL + subtitle to CloudConvert ─────────────────────
+    api_key     = os.environ.get("CC_API_KEY", "").strip()
+    output_name = build_cc_output_name(fname, "VOSTFR")
 
-    await _submit_to_cc_url(
-        client, st, video_url, fname, sub_path, sub_fname,
-        detail_s, tmp, uid, folder_id, seedr_user, seedr_pwd,
+    await safe_edit(
+        st,
+        f"🔥 <b>Seedr → Hardsub</b>\n"
+        "──────────────────────\n\n"
+        f"📁 <code>{fname[:38]}</code>\n"
+        f"💬 <code>{detail[:38]}</code>\n"
+        f"📦 → <code>{output_name[:38]}</code>\n\n"
+        "☁️ <i>Submitting to CloudConvert…\n"
+        "Video URL sent directly — only subtitle uploaded.</i>",
+        parse_mode=enums.ParseMode.HTML,
     )
+
+    try:
+        keys             = parse_api_keys(api_key)
+        selected, creds  = await pick_best_key(keys)
+        key_info         = f"🔑 Key {keys.index(selected)+1}/{len(keys)} ({creds} credits)"
+
+        job_id = await submit_hardsub(
+            selected,
+            video_url=video_url,
+            subtitle_path=sub_path,
+            output_name=output_name,
+        )
+
+        from services.cc_job_store import cc_job_store, CCJob
+        await cc_job_store.add(CCJob(
+            job_id=job_id, uid=uid,
+            fname=fname, sub_fname=sub_fname, output_name=output_name,
+            status="processing",
+            seedr_folder_id=folder_id,
+            seedr_user=seedr_user, seedr_pwd=seedr_pwd,
+        ))
+        try:
+            from plugins.ccstatus import _ensure_poller
+            _ensure_poller()
+        except Exception:
+            pass
+
+        log.info("[SeedrHS] CC job submitted: %s → %s", job_id, output_name)
+        await safe_edit(
+            st,
+            f"✅ <b>Submitted to CloudConvert!</b>\n"
+            "──────────────────────\n\n"
+            f"🆔 <code>{job_id}</code>\n"
+            f"📁 <code>{fname[:36]}</code>\n"
+            f"💬 <code>{detail[:36]}</code>\n"
+            f"📦 → <code>{output_name[:36]}</code>\n"
+            f"{key_info}\n\n"
+            "⏳ <i>Processing (~3-5 min)…\n"
+            "Hardsubbed MP4 will be sent here when ready.</i>\n\n"
+            "📋 /ccstatus to check progress.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    except Exception as exc:
+        log.error("[SeedrHS] CC submit failed: %s", exc, exc_info=True)
+        await safe_edit(
+            st,
+            f"❌ <b>CloudConvert submission failed</b>\n\n<code>{str(exc)[:250]}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+    finally:
+        cleanup(tmp)
 
 
 # ─────────────────────────────────────────────────────────────
