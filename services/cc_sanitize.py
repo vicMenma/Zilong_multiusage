@@ -1,132 +1,197 @@
 """
-services/cc_sanitize.py  —  v2
+services/cc_sanitize.py  —  v3
 
-Filename sanitisation for CloudConvert job submission.
+Produces clean, human-readable filenames for CloudConvert output.
 
-PROBLEM FIXED (v2)
-───────────────────
-Anime/fansub releases from Nyaa / Erai-raws have filenames like:
-  [Erai-raws] Tsue to Tsurugi no Wistoria 2nd Season - 04
-  [720p CR WEB-DL AVC AAC][MultiSub][D0BBA05B].mkv
-
-CloudConvert's import/url task rejects any filename with [], {}, ()
-or other non-URL-safe characters, returning:
-  "422: Task import-video: The url format is invalid."
-
-RULES (v2)
-──────────
-1. Strip ALL bracket groups and their contents:  [tag], {tag}, (tag)
-2. Replace spaces, hyphens, dots (between words) with _
-3. Collapse repeated separators: ____ → _
-4. Strip leading/trailing underscores
-5. Keep only safe chars: A-Z a-z 0-9 _ - .
-6. Always preserve the original file extension
-7. build_cc_output_name() appends a clean tag (VOSTFR, etc.)
-   and ensures the result is safe for CC
+OUTPUT FORMAT:  {Title} {S0204} {TAG}.mp4
 
 EXAMPLES
 ─────────
-  [Erai-raws] Tsue to Tsurugi no Wistoria 2nd Season - 04
-  [720p CR WEB-DL AVC AAC][MultiSub][D0BBA05B].mkv
-  → Tsue_to_Tsurugi_no_Wistoria_2nd_Season_04.mkv
+  [Erai-raws] Tsue to Tsurugi no Wistoria 2nd Season - 04 [720p][MultiSub][ABCD].mkv
+  → Tsue to Tsurugi no Wistoria S0204 VOSTFR.mp4
 
   [SubsPlease] One Piece - 1118 (1080p) [A2B3C4D5].mkv
-  → One_Piece_1118.mkv
+  → One Piece 1118 VOSTFR.mp4
+
+  [HorribleSubs] Attack on Titan S04E28 [1080p].mkv
+  → Attack on Titan S0428 VOSTFR.mp4
+
+  [Erai-raws] Tensei Shitara Slime 3rd Season - 12 [720p].mkv
+  → Tensei Shitara Slime S0312 VOSTFR.mp4
 
   My.Anime.Show.S02E04.FRENCH.1080p.BluRay.x264.mkv
-  → My_Anime_Show_S02E04_FRENCH_1080p_BluRay_x264.mkv
+  → My Anime Show S0204 VOSTFR.mp4
+
+  [ToonsHub] Barbaroi S01E01 1080p WEB-DL AAC2.0 H264.mkv
+  → Barbaroi S0101 VOSTFR.mp4
 """
 from __future__ import annotations
 
 import os
 import re
 
+# ── Ordinal → int ─────────────────────────────────────────────────────────────
 
-# ── Character class constants ─────────────────────────────────────────────────
+_ORDINALS = {
+    "1st": 1, "first":  1,
+    "2nd": 2, "second": 2,
+    "3rd": 3, "third":  3,
+    "4th": 4, "fourth": 4,
+    "5th": 5, "fifth":  5,
+    "6th": 6, "sixth":  6,
+    "7th": 7, "seventh":7,
+    "8th": 8, "eighth": 8,
+    "9th": 9, "ninth":  9,
+}
 
-# Brackets and everything inside them (non-greedy)
-_RE_BRACKETS = re.compile(r'\[[^\]]*\]|\{[^}]*\}|\([^)]*\)')
+def _ord2int(s: str) -> int | None:
+    return _ORDINALS.get(s.lower())
 
-# Any run of characters that isn't alphanumeric or underscore/hyphen
-_RE_UNSAFE   = re.compile(r'[^\w\-.]')
 
-# Dots used as word separators (not the extension dot)
-_RE_DOTS     = re.compile(r'\.(?=[a-zA-Z0-9])')
+# ── Quality / codec noise words to strip from title ───────────────────────────
+# These appear as standalone words after removing brackets.
+_NOISE = re.compile(
+    r'\b('
+    r'\d{3,4}p'                              # 720p 1080p 2160p
+    r'|(?:WEB[-\s]?DL|WEBRip|BluRay|Blu[-\s]?Ray|HDTV|AMZN|DSNP|NF|CR)'
+    r'|(?:AVC|HEVC|x264|x265|H\.?264|H\.?265|XviD)'
+    r'|(?:AAC2?\.?\d*|AC3|DTS|FLAC|MP3|E-AC-3|EAC3|Opus)'
+    r'|(?:MultiSub|Multi|Dual|French|FRENCH|VOSTFR|VOSTA|MULTi)'
+    r'|(?:10bit|8bit|HDR|SDR|DoVi|Remux|REPACK|PROPER)'
+    r')\b',
+    re.IGNORECASE,
+)
 
-# Multiple underscores / hyphens collapsed to single
-_RE_MULTI    = re.compile(r'[_\-]{2,}')
+# ── Regex patterns ────────────────────────────────────────────────────────────
 
-# Leading / trailing underscores and hyphens
-_RE_EDGES    = re.compile(r'^[_\-]+|[_\-]+$')
+_RE_BRACKETS  = re.compile(r'\[[^\]]*\]|\{[^}]*\}|\([^)]*\)')
+_RE_SEP_DOTS  = re.compile(r'\.(?=[a-zA-Z0-9])')
+_RE_MULTISPC  = re.compile(r'[ \t]{2,}')
+_RE_MULTI_DASH= re.compile(r'\s*[-–]+\s*')
+_RE_EDGES     = re.compile(r'^[\s\-_]+|[\s\-_]+$')
+_RE_UNSAFE_FS = re.compile(r'[\\/:*?"<>|]')
+_RE_UNSAFE_URL= re.compile(r'[^\w\-.]')
 
-# Season/episode markers — keep them clearly separated
-_RE_SXXEXX   = re.compile(r'(?i)(S\d{1,2}E\d{1,2})')
+# ── Season/episode patterns (tried in order) ──────────────────────────────────
 
+_EP_PATTERNS = [
+    # S02E04 / s2e4
+    re.compile(
+        r'[Ss](?P<season>\d{1,2})[Ee](?P<episode>\d{1,3})'
+    ),
+    # 2nd Season - 04
+    re.compile(
+        r'(?P<ord>1st|2nd|3rd|[4-9]th|first|second|third|fourth|fifth|'
+        r'sixth|seventh|eighth|ninth)\s+Season\s*[-–]\s*(?P<episode>\d{1,3})',
+        re.IGNORECASE
+    ),
+    # Season 2 - 04
+    re.compile(
+        r'Season\s+(?P<season>\d{1,2})\s*(?:[-–]|Episode)?\s*(?P<episode>\d{1,3})',
+        re.IGNORECASE
+    ),
+    # Bare " - 04" or " - 118"
+    re.compile(r'\s[-–]\s*(?P<episode>\d{1,3})(?=\s|$)'),
+]
+
+
+def _extract_ep(name: str) -> tuple:
+    """Return (start, end, compact_code) or (None, None, '')."""
+    for pat in _EP_PATTERNS:
+        m = pat.search(name)
+        if not m:
+            continue
+        g = m.groupdict()
+        if "ord" in g and g["ord"]:
+            season = _ord2int(g["ord"]) or 1
+        elif "season" in g and g["season"]:
+            season = int(g["season"])
+        else:
+            season = None
+        episode = int(g["episode"])
+        # Compact code: S0204 or zero-padded episode only
+        code = f"S{season:02d}{episode:02d}" if season else f"{episode:02d}"
+        return m.start(), m.end(), code
+    return None, None, ""
+
+
+# ── Core cleaner ─────────────────────────────────────────────────────────────
+
+def _clean_title(name: str) -> tuple[str, str]:
+    """Return (clean_title_with_spaces, ep_code)."""
+    base, _ = os.path.splitext(name)
+
+    # 1. Remove all bracket groups
+    base = _RE_BRACKETS.sub(" ", base)
+
+    # 2. Strip quality/codec noise words BEFORE dot conversion
+    #    so "AAC2.0" is still one token and gets fully removed
+    base = _NOISE.sub(" ", base)
+
+    # 3. Dot-separators → spaces  (My.Anime.Show → My Anime Show)
+    base = _RE_SEP_DOTS.sub(" ", base)
+
+    # 4. Remove unsafe filesystem chars
+    base = _RE_UNSAFE_FS.sub(" ", base)
+
+    # 5. Extract season/episode
+    start, end, ep_code = _extract_ep(base)
+    if start is not None:
+        base = (base[:start] + " " + base[end:])
+
+    # 6. Collapse dashes that are now standalone separators
+    base = _RE_MULTI_DASH.sub(" ", base)
+
+    # 7. Remove orphan dots left after noise stripping in dot-separated names
+    base = re.sub(r'(?<!\w)\.\s*|\s*\.(?!\w)', ' ', base)
+
+    # 8. Collapse spaces, strip edges
+    base = _RE_MULTISPC.sub(" ", base)
+    base = _RE_EDGES.sub("", base)
+
+    return base or "Video", ep_code
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def sanitize_filename(name: str) -> str:
     """
-    Sanitise a filename for CloudConvert submission.
-    Preserves the file extension.  Returns a safe ASCII filename.
+    Clean filename for local storage. Keeps spaces.
 
-    >>> sanitize_filename("[Erai-raws] Wistoria - 04 [720p][MultiSub][ABCD1234].mkv")
-    'Wistoria_04.mkv'
+    >>> sanitize_filename("[Erai-raws] Wistoria 2nd Season - 04 [720p][ABCD].mkv")
+    'Wistoria S0204.mkv'
     """
     if not name:
         return "video.mkv"
+    _, ext = os.path.splitext(name)
+    title, ep_code = _clean_title(name)
+    base = f"{title} {ep_code}".strip() if ep_code else title
+    return base + ext.lower()
 
-    base, ext = os.path.splitext(name)
-    ext = ext.lower()
 
-    # 1. Remove all bracket groups and their contents
-    base = _RE_BRACKETS.sub(" ", base)
-
-    # 2. Normalise dot-separated words to spaces
-    base = _RE_DOTS.sub(" ", base)
-
-    # 3. Replace any unsafe character with underscore
-    base = _RE_UNSAFE.sub("_", base)
-
-    # 4. Collapse runs of separators
-    base = _RE_MULTI.sub("_", base)
-
-    # 5. Strip edges
-    base = _RE_EDGES.sub("", base)
-
-    # 6. If completely empty after stripping, use fallback
-    if not base:
-        base = "video"
-
-    return base + ext
+# Backward-compat alias used by cloudconvert_api.py
+sanitize_for_cc = sanitize_filename
 
 
 def build_cc_output_name(input_name: str, tag: str = "VOSTFR") -> str:
     """
-    Build a sanitised output filename for a CloudConvert hardsub job.
+    Build clean CC output name: 'Title S0204 VOSTFR.mp4'
 
-    The tag (e.g. "VOSTFR") is appended before the extension.
-    The result is guaranteed safe for CC import/url filename parameter.
-
-    >>> build_cc_output_name("[Erai-raws] Wistoria - 04 [720p][ABCD].mkv", "VOSTFR")
-    'Wistoria_04_VOSTFR.mp4'
+    >>> build_cc_output_name("[Erai-raws] Wistoria 2nd Season - 04 [720p][ABCD].mkv")
+    'Wistoria S0204 VOSTFR.mp4'
     """
-    clean_base, _ = os.path.splitext(sanitize_filename(input_name))
-    # Output is always MP4 (CloudConvert hardsub pipeline)
-    return f"{clean_base}_{tag}.mp4"
-
-
-# ── Backward-compat alias used by cloudconvert_api.py ────────────────────────
-sanitize_for_cc = sanitize_filename
+    title, ep_code = _clean_title(input_name)
+    parts = [title]
+    if ep_code:
+        parts.append(ep_code)
+    parts.append(tag)
+    return " ".join(parts) + ".mp4"
 
 
 def sanitize_url_filename(name: str) -> str:
-    """
-    Extra-strict sanitisation for filenames embedded inside URLs.
-    Only keeps alphanumerics, underscore, hyphen, and dot.
-    Used when the filename must appear in a CloudConvert import URL path.
-    """
+    """Strict ASCII, underscores, no spaces — for embedding in URLs."""
     base, ext = os.path.splitext(sanitize_filename(name))
-    # Remove anything that isn't [A-Za-z0-9_\-]
-    base = re.sub(r'[^A-Za-z0-9_\-]', '', base)
-    base = _RE_MULTI.sub("_", base)
-    base = _RE_EDGES.sub("", base) or "video"
+    base = base.replace(" ", "_")
+    base = _RE_UNSAFE_URL.sub("", base)
+    base = re.sub(r'_+', '_', base).strip("_") or "video"
     return base + ext.lower()
