@@ -387,23 +387,82 @@ async def _file_url_fallback(username: str, password: str, file_id: int) -> str:
 
 
 async def _storage(username: str, password: str) -> dict:
+    """
+    Return {total, used, free, unknown}.
+    unknown=True means we could not read storage — callers should skip quota checks.
+
+    Tries every known field name combination across all seedrcc API versions.
+    Logs the full flattened response when all reads return 0 so we can identify
+    new field names after future seedrcc updates.
+    """
+    # All known field name variants across seedrcc versions
+    _TOTAL_KEYS = ("space_max", "storage_max", "storage_total", "space_total",
+                   "total_space", "quota", "quota_total", "disk_space")
+    _USED_KEYS  = ("space_used", "storage_used", "used_space",
+                   "quota_used", "disk_used")
+
+    def _read_storage(data: dict) -> tuple[int, int]:
+        total = 0
+        used  = 0
+        for k in _TOTAL_KEYS:
+            v = data.get(k)
+            if v:
+                try:
+                    total = int(v)
+                    break
+                except (ValueError, TypeError):
+                    pass
+        for k in _USED_KEYS:
+            v = data.get(k)
+            if v:
+                try:
+                    used = int(v)
+                    break
+                except (ValueError, TypeError):
+                    pass
+        return total, used
+
     client = await _get_client(username, password)
+
+    # Attempt 1: get_settings()
     try:
-        raw   = await client.get_settings()
-        data  = _to_dict(raw)
-        total = int(data.get("space_max",  data.get("storage_total", 0)) or 0)
-        used  = int(data.get("space_used", data.get("storage_used",  0)) or 0)
-        return {"total": total, "used": used, "free": max(0, total - used)}
-    except Exception:
-        # Fallback: space info is also in list_contents
-        try:
-            contents = await _root(username, password)
-            total = int(contents.get("space_max",  0) or 0)
-            used  = int(contents.get("space_used", 0) or 0)
-            return {"total": total, "used": used, "free": max(0, total - used)}
-        except Exception as exc:
-            log.warning("[Seedr] storage check failed: %s", exc)
-            return {"total": 0, "used": 0, "free": 9_999_999_999}
+        raw  = await client.get_settings()
+        data = _to_dict(raw)
+        total, used = _read_storage(data)
+        if total > 0:
+            free = max(0, total - used)
+            log.info("[Seedr] Storage (settings): %.0f/%.0f MB (%.0f MB free)",
+                     used / 1e6, total / 1e6, free / 1e6)
+            return {"total": total, "used": used, "free": free, "unknown": False}
+        # Log available keys so we can identify the right field names
+        log.warning(
+            "[Seedr] get_settings() returned 0 for all storage fields. "
+            "Available keys: %s  Sample values: %s",
+            list(data.keys())[:20],
+            {k: data[k] for k in list(data.keys())[:10]},
+        )
+    except Exception as exc:
+        log.warning("[Seedr] get_settings() failed: %s", exc)
+
+    # Attempt 2: list_contents() also carries space info in some API versions
+    try:
+        contents = await _root(username, password)
+        total = int(contents.get("space_max",  0) or 0)
+        used  = int(contents.get("space_used", 0) or 0)
+        if total > 0:
+            free = max(0, total - used)
+            log.info("[Seedr] Storage (list_contents): %.0f/%.0f MB (%.0f MB free)",
+                     used / 1e6, total / 1e6, free / 1e6)
+            return {"total": total, "used": used, "free": free, "unknown": False}
+    except Exception as exc:
+        log.warning("[Seedr] list_contents storage fallback failed: %s", exc)
+
+    # Can't determine storage — return unknown=True so callers skip the check
+    log.warning(
+        "[Seedr] Cannot determine storage for %s — "
+        "assuming space is available and proceeding.", username[:25]
+    )
+    return {"total": 0, "used": 0, "free": 9_999_999_999, "unknown": True}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -532,19 +591,31 @@ async def _del_folder(username: str, password: str, folder_id: int) -> None:
 async def _ensure_free(username: str, password: str, needed: int = 0) -> int:
     want = max(needed, _MIN_FREE)
     s = await _storage(username, password)
+
+    # unknown=True means we couldn't read storage at all — skip the quota
+    # guard and proceed optimistically rather than blocking with a false error
+    if s.get("unknown"):
+        log.warning(
+            "[Seedr] %s: storage unreadable — skipping quota check, proceeding.",
+            username[:25],
+        )
+        return s["free"]  # returns 9_999_999_999 sentinel
+
     log.info(
         "[Seedr] %s: %.0f/%.0f MB (%.0f MB free)",
         username[:25], s["used"] / 1e6, s["total"] / 1e6, s["free"] / 1e6,
     )
     if s["free"] >= want:
         return s["free"]
+
     log.info("[Seedr] Low space — wiping old folders…")
     root = await _root(username, password)
     for f in root["folders"]:
         log.info("[Seedr] Wiping '%s' (id=%d)", f["name"], f["id"])
         await _del_folder(username, password, f["id"])
+
     s = await _storage(username, password)
-    if s["free"] < want:
+    if not s.get("unknown") and s["free"] < want:
         raise SeedrQuotaError(
             f"{username[:25]}: {s['free']//1024//1024} MB free "
             f"(need >= {want//1024//1024} MB)"
