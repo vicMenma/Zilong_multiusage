@@ -206,16 +206,32 @@ async def create_hardsub_job(
     crf: int = 23,
     preset: str = "medium",
     scale_height: int = 0,
+    embedded_sub_si: Optional[int] = None,
 ) -> dict:
+    """
+    embedded_sub_si — when set, burn the subtitle that is ALREADY EMBEDDED
+    in the video at subtitle-stream index `si` (0 = first subtitle track).
+
+    Advantages over the external-subtitle path:
+      • No import-sub task → no subtitle upload → faster job setup
+      • No risk of subtitle format mismatch between extraction and re-import
+      • ffmpeg reads the subtitle directly from its native container stream
+      • Eliminates the silent-fail mode where subtitles= filter skips a
+        broken/missing external file and outputs a clean video with no overlay
+
+    ffmpeg command uses:
+        subtitles='/input/import-video/video.mkv':si=N
+    which tells the subtitles filter to use the embedded track at index N.
+    """
     # FIX CC-ARGSPACE: use _arg_safe() for names embedded inside the arguments
     # string. sanitize_for_cc() may produce spaces ("Wistoria S0204.mp4") which
     # CC's ffmpeg arg splitter breaks into multiple tokens → broken output path
     # → ffmpeg finishes with no output file → export gets INPUT_FILES_NOT_FOUND.
     v_safe = _arg_safe(video_filename)
-    s_safe = _arg_safe(subtitle_filename)
     o_safe = _arg_safe(output_filename)
 
-    log.debug("[CC-API] Sanitized names: video=%s sub=%s out=%s", v_safe, s_safe, o_safe)
+    log.debug("[CC-API] Sanitized names: video=%s out=%s embedded_sub_si=%s",
+              v_safe, o_safe, embedded_sub_si)
 
     tasks: dict = {}
 
@@ -228,15 +244,30 @@ async def create_hardsub_job(
     else:
         tasks["import-video"] = {"operation": "import/upload"}
 
-    tasks["import-sub"] = {"operation": "import/upload"}
-
-    sub_path    = f"/input/import-sub/{s_safe}"
-    sub_escaped = sub_path.replace("\\", "\\\\").replace(":", "\\:")
+    # ── Subtitle source: embedded in video OR external file ───────────────────
+    if embedded_sub_si is not None:
+        # Use the subtitle track already embedded in the video container.
+        # No import-sub task needed — saves a subtitle upload round-trip and
+        # avoids the silent no-overlay failure caused by external file issues.
+        vid_path    = f"/input/import-video/{v_safe}"
+        vid_escaped = vid_path.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+        sub_filter  = f"subtitles='{vid_escaped}':si={embedded_sub_si}"
+        input_tasks = ["import-video"]
+        log.info("[CC-API] Using embedded subtitle si=%d from %s", embedded_sub_si, v_safe)
+    else:
+        # External subtitle file — upload via import-sub task
+        s_safe = _arg_safe(subtitle_filename)
+        tasks["import-sub"] = {"operation": "import/upload"}
+        sub_path    = f"/input/import-sub/{s_safe}"
+        sub_escaped = sub_path.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+        sub_filter  = f"subtitles='{sub_escaped}'"
+        input_tasks = ["import-video", "import-sub"]
+        log.info("[CC-API] Using external subtitle: %s", s_safe)
 
     if scale_height > 0:
-        vf = f"scale=-2:{scale_height},subtitles='{sub_escaped}'"
+        vf = f"scale=-2:{scale_height},{sub_filter}"
     else:
-        vf = f"subtitles='{sub_escaped}'"
+        vf = sub_filter
 
     # FIX CC-SIZE-01: audio bitrate always 128k
     ffmpeg_args = (
@@ -250,7 +281,7 @@ async def create_hardsub_job(
 
     tasks["hardsub"] = {
         "operation": "command",
-        "input":     ["import-video", "import-sub"],
+        "input":     input_tasks,
         "engine":    "ffmpeg",
         "command":   "ffmpeg",
         "arguments": ffmpeg_args,
@@ -525,19 +556,26 @@ def get_export_url(job: dict) -> str:
 
 async def submit_hardsub(
     api_key: str,
-    video_path:    Optional[str] = None,
-    video_url:     Optional[str] = None,
-    subtitle_path: str = "",
-    output_name:   str = "hardsub.mp4",
-    crf:           int = 23,
-    preset:        str = "medium",
-    scale_height:  int = 0,
-    user_id:       int = 0,
+    video_path:      Optional[str] = None,
+    video_url:       Optional[str] = None,
+    subtitle_path:   str = "",
+    output_name:     str = "hardsub.mp4",
+    crf:             int = 23,
+    preset:          str = "medium",
+    scale_height:    int = 0,
+    user_id:         int = 0,
     upload_progress_cb=None,
+    embedded_sub_si: Optional[int] = None,
 ) -> str:
+    """
+    embedded_sub_si — subtitle stream index already embedded in the video
+    (0 = first subtitle track in the file). When set, no subtitle file
+    upload is needed and CC burns the track directly from the container.
+    subtitle_path is ignored when embedded_sub_si is provided.
+    """
     if not video_path and not video_url:
         raise ValueError("Provide either video_path or video_url")
-    if not subtitle_path or not os.path.isfile(subtitle_path):
+    if embedded_sub_si is None and (not subtitle_path or not os.path.isfile(subtitle_path)):
         raise ValueError(f"Subtitle file not found: {subtitle_path}")
 
     keys = parse_api_keys(api_key)
@@ -545,23 +583,25 @@ async def submit_hardsub(
         raise ValueError("No API keys provided in CC_API_KEY")
 
     selected_key, credits = await pick_best_key(keys)
-    log.info("[CC-API] Hardsub: key with %d credits (preset=%s crf=%d)", credits, preset, crf)
+    log.info("[CC-API] Hardsub: key with %d credits (preset=%s crf=%d embedded_si=%s)",
+             credits, preset, crf, embedded_sub_si)
 
     video_fname = (
         os.path.basename(video_path) if video_path
         else video_url.split("/")[-1].split("?")[0]
     )
-    sub_fname = os.path.basename(subtitle_path)
+    sub_fname = os.path.basename(subtitle_path) if subtitle_path else ""
 
     job = await create_hardsub_job(
         selected_key,
         video_url=video_url if not video_path else None,
         video_filename=video_fname,
-        subtitle_filename=sub_fname,
+        subtitle_filename=sub_fname or "subtitle.ass",
         output_filename=output_name,
         crf=crf,
         preset=preset,
         scale_height=scale_height,
+        embedded_sub_si=embedded_sub_si,
     )
 
     job_id = job.get("id", "?")
@@ -580,14 +620,16 @@ async def submit_hardsub(
             except Exception:
                 pass
 
-    sub_task = _find_task(job, "import-sub")
-    if not sub_task:
-        raise RuntimeError("No import-sub task found in job")
-    await upload_file_to_task(
-        sub_task, subtitle_path, sub_fname,
-        api_key=selected_key, job_id=job_id, task_name="import-sub",
-        progress_cb=_sub_progress,
-    )
+    # Upload subtitle only if using external subtitle file
+    if embedded_sub_si is None:
+        sub_task = _find_task(job, "import-sub")
+        if not sub_task:
+            raise RuntimeError("No import-sub task found in job")
+        await upload_file_to_task(
+            sub_task, subtitle_path, sub_fname,
+            api_key=selected_key, job_id=job_id, task_name="import-sub",
+            progress_cb=_sub_progress,
+        )
 
     if video_path:
         vid_task = _find_task(job, "import-video")
@@ -599,7 +641,8 @@ async def submit_hardsub(
             progress_cb=_vid_progress,
         )
 
-    log.info("[CC-API] Hardsub job submitted: %s → %s", job_id, output_name)
+    log.info("[CC-API] Hardsub job submitted: %s → %s (embedded_si=%s)",
+             job_id, output_name, embedded_sub_si)
     return job_id
 
 
