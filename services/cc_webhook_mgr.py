@@ -1,34 +1,37 @@
 """
-services/cc_webhook_mgr.py  —  PATCHED v2
-CloudConvert webhook subscription management.
+services/cc_webhook_mgr.py  —  v3 (Colab-optimised persistent webhook)
 
-WHAT CHANGED vs previous version
-────────────────────────────────
-FIX CC-WH-PAG: list_cc_webhooks() now paginates through EVERY page.
-  Root cause of "webhooks accumulate on every Colab restart":
-    CloudConvert /v2/webhooks returns 25 items per page by default.
-    The old code only read page 1 → only the first 25 stale webhooks
-    were ever deleted.  After a few Colab restarts you end up with
-    hundreds of dead webhooks cluttering your dashboard.
+WHY THIS MATTERS ON COLAB
+─────────────────────────
+Every Colab restart opens a NEW Cloudflare tunnel with a NEW URL.
+Old code always ran: list ALL webhooks (up to 20 paginated API calls) +
+delete each one + create new = many API calls and accumulating stale entries.
 
-  Fix:
-    - Loop with ?page=N until we get an empty page or hit 20 pages
-      (safety cap = 500 webhooks).
-    - Use per_page=100 for efficiency (CC max is typically 100).
-    - Also handles the alternate response shape where data is nested
-      under "data" with "current_page" / "last_page" meta fields.
+NEW BEHAVIOUR
+─────────────
+data/cc_webhooks.json  stores  { "<key_tail>": {"id": "...", "url": "..."} }
 
-FIX CC-WH-DELAY: small 0.15 s gap between deletes (was 0.3 s) — faster
-  cleanup for accounts with many stale webhooks.
+On each restart:
 
-FIX CC-WH-EARLY-TUNNEL (coordinated with config.py change):
-  Caller (main.py / cloudconvert_hook.py) now calls set_tunnel_url()
-  BEFORE opening the aiohttp server, so FreeConvert jobs submitted
-  during early startup already have the correct webhook URL.
+  Case 1 — Same URL (EC2 / VPS with fixed WEBHOOK_BASE_URL):
+    Verify the stored webhook still exists → REUSE it.
+    Zero extra API calls.
+
+  Case 2 — New URL (Colab / dynamic tunnel) + have a stored ID:
+    DELETE just that one webhook (1 API call) + CREATE new (1 API call).
+    Store new ID.  = 2 API calls total, no accumulation.
+
+  Case 3 — First ever run (no stored entry):
+    Full paginated cleanup of any stale webhooks + CREATE new.
+    Store ID for next time.
+
+Previously fixed (v2):
+  CC-WH-PAG: list_cc_webhooks() paginates through ALL pages.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from typing import Optional
@@ -37,24 +40,72 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
-_CC_API   = "https://api.cloudconvert.com/v2"
-_TIMEOUT  = aiohttp.ClientTimeout(total=30)
+_CC_API    = "https://api.cloudconvert.com/v2"
+_TIMEOUT   = aiohttp.ClientTimeout(total=30)
 _CC_EVENTS = ["job.finished", "job.failed"]
 
-_MAX_PAGES   = 20    # safety cap — up to 2000 webhooks listed
-_PAGE_SIZE   = 100
-_DELETE_GAP  = 0.15  # seconds between deletes
+_MAX_PAGES  = 20
+_PAGE_SIZE  = 100
+_DELETE_GAP = 0.15
+
+# ── Persistent store ──────────────────────────────────────────────────────────
+_WEBHOOK_STORE_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "data", "cc_webhooks.json")
+)
+
+
+def _load_webhook_store() -> dict:
+    """Load  { key_tail: {id, url} }  from disk.  Returns {} on any error."""
+    try:
+        with open(_WEBHOOK_STORE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.warning("[CC-WH] Store load: %s", exc)
+        return {}
+
+
+def _save_webhook_store(store: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_WEBHOOK_STORE_PATH), exist_ok=True)
+        with open(_WEBHOOK_STORE_PATH, "w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2)
+    except Exception as exc:
+        log.warning("[CC-WH] Store save: %s", exc)
+
+
+async def _verify_webhook(api_key: str, webhook_id: str, expected_url: str) -> bool:
+    """
+    Return True if webhook_id still exists on CC and points to expected_url.
+    Returns False on 404, network error, or URL mismatch — never raises.
+    """
+    try:
+        async with aiohttp.ClientSession(timeout=_TIMEOUT) as sess:
+            async with sess.get(
+                f"{_CC_API}/webhooks/{webhook_id}",
+                headers=_hdr(api_key),
+            ) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+        wh  = data.get("data") or data
+        got = (wh.get("url") or "").rstrip("/")
+        exp = expected_url.rstrip("/")
+        return got == exp
+    except Exception as exc:
+        log.debug("[CC-WH] Verify %s: %s", webhook_id, exc)
+        return False
 
 
 def _hdr(api_key: str) -> dict:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
+# ── CC API helpers ────────────────────────────────────────────────────────────
+
 async def list_cc_webhooks(api_key: str) -> list[dict]:
-    """
-    Return ALL webhook subscriptions for this key, paginating through
-    every page.  See FIX CC-WH-PAG above.
-    """
+    """Return ALL webhook subscriptions, paginating through every page."""
     all_items: list[dict] = []
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as sess:
         for page in range(1, _MAX_PAGES + 1):
@@ -64,31 +115,21 @@ async def list_cc_webhooks(api_key: str) -> list[dict]:
                     raise PermissionError("CloudConvert API key invalid (401)")
                 if resp.status != 200:
                     body = await resp.text()
-                    log.warning("[CC-WH] List page %d returned %d: %s",
+                    log.warning("[CC-WH] List page %d → %d: %s",
                                 page, resp.status, body[:120])
                     break
                 data = await resp.json()
 
-            # Response shape handling:
-            #   { "data": [ {...}, ... ], "meta": {...} }   ← paginated
-            #   { "data": [ ... ] }                         ← unpaginated
-            #   [ ... ]                                     ← bare array
             items = data.get("data") if isinstance(data, dict) else data
             if isinstance(items, dict) and "data" in items:
                 items = items["data"]
-            if not isinstance(items, list):
+            if not isinstance(items, list) or not items:
                 break
-
-            if not items:
-                break   # empty page → we're done
-
             all_items.extend(items)
-
-            # Stop early if response size < requested page size
             if len(items) < _PAGE_SIZE:
                 break
 
-    log.info("[CC-WH] Key ...%s: paginated list → %d total webhook(s)",
+    log.info("[CC-WH] Key ...%s: %d webhook(s) on account",
              api_key[-6:], len(all_items))
     return all_items
 
@@ -115,57 +156,105 @@ async def create_cc_webhook(
     payload = {"url": url, "events": events}
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as sess:
         async with sess.post(
-            f"{_CC_API}/webhooks",
-            json=payload,
-            headers=_hdr(api_key),
+            f"{_CC_API}/webhooks", json=payload, headers=_hdr(api_key),
         ) as resp:
             data = await resp.json()
             if resp.status not in (200, 201):
                 msg = (data.get("message") or
                        (data.get("data") or {}).get("message") or
                        str(data))
-                raise RuntimeError(f"CC webhook create failed ({resp.status}): {msg}")
+                raise RuntimeError(
+                    f"CC webhook create failed ({resp.status}): {msg}"
+                )
 
     wh = data.get("data") or data
-    log.info("[CC-WH] Registered webhook id=%s → %s", wh.get("id", "?"), url)
+    log.info("[CC-WH] Registered id=%s → %s", wh.get("id", "?"), url)
     return wh
 
 
+# ── Per-key sync (Colab-optimised) ───────────────────────────────────────────
+
 async def _sync_one_key(api_key: str, new_webhook_url: str) -> dict:
-    tail = api_key[-6:]
-    result = {"key_tail": f"...{tail}", "deleted": 0, "registered": None, "error": ""}
+    tail   = api_key[-6:]
+    result = {
+        "key_tail":   f"...{tail}",
+        "deleted":    0,
+        "registered": None,
+        "reused":     False,
+        "error":      "",
+    }
 
-    try:
-        existing = await list_cc_webhooks(api_key)
-        log.info("[CC-WH] Key ...%s: found %d existing webhook(s) across all pages",
-                 tail, len(existing))
+    store = _load_webhook_store()
+    entry = store.get(tail, {})
 
-        deleted = 0
-        for wh in existing:
-            wh_id = wh.get("id") or (wh.get("data") or {}).get("id")
-            if not wh_id:
-                continue
-            ok = await delete_cc_webhook(api_key, str(wh_id))
+    # ── Case 1: URL unchanged → verify and reuse (EC2 / same Cloudflare URL) ──
+    if entry.get("id") and \
+       entry.get("url", "").rstrip("/") == new_webhook_url.rstrip("/"):
+        if await _verify_webhook(api_key, entry["id"], new_webhook_url):
+            result["registered"] = entry["id"]
+            result["reused"]     = True
+            log.info("[CC-WH] Key ...%s: ✅ reusing webhook %s (0 API calls)",
+                     tail, entry["id"])
+            return result
+        # Stored ID is gone from CC — fall through to recreate
+        log.info("[CC-WH] Key ...%s: stored webhook gone — will recreate", tail)
+
+    # ── Case 2: URL changed but we know the old ID → targeted delete (Colab) ──
+    if entry.get("id") and \
+       entry.get("url", "").rstrip("/") != new_webhook_url.rstrip("/"):
+        try:
+            ok = await delete_cc_webhook(api_key, entry["id"])
             if ok:
-                deleted += 1
-            await asyncio.sleep(_DELETE_GAP)
+                result["deleted"] = 1
+                log.info("[CC-WH] Key ...%s: deleted old webhook %s (1 API call)",
+                         tail, entry["id"])
+            # Mark entry as cleared so we skip full cleanup below
+            entry = {"_targeted_delete_done": True}
+        except Exception as exc:
+            log.debug("[CC-WH] Targeted delete failed (%s) — "
+                      "falling back to full cleanup", exc)
+            entry = {}   # force full cleanup
 
-        result["deleted"] = deleted
-        log.info("[CC-WH] Key ...%s: %d/%d webhook(s) deleted",
-                 tail, deleted, len(existing))
+    # ── Case 3: No stored entry (first ever run) → full paginated cleanup ─────
+    if not entry:
+        try:
+            existing = await list_cc_webhooks(api_key)
+            log.info("[CC-WH] Key ...%s: first run — %d webhook(s) to clean",
+                     tail, len(existing))
+            deleted = 0
+            for wh in existing:
+                wh_id = wh.get("id") or (wh.get("data") or {}).get("id")
+                if not wh_id:
+                    continue
+                if await delete_cc_webhook(api_key, str(wh_id)):
+                    deleted += 1
+                await asyncio.sleep(_DELETE_GAP)
+            result["deleted"] = deleted
+        except PermissionError as exc:
+            result["error"] = str(exc)
+            log.error("[CC-WH] Key ...%s invalid: %s", tail, exc)
+            return result
+        except Exception as exc:
+            result["error"] = str(exc)[:120]
+            log.error("[CC-WH] Key ...%s cleanup error: %s", tail, exc)
+            return result
 
-        wh = await create_cc_webhook(api_key, new_webhook_url)
-        result["registered"] = wh.get("id", "?")
-
-    except PermissionError as exc:
-        result["error"] = str(exc)
-        log.error("[CC-WH] Key ...%s invalid: %s", tail, exc)
+    # ── Create fresh webhook + persist the ID ─────────────────────────────────
+    try:
+        wh    = await create_cc_webhook(api_key, new_webhook_url)
+        wh_id = str(wh.get("id", "?"))
+        result["registered"] = wh_id
+        store[tail] = {"id": wh_id, "url": new_webhook_url}
+        _save_webhook_store(store)
+        log.info("[CC-WH] Key ...%s: new webhook %s stored", tail, wh_id)
     except Exception as exc:
         result["error"] = str(exc)[:120]
-        log.error("[CC-WH] Key ...%s error: %s", tail, exc, exc_info=True)
+        log.error("[CC-WH] Key ...%s create error: %s", tail, exc)
 
     return result
 
+
+# ── Public entry point ────────────────────────────────────────────────────────
 
 async def sync_cc_webhooks(
     tunnel_base_url:  str,
@@ -173,8 +262,9 @@ async def sync_cc_webhooks(
     webhook_path:     str = "/webhook/cloudconvert",
 ) -> list[dict]:
     """
-    Clean up ALL stale CloudConvert webhook subscriptions (paginated),
-    then register a fresh one per API key pointing at tunnel_base_url.
+    Ensure each CC API key has exactly one webhook pointing at
+    tunnel_base_url + webhook_path, using the persistent store to
+    minimise API calls on Colab restarts.
     """
     new_url = tunnel_base_url.rstrip("/") + webhook_path
 
@@ -189,17 +279,23 @@ async def sync_cc_webhooks(
     if not api_keys:
         return []
 
-    log.info("[CC-WH] Syncing %d CC key(s) → %s", len(api_keys), new_url)
+    log.info("[CC-WH] Syncing %d key(s) → %s", len(api_keys), new_url)
 
-    tasks   = [_sync_one_key(k, new_url) for k in api_keys]
-    results = await asyncio.gather(*tasks, return_exceptions=False)
-
-    total_del = sum(r["deleted"] for r in results)
-    total_ok  = sum(1 for r in results if r.get("registered"))
-    total_err = sum(1 for r in results if r.get("error"))
-    log.info(
-        "[CC-WH] Sync complete: %d stale webhooks purged, %d new registered, %d errors",
-        total_del, total_ok, total_err,
+    results = await asyncio.gather(
+        *[_sync_one_key(k, new_url) for k in api_keys],
+        return_exceptions=False,
     )
 
-    return results
+    reused    = sum(1 for r in results if r.get("reused"))
+    total_del = sum(r["deleted"] for r in results)
+    total_new = sum(1 for r in results if r.get("registered") and not r.get("reused"))
+    total_err = sum(1 for r in results if r.get("error"))
+
+    if reused:
+        log.info("[CC-WH] %d reused · %d new · %d purged · %d errors",
+                 reused, total_new, total_del, total_err)
+    else:
+        log.info("[CC-WH] %d new · %d purged · %d errors",
+                 total_new, total_del, total_err)
+
+    return list(results)
