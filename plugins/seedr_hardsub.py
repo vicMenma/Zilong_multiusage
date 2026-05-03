@@ -2,7 +2,23 @@
 plugins/seedr_hardsub.py
 Seedr → Auto-Hardsub pipeline.
 
-[original docstring preserved — see repo for full description]
+PATCH v2 — direct import/url to CloudConvert, no local video download
+───────────────────────────────────────────────────────────────────────
+Steps 6+7 previously:
+  6. Download full video from Seedr CDN locally (hundreds of MB, minutes)
+  7. Upload that local file to CloudConvert via import/upload
+
+Steps 6+7 now:
+  6. Submit Seedr CDN URL directly to CloudConvert via import/url
+     (CC fetches at datacenter speed, no local copy needed)
+  7. Fallback: only if CC rejects the URL (403 / network error) do we
+     fall back to the old local-download path
+
+This works because:
+  • Seedr CDN URLs are token+expiry signed, NOT IP-restricted
+  • _collect_files() (seedr.py v6) already renamed the file to a clean
+    name before returning the URL, so CC's ffmpeg parser sees no brackets
+    or spaces in the path
 
 FIX C-05 (audit v3): _WAITING_SUB now has 30-minute TTL eviction.
 MAIN-06 addition: smon| callback handlers for Seedr monitor buttons.
@@ -102,7 +118,6 @@ def _clear_waiting(uid: int) -> None:
     seedr_user = state.get("seedr_user", "")
     seedr_pwd  = state.get("seedr_pwd", "")
     if folder_id and seedr_user:
-        import asyncio
         async def _deferred_del():
             try:
                 from services.seedr import _del_folder
@@ -207,15 +222,20 @@ async def _seedr_hardsub_pipeline(
     client: Client, st, magnet: str, uid: int,
 ) -> None:
     """
-    Full pipeline (linear, no intermediate state):
-      magnet → Seedr CDN URL → 50 MB probe → detect French sub
+    Full pipeline:
+      magnet → Seedr (rename + CDN URL) → 50 MB probe → detect French sub
            → extract sub from probe locally → submit CDN URL + sub to CC
-    CloudConvert pulls the video directly from Seedr's CDN.
-    Only the subtitle file (~20 KB) is uploaded.
+
+    PATCH v2: Step 6 now submits the Seedr CDN URL directly to CC import/url.
+    No local video download. The URL is clean (renamed by seedr.py v6) so
+    CC's ffmpeg arg parser won't choke on brackets or spaces.
+    Falls back to local download only if CC rejects the URL.
     """
     from services.seedr import fetch_urls_via_seedr, _del_folder
     from services import ffmpeg as FF
-    from services.cloudconvert_api import submit_hardsub, parse_api_keys, pick_best_key
+    from services.cloudconvert_api import (
+        submit_hardsub, parse_api_keys, pick_best_key,
+    )
     from services.cc_job_store import cc_job_store, CCJob
     from services.cc_sanitize import build_cc_output_name
 
@@ -252,7 +272,7 @@ async def _seedr_hardsub_pipeline(
     video_files = [f for f in files
                    if os.path.splitext(f.get("name",""))[1].lower() in _VIDEO_EXTS]
     best      = max(video_files or files, key=lambda f: f.get("size", 0))
-    fname     = best["clean_name"]
+    fname     = best.get("clean_name") or best["name"]
     fsize     = best.get("size", 0)
     video_url = best["url"]
     log.info("[SeedrHS] CDN URL: %s (%s)", fname, human_size(fsize))
@@ -268,7 +288,7 @@ async def _seedr_hardsub_pipeline(
         parse_mode=enums.ParseMode.HTML,
     )
 
-    probe_path: object = video_url   # fallback to CDN URL if download fails
+    probe_path: object = video_url   # fallback: probe URL directly
     try:
         import aiohttp as _aiohttp
         _probe_fpath = os.path.join(tmp, fname)
@@ -339,7 +359,7 @@ async def _seedr_hardsub_pipeline(
             )
         _evict_waiting_subs()
         _WAITING_SUB[uid] = {
-            "video_url": video_url,
+            "video_url":  video_url,
             "video_path": probe_path if os.path.isfile(str(probe_path)) else None,
             "fname": fname, "fsize": fsize, "tmp": tmp,
             "folder_id": folder_id, "seedr_user": seedr_user,
@@ -370,7 +390,6 @@ async def _seedr_hardsub_pipeline(
         parse_mode=enums.ParseMode.HTML,
     )
 
-    # Extract from local probe — never from CDN URL (that streams the whole file)
     extract_src = str(probe_path) if os.path.isfile(str(probe_path)) else video_url
     try:
         await asyncio.wait_for(
@@ -398,48 +417,161 @@ async def _seedr_hardsub_pipeline(
     log.info("[SeedrHS] Sub extracted: %s (%s)", sub_fname,
              human_size(os.path.getsize(sub_path)))
 
-    # ── Step 6: Download video from Seedr CDN, then upload to CloudConvert ──────
-    #
-    # WHY NOT import/url:
-    #   Seedr CDN URLs are signed tokens tied to the requesting IP (Colab).
-    #   CloudConvert's servers come from a different IP → 403 Forbidden.
-    #   The only reliable approach is to download from Seedr ourselves
-    #   and upload directly to CloudConvert (import/upload).
-    #
+    # ── Steps 6+7: Submit to CloudConvert ─────────────────────────────────────
+    # PATCH v2: try import/url (no local video download) first.
+    # The CDN URL is clean (renamed by seedr.py v6) — no brackets/spaces.
+    # CC fetches the video at datacenter speed.  Only the subtitle (~20 KB)
+    # needs uploading.  Falls back to local download only on CC fetch error.
+    await _submit_to_cc_url_with_fallback(
+        client, st,
+        video_url, fname, fsize,
+        sub_path, sub_fname, detail,
+        tmp, uid, folder_id, seedr_user, seedr_pwd,
+    )
+
+
+async def _submit_to_cc_url_with_fallback(
+    client:     Client,
+    st,
+    video_url:  str,
+    video_fname: str,
+    fsize:      int,
+    sub_path:   str,
+    sub_fname:  str,
+    sub_detail: str,
+    tmp:        str,
+    uid:        int,
+    folder_id:  int,
+    seedr_user: str,
+    seedr_pwd:  str,
+) -> None:
+    """
+    Submit Seedr CDN URL + subtitle to CloudConvert via import/url.
+
+    Only the subtitle file is uploaded (typically ~20 KB).
+    CC fetches the video directly from Seedr — no local download needed.
+
+    Falls back to local download + import/upload if CC returns an error
+    fetching the video URL (network issue, token expired, etc.).
+    """
+    from services.cloudconvert_api import (
+        submit_hardsub, parse_api_keys, pick_best_key,
+    )
+    from services.cc_job_store import cc_job_store, CCJob
+    from services.cc_sanitize import build_cc_output_name
+    from services.task_runner import tracker, TaskRecord
+    import time as _t
+
     api_key     = os.environ.get("CC_API_KEY", "").strip()
-    output_name = build_cc_output_name(fname, "VOSTFR")
-    video_path  = os.path.join(tmp, fname)
+    output_name = build_cc_output_name(video_fname, "VOSTFR")
 
     await safe_edit(
         st,
         f"🔥 <b>Seedr → Hardsub</b>\n"
         "──────────────────────\n\n"
-        f"📁 <code>{fname[:40]}</code>  <i>{human_size(fsize)}</i>\n"
-        f"💬 <code>{detail[:38]}</code>\n"
+        f"📁 <code>{video_fname[:38]}</code>  <i>{human_size(fsize)}</i>\n"
+        f"💬 <code>{sub_detail[:38]}</code>\n"
         f"📦 → <code>{output_name[:38]}</code>\n\n"
-        "⬇️ <i>Downloading video from Seedr…\n"
-        "(Seedr CDN is IP-restricted — must download first)</i>",
+        "☁️ <i>Submitting Seedr URL to CloudConvert…\n"
+        "Only the subtitle is uploaded (~20 KB)</i>",
         parse_mode=enums.ParseMode.HTML,
     )
 
-    # Download full video (reuse probe file if already complete, else fresh dl)
-    need_download = True
-    if os.path.isfile(video_path):
-        existing = os.path.getsize(video_path)
-        if fsize > 0 and existing >= fsize * 0.99:
-            log.info("[SeedrHS] Probe file is complete (%s) — skipping re-download",
-                     human_size(existing))
-            need_download = False
-        else:
-            log.info("[SeedrHS] Probe file partial (%s / %s) — re-downloading",
-                     human_size(existing), human_size(fsize))
+    ul_tid = None
+    job_id = None
 
-    if need_download:
+    try:
+        keys            = parse_api_keys(api_key)
+        selected, creds = await pick_best_key(keys)
+        key_info        = f"🔑 Key {keys.index(selected)+1}/{len(keys)} ({creds} credits)"
+
+        # Track subtitle upload only
+        ul_tid   = tracker.new_tid()
+        sub_size = os.path.getsize(sub_path)
+        _ul_start = _t.time()
+        await tracker.register(TaskRecord(
+            tid=ul_tid, user_id=uid,
+            label=f"CC↑ sub {sub_fname}",
+            fname=sub_fname, mode="ul", engine="http",
+            state="☁️ Uploading subtitle to CC",
+            total=sub_size,
+        ))
+
+        async def _ul_progress(phase: str, done: int, total: int) -> None:
+            elapsed = _t.time() - _ul_start
+            speed   = done / elapsed if elapsed else 0.0
+            await tracker.update(
+                ul_tid,
+                state=f"☁️ Sub {human_size(done)}/{human_size(sub_size)}",
+                done=done, total=sub_size,
+                speed=speed,
+                eta=int((sub_size - done) / speed) if speed and done < sub_size else 0,
+                elapsed=elapsed,
+            )
+
+        job_id = await submit_hardsub(
+            selected,
+            video_url=video_url,        # ← Seedr CDN URL, CC fetches directly
+            subtitle_path=sub_path,     # ← subtitle uploaded (~20 KB)
+            output_name=output_name,
+            upload_progress_cb=_ul_progress,
+        )
+        await tracker.finish(ul_tid, success=True)
+        ul_tid = None
+
+        await cc_job_store.add(CCJob(
+            job_id=job_id, uid=uid,
+            fname=video_fname, sub_fname=sub_fname, output_name=output_name,
+            status="processing",
+            seedr_folder_id=folder_id,
+            seedr_user=seedr_user, seedr_pwd=seedr_pwd,
+        ))
         try:
-            import aiohttp as _aiohttp
+            from plugins.ccstatus import _ensure_poller
+            _ensure_poller()
+        except Exception:
+            pass
+
+        log.info("[SeedrHS] CC job submitted via import/url: %s → %s", job_id, output_name)
+        await safe_edit(
+            st,
+            f"✅ <b>Submitted to CloudConvert!</b>\n"
+            "──────────────────────\n\n"
+            f"🆔 <code>{job_id}</code>\n"
+            f"📁 <code>{video_fname[:36]}</code>\n"
+            f"💬 <code>{sub_detail[:36]}</code>\n"
+            f"📦 → <code>{output_name[:36]}</code>\n"
+            f"{key_info}\n\n"
+            "⏳ <i>Processing (~3-5 min)…\n"
+            "Hardsubbed MP4 will be sent here when ready.</i>\n\n"
+            "📋 /ccstatus to check progress.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    except Exception as exc:
+        if ul_tid is not None:
+            try:
+                await tracker.finish(ul_tid, success=False, msg=str(exc)[:60])
+            except Exception:
+                pass
+
+        log.warning("[SeedrHS] import/url failed (%s) — falling back to local download", exc)
+
+        # ── Fallback: download video locally then upload to CC ────────────────
+        await safe_edit(
+            st,
+            f"⚠️ <b>Direct URL failed — downloading locally…</b>\n"
+            "──────────────────────\n\n"
+            f"📁 <code>{video_fname[:40]}</code>  <i>{human_size(fsize)}</i>\n\n"
+            f"<i>Error: {str(exc)[:120]}</i>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+        video_path = os.path.join(tmp, video_fname)
+        try:
             _dl_start = time.time()
-            _timeout  = _aiohttp.ClientTimeout(total=3600)
-            async with _aiohttp.ClientSession(timeout=_timeout) as _sess:
+            _timeout  = aiohttp.ClientTimeout(total=3600)
+            async with aiohttp.ClientSession(timeout=_timeout) as _sess:
                 async with _sess.get(
                     video_url,
                     headers={"User-Agent": "Mozilla/5.0"},
@@ -465,120 +597,41 @@ async def _seedr_hardsub_pipeline(
                                     st,
                                     f"🔥 <b>Seedr → Hardsub</b>\n"
                                     "──────────────────────\n\n"
-                                    f"📁 <code>{fname[:40]}</code>\n\n"
+                                    f"📁 <code>{video_fname[:40]}</code>\n\n"
                                     f"⬇️ <b>{human_size(_done)}</b> / {human_size(_total)}"
                                     f"  <i>({_pct:.0f}%)</i>\n"
                                     f"🚀 {human_size(int(_speed))}/s  "
                                     f"⏱ ETA {human_dur(_eta)}",
                                     parse_mode=enums.ParseMode.HTML,
                                 )
-            log.info("[SeedrHS] Downloaded %s in %.0fs",
-                     human_size(_done), time.time() - _dl_start)
-        except Exception as exc:
+        except Exception as dl_exc:
             cleanup(tmp)
             await _del_folder(seedr_user, seedr_pwd, folder_id)
-            log.error("[SeedrHS] Video download failed: %s", exc)
+            log.error("[SeedrHS] Fallback download also failed: %s", dl_exc)
             return await safe_edit(
                 st,
-                f"❌ <b>Video download failed</b>\n\n<code>{str(exc)[:200]}</code>",
+                f"❌ <b>Both direct URL and local download failed</b>\n\n"
+                f"URL error: <code>{str(exc)[:150]}</code>\n"
+                f"Download error: <code>{str(dl_exc)[:150]}</code>",
                 parse_mode=enums.ParseMode.HTML,
             )
 
-    # ── Step 7: Upload video + subtitle to CloudConvert ───────────────────────
-    await safe_edit(
-        st,
-        f"🔥 <b>Seedr → Hardsub</b>\n"
-        "──────────────────────\n\n"
-        f"📁 <code>{fname[:38]}</code>\n"
-        f"💬 <code>{detail[:38]}</code>\n"
-        f"📦 → <code>{output_name[:38]}</code>\n\n"
-        "☁️ <i>Uploading to CloudConvert…</i>",
-        parse_mode=enums.ParseMode.HTML,
-    )
-
-    try:
-        from services.task_runner import tracker, TaskRecord
-        keys            = parse_api_keys(api_key)
-        selected, creds = await pick_best_key(keys)
-        key_info        = f"🔑 Key {keys.index(selected)+1}/{len(keys)} ({creds} credits)"
-
-        ul_tid  = tracker.new_tid()
-        ul_total = os.path.getsize(video_path) + os.path.getsize(sub_path)
-        ul_start = time.time()
-        await tracker.register(TaskRecord(
-            tid=ul_tid, user_id=uid,
-            label=f"CC↑ {fname}",
-            fname=fname, mode="ul", engine="http",
-            state="☁️ Uploading to CC",
-            total=ul_total,
-        ))
-
-        async def _ul_progress(phase: str, done: int, total: int) -> None:
-            _elapsed = time.time() - ul_start
-            _speed   = done / _elapsed if _elapsed else 0
-            await tracker.update(
-                ul_tid,
-                state=f"☁️ {'Video' if phase == 'video' else 'Sub'} {human_size(done)}/{human_size(total)}",
-                done=done, total=total,
-                speed=_speed, eta=int((total - done) / _speed) if _speed and done < total else 0,
-                elapsed=_elapsed,
-            )
-
-        job_id = await submit_hardsub(
-            selected,
-            video_path=video_path,
-            subtitle_path=sub_path,
-            output_name=output_name,
-            upload_progress_cb=_ul_progress,
-        )
-        await tracker.finish(ul_tid, success=True)
-
-        from services.cc_job_store import cc_job_store, CCJob
-        await cc_job_store.add(CCJob(
-            job_id=job_id, uid=uid,
-            fname=fname, sub_fname=sub_fname, output_name=output_name,
-            status="processing",
-            seedr_folder_id=folder_id,
+        # Upload locally-downloaded video to CC
+        await _submit_to_cc(
+            client, st,
+            video_path, video_fname,
+            sub_path, sub_fname, sub_detail,
+            tmp, uid,
+            folder_id=folder_id,
             seedr_user=seedr_user, seedr_pwd=seedr_pwd,
-        ))
-        try:
-            from plugins.ccstatus import _ensure_poller
-            _ensure_poller()
-        except Exception:
-            pass
+        )
+        return
 
-        log.info("[SeedrHS] CC job submitted: %s → %s", job_id, output_name)
-        await safe_edit(
-            st,
-            f"✅ <b>Submitted to CloudConvert!</b>\n"
-            "──────────────────────\n\n"
-            f"🆔 <code>{job_id}</code>\n"
-            f"📁 <code>{fname[:36]}</code>\n"
-            f"💬 <code>{detail[:36]}</code>\n"
-            f"📦 → <code>{output_name[:36]}</code>\n"
-            f"{key_info}\n\n"
-            "⏳ <i>Processing (~3-5 min)…\n"
-            "Hardsubbed MP4 will be sent here when ready.</i>\n\n"
-            "📋 /ccstatus to check progress.",
-            parse_mode=enums.ParseMode.HTML,
-        )
-    except Exception as exc:
-        log.error("[SeedrHS] CC submit failed: %s", exc, exc_info=True)
-        try:
-            await tracker.finish(ul_tid, success=False, msg=str(exc)[:60])
-        except Exception:
-            pass
-        await safe_edit(
-            st,
-            f"❌ <b>CloudConvert submission failed</b>\n\n<code>{str(exc)[:250]}</code>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-    finally:
-        cleanup(tmp)
+    cleanup(tmp)
 
 
 # ─────────────────────────────────────────────────────────────
-# Submit CDN URL + subtitle to CloudConvert
+# Submit CDN URL + subtitle to CloudConvert (legacy local-file path)
 # ─────────────────────────────────────────────────────────────
 
 async def _submit_to_cc_url(
@@ -594,128 +647,14 @@ async def _submit_to_cc_url(
     seedr_user: str,
     seedr_pwd: str,
 ) -> None:
-    from services.cloudconvert_api import submit_hardsub, parse_api_keys, pick_best_key
-    from services.cc_job_store import cc_job_store, CCJob
-    from services.cc_sanitize import build_cc_output_name
-    from services.task_runner import tracker, TaskRecord
-    from services.utils import human_size
-    import time as _time
-
-    api_key     = os.environ.get("CC_API_KEY", "").strip()
-    output_name = build_cc_output_name(video_fname, "VOSTFR")
-
-    await safe_edit(
-        st,
-        f"🔥 <b>Seedr → Hardsub</b>\n"
-        "──────────────────────\n\n"
-        f"📁 <code>{video_fname[:38]}</code>\n"
-        f"💬 <code>{sub_detail[:38]}</code>\n"
-        f"📦 → <code>{output_name[:38]}</code>\n\n"
-        "☁️ <i>Submitting to CloudConvert…\n"
-        "Video URL sent directly — only subtitle uploaded!</i>",
-        parse_mode=enums.ParseMode.HTML,
+    """Kept for backward compat — now delegates to _submit_to_cc_url_with_fallback."""
+    await _submit_to_cc_url_with_fallback(
+        client, st,
+        video_url, video_fname, 0,
+        sub_path, sub_fname, sub_detail,
+        tmp, uid, folder_id, seedr_user, seedr_pwd,
     )
 
-    ul_tid = None
-    try:
-        ul_tid = tracker.new_tid()
-        ul_rec = TaskRecord(
-            tid=ul_tid, user_id=uid,
-            label=f"CC↑ {video_fname} (sub only)",
-            fname=video_fname,
-            mode="ul", engine="http",
-            state="☁️ Uploading subtitle to CC",
-            total=os.path.getsize(sub_path),
-        )
-        await tracker.register(ul_rec)
-
-        sub_size  = os.path.getsize(sub_path)
-        _ul_start = _time.time()
-
-        async def _upload_progress(phase: str, done: int, total: int) -> None:
-            elapsed = _time.time() - _ul_start
-            speed   = done / elapsed if elapsed else 0.0
-            eta     = int((sub_size - done) / speed) if (speed and sub_size > done) else 0
-            await tracker.update(
-                ul_tid,
-                state=f"☁️ Sub {human_size(done)}/{human_size(sub_size)}",
-                done=done, total=sub_size,
-                speed=speed, eta=eta, elapsed=elapsed,
-            )
-
-        keys = parse_api_keys(api_key)
-        selected, credits = await pick_best_key(keys)
-        key_info = f"🔑 Key {keys.index(selected)+1}/{len(keys)} ({credits} credits)"
-
-        job_id = await submit_hardsub(
-            selected,
-            video_url=video_url,
-            subtitle_path=sub_path,
-            output_name=output_name,
-            upload_progress_cb=_upload_progress,
-        )
-
-        await tracker.finish(ul_tid, success=True)
-
-        await cc_job_store.add(CCJob(
-            job_id=job_id,
-            uid=uid,
-            fname=video_fname,
-            sub_fname=sub_fname,
-            output_name=output_name,
-            status="processing",
-            seedr_folder_id=folder_id,
-            seedr_user=seedr_user,
-            seedr_pwd=seedr_pwd,
-        ))
-
-        try:
-            from plugins.ccstatus import _ensure_poller
-            _ensure_poller()
-        except Exception:
-            pass
-
-        log.info(
-            "[SeedrHS] CC job submitted via URL: %s  video=%s  sub=%s  out=%s",
-            job_id, video_fname, sub_fname, output_name,
-        )
-
-        await safe_edit(
-            st,
-            f"✅ <b>Seedr → Hardsub — Submitted!</b>\n"
-            "──────────────────────\n\n"
-            f"🆔 <code>{job_id}</code>\n"
-            f"📁 <code>{video_fname[:36]}</code>\n"
-            f"💬 <code>{sub_detail[:36]}</code>\n"
-            f"📦 → <code>{output_name[:36]}</code>\n"
-            f"{key_info}\n\n"
-            "⏳ <i>CloudConvert is processing…\n"
-            "The hardsubbed MP4 will auto-upload\n"
-            "to this chat when ready (~3-5 min).</i>\n\n"
-            "📋 Use /ccstatus to track progress.",
-            parse_mode=enums.ParseMode.HTML,
-        )
-
-    except Exception as exc:
-        if ul_tid is not None:
-            try:
-                await tracker.finish(ul_tid, success=False, msg=str(exc)[:60])
-            except Exception:
-                pass
-        log.error("[SeedrHS] CC submit failed: %s", exc, exc_info=True)
-        await safe_edit(
-            st,
-            f"❌ <b>CloudConvert submission failed</b>\n\n"
-            f"<code>{str(exc)[:250]}</code>",
-            parse_mode=enums.ParseMode.HTML,
-        )
-    finally:
-        cleanup(tmp)
-
-
-# ─────────────────────────────────────────────────────────────
-# Legacy: local-file upload to CloudConvert (kept for compatibility)
-# ─────────────────────────────────────────────────────────────
 
 async def _submit_to_cc(
     client: Client, st,
@@ -723,13 +662,16 @@ async def _submit_to_cc(
     sub_path: str, sub_fname: str,
     sub_detail: str,
     tmp: str, uid: int,
+    folder_id: int = 0,
+    seedr_user: str = "",
+    seedr_pwd:  str = "",
 ) -> None:
+    """Local-file upload to CloudConvert (fallback path)."""
     from services.cloudconvert_api import submit_hardsub, parse_api_keys, pick_best_key
     from services.cc_job_store import cc_job_store, CCJob
     from services.cc_sanitize import build_cc_output_name
     from services.task_runner import tracker, TaskRecord
-    from services.utils import human_size
-    import time as _time
+    import time as _t
 
     api_key     = os.environ.get("CC_API_KEY", "").strip()
     output_name = build_cc_output_name(video_fname, "VOSTFR")
@@ -761,7 +703,7 @@ async def _submit_to_cc(
 
         sub_size   = os.path.getsize(sub_path)
         vid_size   = os.path.getsize(video_path)
-        _ul_start  = _time.time()
+        _ul_start  = _t.time()
 
         async def _upload_progress(phase: str, done: int, total: int) -> None:
             if phase == "sub":
@@ -772,7 +714,7 @@ async def _submit_to_cc(
                 pct_label = f"🎬 Video {human_size(done)}/{human_size(vid_size)}"
                 ul_done = sub_size + done
                 ul_total = sub_size + vid_size
-            elapsed = _time.time() - _ul_start
+            elapsed = _t.time() - _ul_start
             speed   = ul_done / elapsed if elapsed else 0.0
             eta     = int((ul_total - ul_done) / speed) if (speed and ul_total > ul_done) else 0
             await tracker.update(
@@ -799,6 +741,7 @@ async def _submit_to_cc(
         )
 
         await tracker.finish(ul_tid, success=True)
+        ul_tid = None
 
         await cc_job_store.add(CCJob(
             job_id=job_id,
@@ -807,6 +750,9 @@ async def _submit_to_cc(
             sub_fname=sub_fname,
             output_name=output_name,
             status="processing",
+            seedr_folder_id=folder_id,
+            seedr_user=seedr_user,
+            seedr_pwd=seedr_pwd,
         ))
 
         try:
@@ -815,10 +761,8 @@ async def _submit_to_cc(
         except Exception:
             pass
 
-        log.info(
-            "[SeedrHS] CC job submitted: %s  video=%s  sub=%s  out=%s",
-            job_id, video_fname, sub_fname, output_name,
-        )
+        log.info("[SeedrHS] CC job submitted (local): %s  video=%s  sub=%s  out=%s",
+                 job_id, video_fname, sub_fname, output_name)
 
         await safe_edit(
             st,
@@ -829,9 +773,9 @@ async def _submit_to_cc(
             f"💬 <code>{sub_detail[:36]}</code>\n"
             f"📦 → <code>{output_name[:36]}</code>\n"
             f"{key_info}\n\n"
-            "⏳ <i>CloudConvert is processing…\n"
+            "⏳ <i>Processing (~3-5 min)…\n"
             "The hardsubbed MP4 will auto-upload\n"
-            "to this chat when ready (~3-5 min).</i>\n\n"
+            "to this chat when ready.</i>\n\n"
             "📋 Use /ccstatus to track progress.",
             parse_mode=enums.ParseMode.HTML,
         )
@@ -878,9 +822,9 @@ async def shs_manual_sub_file(client: Client, msg: Message):
         return
 
     tmp         = state["tmp"]
-    video_path  = state.get("video_path")
     video_url   = state.get("video_url")
     video_fname = state["fname"]
+    fsize       = state.get("fsize", 0)
     folder_id   = state.get("folder_id")
     seedr_user  = state.get("seedr_user")
     seedr_pwd   = state.get("seedr_pwd")
@@ -904,12 +848,13 @@ async def shs_manual_sub_file(client: Client, msg: Message):
     log.info("[SeedrHS] Manual sub received: %s", sub_fname)
 
     if video_url and folder_id and seedr_user and seedr_pwd:
-        await _submit_to_cc_url(
-            client, st, video_url, video_fname,
+        await _submit_to_cc_url_with_fallback(
+            client, st, video_url, video_fname, fsize,
             sub_path, sub_fname, sub_fname,
             tmp, uid, folder_id, seedr_user, seedr_pwd,
         )
     else:
+        video_path = state.get("video_path")
         await _submit_to_cc(
             client, st,
             video_path, video_fname,
@@ -942,9 +887,9 @@ async def shs_manual_sub_url(client: Client, msg: Message):
         return
 
     tmp         = state["tmp"]
-    video_path  = state.get("video_path")
     video_url   = state.get("video_url")
     video_fname = state["fname"]
+    fsize       = state.get("fsize", 0)
     folder_id   = state.get("folder_id")
     seedr_user  = state.get("seedr_user")
     seedr_pwd   = state.get("seedr_pwd")
@@ -1001,12 +946,13 @@ async def shs_manual_sub_url(client: Client, msg: Message):
     log.info("[SeedrHS] Manual sub from URL: %s", sub_fname)
 
     if video_url and folder_id and seedr_user and seedr_pwd:
-        await _submit_to_cc_url(
-            client, st, video_url, video_fname,
+        await _submit_to_cc_url_with_fallback(
+            client, st, video_url, video_fname, fsize,
             sub_path, sub_fname, sub_fname,
             tmp, uid, folder_id, seedr_user, seedr_pwd,
         )
     else:
+        video_path = state.get("video_path")
         await _submit_to_cc(
             client, st,
             video_path, video_fname,
@@ -1031,18 +977,11 @@ async def shs_cancel(client: Client, msg: Message):
 
 
 # ─────────────────────────────────────────────────────────────
-# Seedr Monitor button callbacks  (smon|sub|  smon|upload|  smon|skip|)
-# Handles the three inline buttons shown by services/seedr_monitor.py
-# when a new Seedr folder has no French subtitle.
+# Seedr Monitor button callbacks
 # ─────────────────────────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^smon\|"))
 async def seedr_monitor_cb(client: Client, cb: CallbackQuery) -> None:
-    """
-    smon|sub|<folder_id>    — keep _WAITING_SUB active, remind user to send a sub
-    smon|upload|<folder_id> — download the full video from Seedr CDN, upload to DM
-    smon|skip|<folder_id>   — discard pending state and do nothing
-    """
     parts = cb.data.split("|")
     if len(parts) < 3:
         return await cb.answer("Invalid data.", show_alert=True)
@@ -1056,7 +995,6 @@ async def seedr_monitor_cb(client: Client, cb: CallbackQuery) -> None:
     uid = cb.from_user.id
     await cb.answer()
 
-    # ── "I'll send a subtitle" — _WAITING_SUB already populated ─────────────
     if action == "sub":
         try:
             await cb.message.edit(
@@ -1070,7 +1008,6 @@ async def seedr_monitor_cb(client: Client, cb: CallbackQuery) -> None:
             pass
         return
 
-    # ── "Upload as-is" — download full file, upload to DM, no hardsub ───────
     if action == "upload":
         _WAITING_SUB.pop(uid, None)
         try:
@@ -1084,7 +1021,6 @@ async def seedr_monitor_cb(client: Client, cb: CallbackQuery) -> None:
         asyncio.create_task(_do_upload_as_is(client, cb.message, folder_id, uid))
         return
 
-    # ── "Skip" — clean up and move on ────────────────────────────────────────
     if action == "skip":
         _WAITING_SUB.pop(uid, None)
         try:
@@ -1092,7 +1028,6 @@ async def seedr_monitor_cb(client: Client, cb: CallbackQuery) -> None:
             info = _pending_upload.pop(folder_id, None)
             if info and info.get("tmp"):
                 cleanup(info["tmp"])
-            # Best-effort Seedr folder cleanup
             s_user = (info or {}).get("seedr_user", "")
             s_pwd  = (info or {}).get("seedr_pwd",  "")
             if s_user and folder_id:
@@ -1112,7 +1047,6 @@ async def seedr_monitor_cb(client: Client, cb: CallbackQuery) -> None:
 async def _do_upload_as_is(
     client: Client, status_msg, folder_id: int, uid: int,
 ) -> None:
-    """Download the full Seedr CDN file and upload it to the user's DM."""
     try:
         from services.seedr_monitor import handle_upload_as_is
         await handle_upload_as_is(folder_id, uid, client)
@@ -1134,3 +1068,69 @@ async def _deferred_seedr_del(user: str, pwd: str, folder_id: int) -> None:
         log.info("[SeedrMon-CB] Seedr folder %d cleaned on skip", folder_id)
     except Exception as exc:
         log.warning("[SeedrMon-CB] Seedr cleanup (non-fatal): %s", exc)
+
+
+# ─────────────────────────────────────────────────────────────
+# Public auto-hardsub entry point (called by seedr_monitor.py)
+# ─────────────────────────────────────────────────────────────
+
+async def _auto_hardsub_url(
+    client:      Client,
+    st,
+    probe_path:  str,
+    video_url:   str,
+    fname:       str,
+    fsize:       int,
+    sub_stream:  dict,
+    tmp:         str,
+    uid:         int,
+    folder_id:   int,
+    seedr_user:  str,
+    seedr_pwd:   str,
+) -> None:
+    """
+    Called by seedr_monitor when a new folder has a French text subtitle.
+    Extracts the sub from probe_path, then submits video_url + sub to CC.
+    """
+    from services import ffmpeg as FF
+
+    idx   = sub_stream.get("index", 0)
+    codec = (sub_stream.get("codec_name") or "ass").lower()
+    ext   = FF.subtitle_ext(codec)
+    tags  = sub_stream.get("tags", {}) or {}
+
+    sub_path  = os.path.join(tmp, f"french_sub{ext}")
+    sub_fname = os.path.basename(sub_path)
+
+    detail_s = f"#{idx} {codec.upper()}"
+    if tags.get("title"):
+        detail_s += f" — {tags['title']}"
+
+    await safe_edit(
+        st,
+        f"🔥 <b>Seedr → Hardsub</b>\n"
+        "──────────────────────\n\n"
+        f"📁 <code>{fname[:40]}</code>\n"
+        f"✅ French sub: <code>{detail_s}</code>\n\n"
+        "📤 <i>Extracting subtitle…</i>",
+        parse_mode=enums.ParseMode.HTML,
+    )
+
+    try:
+        await FF.stream_op(probe_path, sub_path, ["-map", f"0:{idx}", "-c", "copy"])
+    except Exception as exc:
+        cleanup(tmp)
+        from services.seedr import _del_folder
+        await _del_folder(seedr_user, seedr_pwd, folder_id)
+        return await safe_edit(
+            st,
+            f"❌ <b>Subtitle extraction failed</b>\n\n<code>{exc}</code>",
+            parse_mode=enums.ParseMode.HTML,
+        )
+
+    await _submit_to_cc_url_with_fallback(
+        client, st,
+        video_url, fname, fsize,
+        sub_path, sub_fname, detail_s,
+        tmp, uid, folder_id, seedr_user, seedr_pwd,
+    )
