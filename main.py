@@ -11,6 +11,7 @@ MAIN-03: on_tunnel_ready called with explicit cc_path="/webhook/cloudconvert"
   so CC webhooks always register to the correct URL.
 MAIN-04: FC import errors logged at WARNING instead of silently swallowed.
 MAIN-05: Webhook server started when FC_API_KEY is set, not just CC_API_KEY.
+MAIN-06: Seedr monitor started when both SEEDR_USERNAME and CC_API_KEY are set.
 """
 import asyncio
 import logging
@@ -206,8 +207,6 @@ async def main() -> None:
             log.info("☁️  Webhook server on port 8765 (no public URL)")
 
         # MAIN-03: explicit cc_path to avoid any default value confusion.
-        # on_tunnel_ready() handles BOTH CC and FC webhook sync — call it
-        # whenever a tunnel URL is available, regardless of which API keys are set.
         try:
             from services.webhook_sync import on_tunnel_ready, poll_pending_jobs
             from core.config import get_tunnel_url
@@ -229,7 +228,6 @@ async def main() -> None:
         try:
             import plugins.fc_webhook as fc_webhook
             await fc_webhook.startup_load()
-            # Also pre-load the fc_seedr plugin to ensure its handlers register
             try:
                 import plugins.fc_seedr  # noqa: F401
                 log.info("🆓 FreeConvert Seedr pipeline loaded")
@@ -237,7 +235,6 @@ async def main() -> None:
                 log.warning("fc_seedr import: %s", exc)
             log.info("🆓 FreeConvert job store loaded")
         except ImportError as exc:
-            # MAIN-04: log at warning so user can see what's missing
             log.warning(
                 "⚠️  plugins/fc_webhook.py missing — FreeConvert disabled.\n"
                 "    Ensure fc_webhook.py and fc_job_store.py are in your repo.\n"
@@ -256,6 +253,21 @@ async def main() -> None:
             log.info("📡 ccstatus auto-poller started")
         except Exception as exc:
             log.warning("ccstatus poller failed: %s", exc)
+
+    # ── MAIN-06: Seedr monitor — auto-hardsub for new Seedr folders ───────────
+    _seedr_user = os.environ.get("SEEDR_USERNAME", "").strip()
+    if _seedr_user and cc_api_key:
+        try:
+            from services.seedr_monitor import start_monitor as _sm_start
+            _sm_start(cfg.owner_id)
+            log.info("🌱 Seedr monitor started (polling every 60 s for new folders)")
+        except Exception as exc:
+            log.warning("Seedr monitor failed to start: %s", exc)
+    else:
+        if not _seedr_user:
+            log.info("ℹ️  Seedr monitor disabled (SEEDR_USERNAME not set)")
+        else:
+            log.info("ℹ️  Seedr monitor disabled (CC_API_KEY not set)")
 
     if not is_name_configured():
         await _ask_bot_name(client)
@@ -303,6 +315,12 @@ async def main() -> None:
             await stop_webhook_server()
         except Exception:
             pass
+    # ── Stop Seedr monitor ────────────────────────────────────────────────────
+    try:
+        from services.seedr_monitor import stop_monitor as _sm_stop
+        _sm_stop()
+    except Exception:
+        pass
     runner.stop()
     await client.stop()
     log.info("✅ Shutdown complete.")
