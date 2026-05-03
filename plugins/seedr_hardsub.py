@@ -402,6 +402,30 @@ async def _seedr_hardsub_pipeline(
     api_key     = os.environ.get("CC_API_KEY", "").strip()
     output_name = build_cc_output_name(fname, "VOSTFR")
 
+    # Seedr CDN URLs often embed the original filename in the path, which can
+    # contain spaces, brackets and other characters that CloudConvert rejects
+    # as "url format is invalid".  Percent-encode only the unsafe characters
+    # without touching the scheme, host, query string, or already-encoded parts.
+    import re as _re
+    from urllib.parse import urlparse as _urlparse, urlunparse as _urlunparse, quote as _quote
+    def _safe_url(u: str) -> str:
+        try:
+            p = _urlparse(u)
+            # Encode path: allow normal URL path chars, encode everything else
+            safe_path  = _quote(p.path,  safe="/:@!$&'()*+,;=~.-_")
+            # Encode query: allow key=value&... chars
+            safe_query = _quote(p.query, safe="=&+%~.-_:@!$'()*,;/?")
+            return _urlunparse(p._replace(path=safe_path, query=safe_query))
+        except Exception:
+            # Fallback: just encode the most problematic chars inline
+            return _re.sub(r'[ \[\]{}|\\^`<>"]',
+                           lambda m: f"%{ord(m.group()):02X}", u)
+
+    safe_video_url = _safe_url(video_url)
+    if safe_video_url != video_url:
+        log.info("[SeedrHS] URL encoded for CC: %s → %s",
+                 video_url[:80], safe_video_url[:80])
+
     await safe_edit(
         st,
         f"🔥 <b>Seedr → Hardsub</b>\n"
@@ -421,7 +445,7 @@ async def _seedr_hardsub_pipeline(
 
         job_id = await submit_hardsub(
             selected,
-            video_url=video_url,
+            video_url=safe_video_url,
             subtitle_path=sub_path,
             output_name=output_name,
         )
