@@ -17,10 +17,9 @@ FIX CC-SIZE-01: audio bitrate is now ALWAYS 128k (was 192k for non-480p).
 FIX CC-SIZE-02: default CRF raised from 20 → 23.
 NEW CC-COMPRESS: create_compress_job() + submit_compress() + run_cc_job()
 NEW CC-RUN: run_cc_job() polls an existing CC job until completion.
-PATCH FAST-PRESET: default preset changed from "medium" → "fast" for hardsub
-  jobs. "fast" encodes 2-3x quicker than "medium" with negligible quality
-  difference, reducing a typical 7-minute hardsub to under 3 minutes on
-  CloudConvert's shared infrastructure.
+PATCH TIMEOUT-FIX: default preset changed from "fast" → "veryfast" and
+  -threads 0 added to hardsub ffmpeg_args. veryfast encodes 2-4x quicker
+  than fast, preventing CC PROCESSING_TIMEOUT on long anime episodes.
 """
 from __future__ import annotations
 
@@ -43,26 +42,6 @@ _CC_TIMEOUT_UPLOAD = aiohttp.ClientTimeout(total=7200)
 
 
 def _arg_safe(name: str) -> str:
-    """
-    Strip spaces from a sanitized filename before embedding it inside an
-    ffmpeg arguments string.
-
-    sanitize_for_cc() (→ sanitize_filename) deliberately preserves spaces
-    for human-readable output names such as "Wistoria S0204.mp4". That is
-    fine for the import/export task `filename` fields, which CC handles as
-    opaque strings. But the `arguments` value is whitespace-tokenised by
-    CloudConvert before passing to ffmpeg, so a path like
-
-        /output/Wistoria S0204.mp4
-
-    is split into two tokens and ffmpeg rejects it. ffmpeg then exits with
-    an error but CC's command task still marks itself "finished" (rc=0 from
-    its shell wrapper), leaving the export task with no input file.
-
-    This function replaces every space with an underscore so argument paths
-    are single tokens, while keeping the result otherwise identical to
-    sanitize_for_cc().
-    """
     return sanitize_for_cc(name).replace(" ", "_")
 
 
@@ -208,14 +187,10 @@ async def create_hardsub_job(
     subtitle_filename: str = "subtitle.ass",
     output_filename: str = "output.mp4",
     crf: int = 23,
-    preset: str = "fast",    # PATCHED: was "medium" — "fast" is 2-3x quicker
+    preset: str = "veryfast",  # PATCHED: veryfast avoids CC PROCESSING_TIMEOUT
     scale_height: int = 0,
     embedded_sub_si: Optional[int] = None,
 ) -> dict:
-    """
-    embedded_sub_si — when set, burn the subtitle that is ALREADY EMBEDDED
-    in the video at subtitle-stream index `si` (0 = first subtitle track).
-    """
     v_safe = _arg_safe(video_filename)
     o_safe = _arg_safe(output_filename)
 
@@ -257,6 +232,7 @@ async def create_hardsub_job(
         f"-i /input/import-video/{v_safe} "
         f"-vf {vf} "
         f"-c:v libx264 -crf {crf} -preset {preset} "
+        f"-threads 0 "
         f"-c:a aac -b:a 128k "
         f"-movflags +faststart "
         f"/output/{o_safe}"
@@ -539,18 +515,12 @@ async def submit_hardsub(
     subtitle_path:   str = "",
     output_name:     str = "hardsub.mp4",
     crf:             int = 23,
-    preset:          str  = "fast",   # PATCHED: was "medium"
+    preset:          str  = "veryfast",  # PATCHED: veryfast avoids CC PROCESSING_TIMEOUT
     scale_height:    int = 0,
     user_id:         int = 0,
     upload_progress_cb=None,
     embedded_sub_si: Optional[int] = None,
 ) -> str:
-    """
-    embedded_sub_si — subtitle stream index already embedded in the video
-    (0 = first subtitle track in the file). When set, no subtitle file
-    upload is needed and CC burns the track directly from the container.
-    subtitle_path is ignored when embedded_sub_si is provided.
-    """
     if not video_path and not video_url:
         raise ValueError("Provide either video_path or video_url")
     if embedded_sub_si is None and (not subtitle_path or not os.path.isfile(subtitle_path)):
