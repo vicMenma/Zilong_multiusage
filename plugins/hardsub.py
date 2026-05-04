@@ -1,15 +1,16 @@
 """
-plugins/hardsub.py  —  PATCHED v3 (fast preset for CC)
+plugins/hardsub.py  —  PATCHED v4 (veryfast preset for CC)
 
 WHAT CHANGED vs previous version
 ────────────────────────────────
 FIX HS-PRESET: user can now pick FFmpeg preset (fast | medium | slow)
   at the same "waiting_subtitle" step as CRF.
 
-PATCH FAST-PRESET: CC hardsub default preset changed from "medium" → "fast".
-  "fast" encodes 2-3x quicker with negligible quality difference, reducing
-  a typical 7-minute CC hardsub job to under 3 minutes. The _submit_batch
-  function also hard-forces "fast" on the CC path regardless of user state.
+PATCH TIMEOUT-FIX: CC hardsub default preset changed from "fast" → "veryfast".
+  "veryfast" encodes 2-4x quicker than "fast", preventing CC
+  PROCESSING_TIMEOUT errors on long anime episodes. Quality difference
+  vs "fast" is negligible for subtitle burn-in jobs.
+  -threads 0 is also added in cloudconvert_api.py to use all CC CPU cores.
 """
 from __future__ import annotations
 
@@ -111,7 +112,7 @@ async def start_hardsub_for_url(
         "sub_path":  None,
         "sub_fname": None,
         "crf":       23,
-        "preset":    "fast",       # PATCHED: was "medium" — CC fast preset
+        "preset":    "veryfast",   # PATCHED: veryfast avoids CC PROCESSING_TIMEOUT
         "platform":  _default_platform(),
         "_created":  time.time(),  # FIX HIGH-03: TTL tracking
     }
@@ -128,7 +129,8 @@ def _crf_label(crf: int) -> str:
 
 
 def _preset_label(p: str) -> str:
-    return {"fast": "⚡ Fast", "medium": "🟢 Medium",
+    return {"fast": "⚡ Fast", "veryfast": "⚡⚡ VeryFast",
+            "medium": "🟢 Medium",
             "slow": "🐢 Slow", "veryslow": "🦥 VerySlow"}.get(p, p)
 
 
@@ -155,7 +157,7 @@ def _default_platform() -> str:
 async def _show_subtitle_prompt(st, uid: int, fname: str, fsize: int = 0) -> None:
     state        = _STATE.get(uid, {})
     cur_crf      = state.get("crf", 23)
-    cur_preset   = state.get("preset", "fast")
+    cur_preset   = state.get("preset", "veryfast")
     cur_platform = state.get("platform", _default_platform())
     size_s = f"  <code>{human_size(fsize)}</code>" if fsize else ""
 
@@ -179,7 +181,7 @@ async def _show_subtitle_prompt(st, uid: int, fname: str, fsize: int = 0) -> Non
 def _subtitle_kb(uid: int) -> InlineKeyboardMarkup:
     state        = _STATE.get(uid, {})
     cur_crf      = state.get("crf", 23)
-    cur_preset   = state.get("preset", "fast")
+    cur_preset   = state.get("preset", "veryfast")
     cur_platform = state.get("platform", _default_platform())
 
     def _crf_btn(lbl, crf):
@@ -199,8 +201,8 @@ def _subtitle_kb(uid: int) -> InlineKeyboardMarkup:
     rows = [
         [_crf_btn("🔵 18", 18), _crf_btn("🟢 20", 20),
          _crf_btn("🟡 23", 23), _crf_btn("🟠 26", 26)],
-        [_pre_btn("fast"), _pre_btn("medium"),
-         _pre_btn("slow"), _pre_btn("veryslow")],
+        [_pre_btn("veryfast"), _pre_btn("fast"),
+         _pre_btn("medium"), _pre_btn("slow")],
     ]
 
     # Platform row — show if 2+ backends available
@@ -246,7 +248,7 @@ async def hardsub_preset_cb(client: Client, cb: CallbackQuery):
     state = _user_state(uid)
     if not state: return await cb.answer("Session expired.", show_alert=True)
     await cb.answer()
-    if preset not in ("fast", "medium", "slow", "veryslow"):
+    if preset not in ("veryfast", "fast", "medium", "slow", "veryslow"):
         return
     state["preset"] = preset
     videos = state.get("videos", [])
@@ -285,7 +287,7 @@ async def _submit_one_job(
     sub_fname: str,
     uid:       int,
     crf:       int  = 23,
-    preset:    str  = "fast",
+    preset:    str  = "veryfast",
     platform:  str  = "cc",
 ) -> tuple[str, str, bool]:
     video_fname = video.get("fname", "video.mkv")
@@ -432,7 +434,6 @@ async def _submit_batch_local(
             continue
 
         fname = video.get("fname", os.path.basename(in_path))
-        stem, _ = os.path.splitext(fname)
         out_name = build_cc_output_name(fname, suffix="VOSTFR")
         out_path = os.path.join(state["tmp"], out_name)
 
@@ -492,7 +493,7 @@ async def _submit_batch(st, state: dict, uid: int) -> None:
     sub_path  = state["sub_path"]
     sub_fname = state.get("sub_fname", "subtitle.ass")
     crf       = state.get("crf", 23)
-    preset    = state.get("preset", "fast")
+    preset    = state.get("preset", "veryfast")
     platform  = state.get("platform", _default_platform())
     count     = len(videos)
 
@@ -500,9 +501,9 @@ async def _submit_batch(st, state: dict, uid: int) -> None:
     if platform == "local":
         return await _submit_batch_local(st, state, uid, videos, sub_path, sub_fname, crf, preset)
 
-    # PATCHED: CC always uses "fast" — "medium" takes 7+ min on shared infra
+    # CC always uses "veryfast" to avoid PROCESSING_TIMEOUT
     if platform == "cc":
-        preset = "fast"
+        preset = "veryfast"
 
     vid_list = "\n".join(
         f"  {i+1}. <code>{v['fname'][:40]}</code>" for i, v in enumerate(videos)
@@ -637,7 +638,7 @@ async def cmd_hardsub(client: Client, msg: Message):
     _STATE[uid] = {
         "step": "waiting_video", "tmp": tmp, "videos": [],
         "sub_path": None, "sub_fname": None,
-        "crf": 23, "preset": "fast", "platform": _default_platform(),  # PATCHED
+        "crf": 23, "preset": "veryfast", "platform": _default_platform(),  # PATCHED: veryfast avoids CC PROCESSING_TIMEOUT
         "_created": time.time(),  # FIX HIGH-03: TTL tracking
     }
     await msg.reply(
